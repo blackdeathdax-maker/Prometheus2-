@@ -3,7 +3,7 @@ from collections import Counter
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from prometheus.archivist import SELF_NODE, TIER_PROVISIONAL, TIER_WORKING
+from .archivist import SELF_NODE, TIER_PROVISIONAL, TIER_WORKING
 
 
 class OverrideSignal:
