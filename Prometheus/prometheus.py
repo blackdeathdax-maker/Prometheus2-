@@ -1,14 +1,14 @@
 import random
 
-from prometheus.hormonal import BioSystem, Epoch
-from prometheus.archivist import ArchivistModule, TIER_WORKING, TIER_TRUSTED
-from prometheus.executive import ExecutiveModule
-from prometheus.synthesizer import SynthesizerModule
-from prometheus.reflector import ReflectorModule
-from prometheus.chronos import ChronosModule
-from prometheus.sensory import SensoryModule
-from prometheus.association import AssociationEngine
-from prometheus.stimulus import SyntheticStimulusEngine
+from .hormonal import BioSystem, Epoch
+from .archivist import ArchivistModule, TIER_WORKING, TIER_TRUSTED
+from .executive import ExecutiveModule
+from .synthesizer import SynthesizerModule
+from .reflector import ReflectorModule
+from .chronos import ChronosModule
+from .sensory import SensoryModule
+from .association import AssociationEngine
+from .stimulus import SyntheticStimulusEngine
 
 
 class Prometheus:
@@ -92,6 +92,11 @@ class Prometheus:
 
         result = self.association.place_node(text, definition="", source=source, context_node=anchor)
         node = result.get("term")
+
+        # §2.1b item 4a: try to name any unnamed schemas with this term
+        # (schema naming trigger when user/dictionary input provides a word).
+        if node and source in ("user", "dictionary"):
+            self.association.try_name_schemas(node)
 
         relations = self.sensory.detect_relational(text)
         if relations:
