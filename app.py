@@ -4,10 +4,11 @@ Streamlit entry point (§7, §4B). Hosts the tabbed layout: Graph / State / Refl
 import streamlit as st
 import traceback
 
+# Import Prometheus
 try:
     from Prometheus.Prometheus import Prometheus
 except ImportError:
-    from Prometheus import Prometheus  # fallback
+    from Prometheus import Prometheus
 
 from prometheus_dashboard import render_graph_html
 
@@ -23,12 +24,13 @@ if st.sidebar.button("Start System", disabled=st.session_state.prom is not None)
         st.session_state.prom = Prometheus()
         st.sidebar.success("System started")
     except Exception as e:
-        st.error(f"Failed to start: {e}")
+        st.error(f"Failed to start Prometheus: {e}")
         st.code(traceback.format_exc(), language="python")
 
 if st.session_state.prom is not None:
     prom = st.session_state.prom
 
+    # ==================== SIDEBAR INPUT ====================
     st.sidebar.subheader("Input")
     user_text = st.sidebar.text_area(
         "Say something to Prometheus", key="user_text", height=80
@@ -36,7 +38,7 @@ if st.session_state.prom is not None:
 
     if st.sidebar.button("Send") and user_text.strip():
         try:
-            prom.queue_input(user_text.strip(), source="user")  # assuming this method
+            prom.queue_input(user_text.strip(), source="user")
             st.sidebar.success("Queued for next pulse")
         except Exception as e:
             st.error(f"Send error: {e}")
@@ -51,76 +53,106 @@ if st.session_state.prom is not None:
             st.code(traceback.format_exc(), language="python")
 
     st.sidebar.subheader("Stimulus")
-    focus = st.sidebar.text_input("Focus", "Knowledge")
-    intensity = st.sidebar.slider("Intensity", 0.0, 1.0, 0.7)
+    focus = st.sidebar.text_input("Focus", "Knowledge", key="focus")
+    intensity = st.sidebar.slider("Intensity", 0.0, 1.0, 0.7, key="intensity")
     if st.sidebar.button("Trigger Event"):
         try:
-            if hasattr(prom, 'stimulus'):
+            if hasattr(prom, "stimulus") and hasattr(prom.stimulus, "trigger_internal_event"):
                 prom.stimulus.trigger_internal_event(intensity, focus)
                 st.sidebar.success("Event triggered")
             else:
-                st.sidebar.warning("Stimulus module not available")
+                st.sidebar.warning("Stimulus module not available yet")
         except Exception as e:
             st.error(f"Stimulus error: {e}")
             st.code(traceback.format_exc(), language="python")
 
-    # Tabbed layout
+    # ==================== TABS ====================
     tab_graph, tab_state, tab_reflection, tab_debug = st.tabs(
         ["Graph", "State", "Reflection", "Debug"]
     )
 
+    # GRAPH TAB
     with tab_graph:
         st.subheader("Knowledge / Schema Web")
-        if prom is None:
-            st.info("Start the system first.")
-        else:
-            new_node = st.text_input("New Node Name", key="new_node")
-            if st.button("Add Node") and new_node:
-                try:
-                    prom.archivist.store(new_node, source="user")
-                    st.success(f"Added {new_node}")
-                except Exception as e:
-                    st.error(f"Add node error: {e}")
-
+        new_node = st.text_input("New Node Name", key="new_node")
+        if st.button("Add Node") and new_node:
             try:
-                html = render_graph_html(prom.archivist)
-                st.html(html)
+                prom.archivist.store(new_node, source="user")
+                st.success(f"Added {new_node}")
             except Exception as e:
-                st.error(f"Graph render error: {e}")
-                st.code(traceback.format_exc())
+                st.error(f"Add node error: {e}")
 
+        try:
+            html = render_graph_html(prom.archivist)
+            st.html(html)
+        except Exception as e:
+            st.error(f"Graph rendering error: {e}")
+            st.code(traceback.format_exc(), language="python")
+            st.subheader("Raw Graph Data (Fallback)")
+            st.json({
+                "node_count": prom.archivist.graph.number_of_nodes(),
+                "edge_count": prom.archivist.graph.number_of_edges(),
+                "nodes": list(prom.archivist.graph.nodes(data=True))
+            })
+
+    # STATE TAB
     with tab_state:
         st.subheader("Current State")
         try:
             felt_state = prom.synthesizer.get_current_felt_state()
             st.metric("Felt State", felt_state)
-            st.metric("Epoch", getattr(prom, 'bio', type('obj', (), {'epoch': type('e', (), {'value': 'N/A'})})()).epoch.value)
-            # ... add other metrics with try/except as needed
+            st.metric("Epoch", getattr(getattr(prom, 'bio', None), 'epoch', type('obj', (object,), {'value': 'Unknown'}))().value)
+            st.metric("Operating Mode", str(getattr(prom, 'state', 'Unknown')))
+
+            fatigue = getattr(prom, 'fatigue', 0)
+            if fatigue < getattr(Prometheus, 'T1', 0.3):
+                fatigue_level = "Low"
+            elif fatigue < getattr(Prometheus, 'T2', 0.7):
+                fatigue_level = "Medium"
+            else:
+                fatigue_level = "High"
+            st.metric("Fatigue", fatigue_level)
         except Exception as e:
-            st.error(f"State error: {e}")
+            st.error(f"State display error: {e}")
+            st.code(traceback.format_exc())
 
-    # (Reflection and Debug tabs can stay mostly as-is, but wrap heavy calls similarly)
-
+    # REFLECTION TAB
     with tab_reflection:
-        st.subheader("Self-Report")
+        st.subheader("Self-Report & Schemas")
         try:
             metrics = prom.reflector.observe()
             st.write(f"Last updated: pulse {getattr(prom.reflector, 'pulse_count', 'N/A')}")
             st.json(metrics)
-            # ... rest of reflection
+
+            st.subheader("Complex Emotional Schemas")
+            schema_nodes = [(n, d) for n, d in prom.archivist.graph.nodes(data=True) if d.get("is_schema")]
+            if not schema_nodes:
+                st.caption("No stable Schema Nodes yet.")
+            else:
+                for n, d in schema_nodes:
+                    label = d.get("name") or f"(unnamed: {n})"
+                    st.write(f"**{label}** – basin: {d.get('basin')}")
         except Exception as e:
             st.error(f"Reflection error: {e}")
             st.code(traceback.format_exc())
 
+    # DEBUG TAB
     with tab_debug:
-        st.markdown("""<div style='background-color:#402020;padding:8px;border-radius:4px;'>
-        <b>RAW INTERNAL STATE – NOT PART OF THE COGNITIVE MODEL</b>
-        </div>""", unsafe_allow_html=True)
+        st.markdown(
+            "<div style='background-color:#402020;padding:8px;border-radius:4px;'>"
+            "<b>RAW INTERNAL STATE – NOT PART OF THE COGNITIVE MODEL</b><br>"
+            "Read-only instrumentation only."
+            "</div>",
+            unsafe_allow_html=True,
+        )
         try:
+            st.subheader("Raw Somatic Variables")
             st.json(prom.bio.get_raw_variables())
+            st.subheader("Hormonal State")
             st.json({k: round(v, 4) for k, v in getattr(prom.bio, '_hormones', {}).items()})
         except Exception as e:
-            st.error(f"Debug error: {e}")
+            st.error(f"Debug data error: {e}")
+            st.code(traceback.format_exc())
 
 else:
     st.info("Click 'Start System' in the sidebar to begin.")
