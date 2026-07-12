@@ -1,10 +1,9 @@
 """
-Streamlit entry point (§7, §4B). Hosts the tabbed layout: Graph / State / Reflection / Debug.
+Streamlit entry point for Prometheus.
 """
 import streamlit as st
 import traceback
 
-# Import Prometheus
 try:
     from Prometheus.Prometheus import Prometheus
 except ImportError:
@@ -49,24 +48,9 @@ if st.session_state.prom is not None:
             st.error(f"Pulse error: {e}")
             st.code(traceback.format_exc(), language="python")
 
-    st.sidebar.subheader("Stimulus")
-    focus = st.sidebar.text_input("Focus", "Knowledge", key="focus_input")
-    intensity = st.sidebar.slider("Intensity", 0.0, 1.0, 0.7, key="intensity_slider")
-    if st.sidebar.button("Trigger Event"):
-        try:
-            if hasattr(prom, 'stimulus'):
-                prom.stimulus.trigger_internal_event(intensity, focus)
-                st.sidebar.success("Event triggered")
-            else:
-                st.sidebar.warning("Stimulus not available")
-        except Exception as e:
-            st.error(f"Stimulus error: {e}")
-            st.code(traceback.format_exc(), language="python")
-
     # Tabs
     tab_graph, tab_state, tab_reflection, tab_debug = st.tabs(["Graph", "State", "Reflection", "Debug"])
 
-    # GRAPH TAB
     with tab_graph:
         st.subheader("Knowledge / Schema Web")
         new_node = st.text_input("New Node Name", key="new_node")
@@ -82,28 +66,35 @@ if st.session_state.prom is not None:
             html = render_graph_html(prom.archivist)
             st.components.v1.html(html, height=750, scrolling=True)
         except Exception as e:
-            st.error(f"Graph render error: {e}")
+            st.error(f"Graph error: {e}")
             st.code(traceback.format_exc(), language="python")
-            # Fallback
-            st.subheader("Raw Graph Data")
             g = prom.archivist.graph
-            st.json({
-                "nodes": len(g.nodes()),
-                "edges": len(g.edges()),
-                "sample_nodes": list(g.nodes())[:20]
-            })
+            st.json({"nodes": len(g.nodes()), "edges": len(g.edges())})
 
-    # STATE TAB
     with tab_state:
         st.subheader("Current State")
         try:
-            felt = prom.synthesizer.get_current_felt_state()
-            st.metric("Felt State", felt)
-            st.metric("Epoch", getattr(getattr(prom, 'bio', None), 'epoch', 'N/A'))
-            st.metric("Node Count", prom.archivist.graph.number_of_nodes())
+            st.metric("Felt State", prom.synthesizer.get_current_felt_state())
+            st.metric("Nodes", prom.archivist.graph.number_of_nodes())
         except Exception as e:
-            st.error(f"State error: {e}")
+            st.error(str(e))
 
+    with tab_reflection:
+        st.subheader("Reflection")
+        try:
+            st.json(prom.reflector.observe())
+        except Exception as e:
+            st.error(str(e))
+
+    with tab_debug:
+        st.subheader("Raw Debug")
+        try:
+            st.json(prom.bio.get_raw_variables())
+        except Exception as e:
+            st.error(str(e))
+
+else:
+    st.info("Click 'Start System' in the sidebar.")
     # REFLECTION TAB (simplified)
     with tab_reflection:
         st.subheader("Reflection & Schemas")
