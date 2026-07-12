@@ -120,24 +120,36 @@ class AssociationEngine:
     # §2.1b item 4a: Schema Node naming trigger. Called whenever a term
     # is placed that might correspond to an existing unnamed schema.
     # ------------------------------------------------------------------
-    def try_name_schemas(self, term: str):
+    def try_name_schemas(self, term: str, current_felt_state: Optional[str] = None):
         """
-        After placing a new term, scan for unnamed schema nodes that might
-        now be nameable by this term. This implements §2.1b item 4a:
-        "Schema Node earns a name only if/when the agent's actual
-        dictionary/user input happens to link a word to it -- never
-        pre-assigned."
+        After placing a new term, check whether any unnamed Schema Node is
+        tied to the felt state active *right now* -- if so, the term being
+        used in that moment is what earns the schema its name. This
+        implements §2.1b item 4a: "Schema Node earns a name only if/when
+        the agent's actual dictionary/user input happens to link a word to
+        it -- never pre-assigned," via the same felt-state-to-node
+        co-occurrence mechanism used for basic basin naming (§6.1), not an
+        independent heuristic.
+
+        Fixes two prior bugs: (1) `self.archivist.reflector` was never a
+        real attribute -- archivist.py now owns name_schema() directly,
+        since it's just a graph mutation on data archivist already owns;
+        (2) the old check compared `term` against the schema's `basin`
+        field as a raw string (`"basin_0.5_0.2_0.6"`), which is a
+        coordinate-derived ID a word can never be a substring of, so it
+        could never actually fire. This checks the schema's `basin`
+        against the current felt-state key instead, which is the same
+        object (both `synthesizer.py`'s stabilized-basin ID), so an actual
+        match is possible.
         """
+        if not current_felt_state or current_felt_state == "Unformed":
+            return
         graph = self.archivist.graph
         for node, data in graph.nodes(data=True):
             if data.get("is_schema") and not data.get("named", False):
-                # Simple heuristic: if the new term is related to the schema's
-                # basin (felt state), try to name it. More sophisticated matching
-                # could use edge distance or semantic similarity.
-                basin = data.get("basin")
-                if basin and term.lower() in basin.lower():
-                    self.archivist.reflector.name_schema(node, term)
-                    logger.info(f"Schema {node} named as '{term}'")
+                if data.get("basin") == current_felt_state:
+                    self.archivist.name_schema(node, term)
+                    logger.info(f"Schema {node} named as '{term}' (felt state: {current_felt_state})")
 
     # ------------------------------------------------------------------
     # Kept for compatibility with earlier callers; delegates to

@@ -159,6 +159,23 @@ class ArchivistModule:
         self.graph.nodes[node_a]["last_reinforced"] = datetime.now()
         self.save()
 
+    def name_schema(self, schema_id: str, word: str) -> bool:
+        """§2.1b item 4a: a Schema Node earns a name only if/when the
+        agent's actual dictionary/user input happens to link a word to it
+        -- never pre-assigned. Lives here (not reflector.py) because it's
+        a direct graph mutation on data archivist.py already owns; calling
+        out to reflector for a two-field write was an unnecessary
+        cross-module hop that also never existed as a wired reference.
+        Returns True if the write happened, False if the node wasn't an
+        eligible unnamed schema."""
+        if schema_id in self.graph and self.graph.nodes[schema_id].get("is_schema") \
+                and not self.graph.nodes[schema_id].get("named", False):
+            self.graph.nodes[schema_id]["name"] = word
+            self.graph.nodes[schema_id]["named"] = True
+            self.save()
+            return True
+        return False
+
     def flag_negation(self, node: str):
         """§3.4 mechanism 1: explicit negation/correction detected by
         sensory.py against a recently-active node. Demotion itself still

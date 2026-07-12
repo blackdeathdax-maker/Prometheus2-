@@ -173,13 +173,12 @@ class ReflectorModule:
     def name_schema(self, schema_id: str, word: str):
         """§2.1b item 4a: a Schema Node earns a name only if/when the
         agent's actual dictionary/user input happens to link a word to it
-        -- never pre-assigned. This is the only place that ever writes a
-        name onto a schema node."""
-        graph = self.archivist.graph
-        if schema_id in graph and graph.nodes[schema_id].get("is_schema"):
-            graph.nodes[schema_id]["name"] = word
-            graph.nodes[schema_id]["named"] = True
-            self.archivist.save()
+        -- never pre-assigned. Delegates to archivist.py, which owns the
+        graph mutation directly (kept here too since app.py's manual
+        "Name it" UI control calls reflector.name_schema -- this is a
+        thin pass-through, not a second implementation, so the two paths
+        can't drift out of sync)."""
+        self.archivist.name_schema(schema_id, word)
 
     def schema_count(self) -> int:
         """Used by prometheus.py for the §6.2 Adolescence->Maturity gate."""

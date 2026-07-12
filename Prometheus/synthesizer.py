@@ -66,6 +66,22 @@ class SynthesizerModule:
         already-synthesized composite key, not a hidden-layer value."""
         return self._current_key
 
+    def get_current_intensity(self) -> float:
+        """Legitimate, boundary-crossing continuous signal for anything
+        that needs a spike/threshold check (§4.1 regulation, executive
+        bias) rather than a raw hidden-layer value. Uses the arousal
+        component of the current basin key -- arousal is the "how
+        activated" axis in the PAD model (§2.1a), and it's already the
+        product of synthesizer.py's projection, same legitimacy argument
+        as get_current_basin_key() above. This exists specifically so
+        prometheus.py and executive.py never need to read
+        BioSystem.get_somatic_readout()/somatic.urgency directly, which
+        hormonal.py's own docstring prohibits ("nothing in here should be
+        read directly by any module that participates in the agent's
+        decision loop -- only synthesizer.py's composite projection may
+        leave this layer")."""
+        return self._current_key[0]
+
     def consolidate_basins(self):
         """
         Consolidation-only basin stabilization (§2.1a point 6). Peaks in

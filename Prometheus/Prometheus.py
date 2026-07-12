@@ -26,7 +26,10 @@ class Prometheus:
 
     # Regulation spike threshold (§4.1) and dampening cap (§4.4). Not yet
     # numerically tuned per spec §10 item 8 -- placeholders, documented.
+    # Thresholds are on synthesizer.py's arousal-axis intensity signal
+    # (0.0-1.0), NOT raw somatic.urgency (§ Core Emergence Principle).
     REGULATION_SPIKE_THRESHOLD = 0.7
+    REGULATION_HYSTERESIS = 0.05  # §4.1: "same hysteresis-band pattern as fatigue T1/T2"
     REGULATION_DAMPENING_CAP = 0.4
     REGULATION_FATIGUE_COST = 0.05  # §4.6: regulation draws on the fatigue economy
 
@@ -67,6 +70,11 @@ class Prometheus:
         # only... over the ticks following a regulation attempt").
         self._pending_regulation = None
 
+        # Hysteresis state for the regulation spike trigger (§4.1) -- same
+        # banded pattern as fatigue's T1/T2, so a signal hovering right at
+        # threshold doesn't fire regulation every other tick.
+        self._regulating = False
+
         # Queue of external input waiting to be ingested this Learning
         # tick; when empty, self-study fires instead (§5.1).
         self._input_queue = []
@@ -93,10 +101,11 @@ class Prometheus:
         result = self.association.place_node(text, definition="", source=source, context_node=anchor)
         node = result.get("term")
 
-        # §2.1b item 4a: try to name any unnamed schemas with this term
-        # (schema naming trigger when user/dictionary input provides a word).
+        # §2.1b item 4a: try to name any unnamed schemas tied to the felt
+        # state active right now (schema naming trigger when user/dictionary
+        # input provides a word while "in" that state).
         if node and source in ("user", "dictionary"):
-            self.association.try_name_schemas(node)
+            self.association.try_name_schemas(node, current_felt_state=felt_state)
 
         relations = self.sensory.detect_relational(text)
         if relations:
@@ -121,20 +130,32 @@ class Prometheus:
     def pulse(self):
         self.pulse_count += 1
         somatic = self.bio.step()
-        bias = self.executive.bias_processing(somatic)
 
-        if somatic.urgency > self.REGULATION_SPIKE_THRESHOLD:
-            self._apply_regulation(somatic)
+        # synthesizer must run first, before anything that conditions a
+        # decision on its output (regulation trigger, executive bias) --
+        # previously this ran *after* those checks, which meant they were
+        # either reading last tick's synthesized state or (as fixed here)
+        # reading raw hidden-layer data directly. Per the Core Emergence
+        # Principle, prometheus.py and executive.py must only condition on
+        # synthesizer.py's output, never on `somatic` directly.
+        self.synthesizer.update_from_core(self.bio.get_raw_variables())
+        intensity = self.synthesizer.get_current_intensity()
+
+        bias = self.executive.bias_processing(intensity)
+
+        # §4.1: hysteresis-banded spike detection on the synthesized
+        # intensity signal, same pattern as fatigue's T1/T2 -- not a bare
+        # threshold, and not somatic.urgency.
+        if not self._regulating and intensity > self.REGULATION_SPIKE_THRESHOLD:
+            self._regulating = True
+        elif self._regulating and intensity < self.REGULATION_SPIKE_THRESHOLD - self.REGULATION_HYSTERESIS:
+            self._regulating = False
+        if self._regulating:
+            self._apply_regulation(intensity)
 
         override = self.reflector.issue_directive(bias)
         if override != bias:
             bias = override
-
-        # synthesizer must run before chronos.record_pulse so the felt
-        # state logged this tick reflects this tick's hormonal state, and
-        # before self-study/ingest so co-occurrence placement sees the
-        # right anchor.
-        self.synthesizer.update_from_core(self.bio.get_raw_variables())
 
         if self.state == "Learning":
             if self._input_queue:
@@ -276,12 +297,14 @@ class Prometheus:
     # ------------------------------------------------------------------
     # §4 Regulation
     # ------------------------------------------------------------------
-    def _apply_regulation(self, somatic):
+    def _apply_regulation(self, intensity: float):
         """
         Regulation per §4: accelerates core.py's fast-layer decay,
         restricted to Working/Trusted-tier nodes anchored to the current
         felt state (§4.2), capped and scaled by regulatory efficacy
-        (§4.4/§4.5), costs fatigue (§4.6).
+        (§4.4/§4.5), costs fatigue (§4.6). Takes the synthesized intensity
+        signal (synthesizer.get_current_intensity()), never raw somatic
+        data -- see the Core Emergence Principle note on pulse().
         """
         key = self.synthesizer.get_current_basin_key()
         anchors = self.felt_state_anchors.get(key, [])
@@ -305,7 +328,7 @@ class Prometheus:
 
         self._pending_regulation = {
             "nodes": regulating_nodes,
-            "intensity_before": somatic.urgency,
+            "intensity_before": intensity,
             "pulse": self.pulse_count,
         }
         print(f"Regulation applied via {len(regulating_nodes)} eligible node(s), rate={rate:.3f}.")
@@ -313,12 +336,14 @@ class Prometheus:
     def _evaluate_pending_regulation(self):
         """§4.5: efficacy evaluated during Consolidation only -- check
         whether felt-state intensity dropped faster than baseline decay
-        alone would predict, over the ticks following the attempt."""
+        alone would predict, over the ticks following the attempt. Uses
+        the same synthesized intensity signal regulation was triggered on,
+        not raw somatic data."""
         pending = self._pending_regulation
         if not pending:
             return
-        current_urgency = self.bio.get_somatic_readout().urgency
-        dropped = pending["intensity_before"] - current_urgency
+        current_intensity = self.synthesizer.get_current_intensity()
+        dropped = pending["intensity_before"] - current_intensity
         # Simple baseline-decay proxy: natural decay toward 0.5 baseline
         # over the elapsed ticks would account for some drop on its own;
         # only credit regulation if the drop clearly exceeds that.
