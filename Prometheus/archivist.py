@@ -35,7 +35,7 @@ SOURCE_WEIGHT = {"dictionary": 0.6, "user": 0.3, "self_generated": 0.2}
 DIVERSITY_WEIGHT = 0.25
 EDGE_COUNT_WEIGHT = 0.05
 EDGE_COUNT_CAP = 10
-WORKING_THRESHOLD = 0.6
+WORKING_THRESHOLD = 0.4
 TRUSTED_THRESHOLD = 1.2
 
 # Hysteresis (§3.3: "N consecutive consolidation passes, not a single
@@ -45,7 +45,7 @@ DEMOTION_HYSTERESIS_N = 2
 
 # §10 item 19 concrete pruning rule: still Tier 0 after N consolidation
 # cycles with no reinforcement -> eligible for pruning.
-PRUNE_TIER0_CYCLES = 5
+PRUNE_TIER0_CYCLES = 20
 
 
 class ArchivistModule:
