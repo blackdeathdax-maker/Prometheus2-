@@ -2,8 +2,8 @@ import logging
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from prometheus.archivist import SELF_NODE, TIER_PROVISIONAL
-from prometheus.sensory import SensoryModule
+from .archivist import SELF_NODE, TIER_PROVISIONAL
+from .sensory import SensoryModule
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +115,29 @@ class AssociationEngine:
                 self.archivist.link("OTHER", event_node, "concerns-other", source=source, placement="explicit")
             else:
                 self.archivist.link(SELF_NODE, event_node, rel, source=source, placement="explicit")
+
+    # ------------------------------------------------------------------
+    # §2.1b item 4a: Schema Node naming trigger. Called whenever a term
+    # is placed that might correspond to an existing unnamed schema.
+    # ------------------------------------------------------------------
+    def try_name_schemas(self, term: str):
+        """
+        After placing a new term, scan for unnamed schema nodes that might
+        now be nameable by this term. This implements §2.1b item 4a:
+        "Schema Node earns a name only if/when the agent's actual
+        dictionary/user input happens to link a word to it -- never
+        pre-assigned."
+        """
+        graph = self.archivist.graph
+        for node, data in graph.nodes(data=True):
+            if data.get("is_schema") and not data.get("named", False):
+                # Simple heuristic: if the new term is related to the schema's
+                # basin (felt state), try to name it. More sophisticated matching
+                # could use edge distance or semantic similarity.
+                basin = data.get("basin")
+                if basin and term.lower() in basin.lower():
+                    self.archivist.reflector.name_schema(node, term)
+                    logger.info(f"Schema {node} named as '{term}'")
 
     # ------------------------------------------------------------------
     # Kept for compatibility with earlier callers; delegates to
