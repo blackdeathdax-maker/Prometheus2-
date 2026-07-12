@@ -24,12 +24,12 @@ if st.session_state.prom is not None:
     )
     if st.sidebar.button("Send") and user_text.strip():
         try:
-        st.sidebar.success("Queued for next pulse")
-        # Existing call
-        prom_queue_input(user_text.strip(), source="user")
-    except Exception as e:
-        st.error(f"Send error: {e}")
-        st.code(traceback.format_exc(), language="python")
+            st.sidebar.success("Queued for next pulse")
+            # Existing call
+            prom_queue_input(user_text.strip(), source="user")
+        except Exception as e:
+            st.error(f"Send error: {e}")
+            st.code(traceback.format_exc(), language="python")
     if st.sidebar.button("Pulse"):
     try:
         prom.pulse()
