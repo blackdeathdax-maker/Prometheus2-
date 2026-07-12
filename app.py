@@ -131,10 +131,10 @@ else:
             fatigue_level = "Medium"
     else:
         fatigue_level = "High"
-            st.metric("Fatigue", fatigue_level)
+        st.metric("Fatigue", fatigue_level)
     except Exception as e:
-            st.error(f"State display error: {e}")
-            st.code(traceback.format_exc())
+        st.error(f"State display error: {e}")
+        st.code(traceback.format_exc())
 
     # REFLECTION TAB
     with tab_reflection:
