@@ -35,7 +35,7 @@ SOURCE_WEIGHT = {"dictionary": 0.6, "user": 0.3, "self_generated": 0.2}
 DIVERSITY_WEIGHT = 0.25
 EDGE_COUNT_WEIGHT = 0.05
 EDGE_COUNT_CAP = 10
-WORKING_THRESHOLD = 0.4
+WORKING_THRESHOLD = 0.6
 TRUSTED_THRESHOLD = 1.2
 
 # Hysteresis (§3.3: "N consecutive consolidation passes, not a single
@@ -45,7 +45,7 @@ DEMOTION_HYSTERESIS_N = 2
 
 # §10 item 19 concrete pruning rule: still Tier 0 after N consolidation
 # cycles with no reinforcement -> eligible for pruning.
-PRUNE_TIER0_CYCLES = 20
+PRUNE_TIER0_CYCLES = 5
 
 
 class ArchivistModule:
@@ -59,6 +59,23 @@ class ArchivistModule:
     """
 
     def __init__(self):
+        # Tunable thresholds as instance attributes, not just module-level
+        # constants -- this is what lets the Debug tab's sliders mutate a
+        # live instance (e.g. `archivist.WORKING_THRESHOLD = 0.5`) without
+        # any code change taking effect only on next restart. Defaults
+        # mirror the module-level constants above (still the documented
+        # "not yet numerically tuned" placeholders, §10) -- this is a
+        # mechanism for tuning them live, not a claim that these specific
+        # values are now correct.
+        self.DIVERSITY_WEIGHT = DIVERSITY_WEIGHT
+        self.EDGE_COUNT_WEIGHT = EDGE_COUNT_WEIGHT
+        self.EDGE_COUNT_CAP = EDGE_COUNT_CAP
+        self.WORKING_THRESHOLD = WORKING_THRESHOLD
+        self.TRUSTED_THRESHOLD = TRUSTED_THRESHOLD
+        self.PROMOTION_HYSTERESIS_N = PROMOTION_HYSTERESIS_N
+        self.DEMOTION_HYSTERESIS_N = DEMOTION_HYSTERESIS_N
+        self.PRUNE_TIER0_CYCLES = PRUNE_TIER0_CYCLES
+
         # MultiDiGraph, not DiGraph: §2.1b requires an event node to carry
         # *more than one* simultaneous relational edge type from SELF at
         # once (its own example: "I shouldn't have done that" flags both
@@ -138,7 +155,14 @@ class ArchivistModule:
                     )
                 self.graph.add_edge(entity, target, relation_type=rel, source=source,
                                      created_at=datetime.now().isoformat())
-        self.save()
+        # No self.save() here (§4C): persistence is Consolidation-gated
+        # only. store() runs constantly during Learning (every ingested
+        # term, every self-study expansion) -- a disk write per call would
+        # both violate "checkpoint at Consolidation, one clock" and be a
+        # real performance cost as the graph grows. Prometheus.py's
+        # _run_consolidation() calls archivist.save() once, after every
+        # sub-step (trust pass, re-parenting, schema detection, efficacy)
+        # has run.
 
     def link(self, node_a: str, node_b: str, relation_type: str, source: str = "user",
               placement: str = "explicit"):
@@ -157,7 +181,9 @@ class ArchivistModule:
         self.graph.add_edge(node_a, node_b, relation_type=relation_type, source=source,
                              placement=placement, created_at=datetime.now().isoformat())
         self.graph.nodes[node_a]["last_reinforced"] = datetime.now()
-        self.save()
+        # No self.save() here (§4C) -- see store()'s comment. link() is
+        # called on every hierarchy placement and every relational edge,
+        # same Learning-time frequency problem.
 
     def name_schema(self, schema_id: str, word: str) -> bool:
         """§2.1b item 4a: a Schema Node earns a name only if/when the
@@ -172,7 +198,7 @@ class ArchivistModule:
                 and not self.graph.nodes[schema_id].get("named", False):
             self.graph.nodes[schema_id]["name"] = word
             self.graph.nodes[schema_id]["named"] = True
-            self.save()
+            # No self.save() here (§4C) -- see store()'s comment.
             return True
         return False
 
@@ -183,7 +209,9 @@ class ArchivistModule:
         records the flag."""
         if node in self.graph:
             self.graph.nodes[node]["negated_flag"] = True
-            self.save()
+            # No self.save() here (§4C) -- the flag is consumed at the
+            # next Consolidation pass regardless; nothing durable is lost
+            # by waiting for that pass to checkpoint it.
 
     # ------------------------------------------------------------------
     # §3 Trust scoring -- Consolidation-gated only. prometheus.py must
@@ -191,7 +219,7 @@ class ArchivistModule:
     # ------------------------------------------------------------------
     def _trust_score(self, node: str) -> float:
         data = self.graph.nodes[node]
-        base = SOURCE_WEIGHT.get(data.get("source", "user"), 0.3)
+        base = SOURCE_WEIGHT.get(data.get("source", "user"), 0.3)  # source-weight dict itself not yet slider-exposed
 
         incident_sources = set()
         edge_count = 0
@@ -202,13 +230,13 @@ class ArchivistModule:
                 incident_sources.add(esrc)
 
         diversity = len(incident_sources)
-        score = base + diversity * DIVERSITY_WEIGHT + min(edge_count, EDGE_COUNT_CAP) * EDGE_COUNT_WEIGHT
+        score = base + diversity * self.DIVERSITY_WEIGHT + min(edge_count, self.EDGE_COUNT_CAP) * self.EDGE_COUNT_WEIGHT
         return score
 
     def _tier_for_score(self, score: float) -> int:
-        if score >= TRUSTED_THRESHOLD:
+        if score >= self.TRUSTED_THRESHOLD:
             return TIER_TRUSTED
-        if score >= WORKING_THRESHOLD:
+        if score >= self.WORKING_THRESHOLD:
             return TIER_WORKING
         return TIER_PROVISIONAL
 
@@ -251,14 +279,14 @@ class ArchivistModule:
                     data["_promo_target"] = target
                     data["_promo_streak"] = 1
                 data["_demo_streak"] = 0
-                if data["_promo_streak"] >= PROMOTION_HYSTERESIS_N:
+                if data["_promo_streak"] >= self.PROMOTION_HYSTERESIS_N:
                     data["tier"] = min(current + 1, TIER_TRUSTED)  # one tier at a time
                     data["_promo_streak"] = 0
                     promotions += 1
             elif target < current:
                 data["_demo_streak"] = data.get("_demo_streak", 0) + 1
                 data["_promo_streak"] = 0
-                if data["_demo_streak"] >= DEMOTION_HYSTERESIS_N:
+                if data["_demo_streak"] >= self.DEMOTION_HYSTERESIS_N:
                     data["tier"] = max(current - 1, TIER_PROVISIONAL)  # one tier at a time (§3.4)
                     data["_demo_streak"] = 0
                     demotions += 1
@@ -266,7 +294,11 @@ class ArchivistModule:
                 data["_promo_streak"] = 0
                 data["_demo_streak"] = 0
 
-        self.save()
+        # No self.save() here (§4C) -- this is one of several sub-steps
+        # prometheus.py's _run_consolidation() runs; re-parenting and
+        # schema detection happen after this and mutate the same graph,
+        # so saving now would just be redone (or missed) depending on
+        # ordering. The orchestrator checkpoints once, after everything.
         return {"promotions": promotions, "demotions": demotions}
 
     # ------------------------------------------------------------------
@@ -292,7 +324,9 @@ class ArchivistModule:
         eff = self.graph.nodes[node].get("regulatory_efficacy", 0.5)
         eff = eff + step if worked else eff - step
         self.graph.nodes[node]["regulatory_efficacy"] = max(0.0, min(1.0, eff))
-        self.save()
+        # No self.save() here (§4C) -- called once per regulating node,
+        # potentially several times per Consolidation pass; the
+        # orchestrator's single end-of-consolidation checkpoint covers it.
 
     # ------------------------------------------------------------------
     # §2.3 mechanism 3 -- re-parenting evaluation, Consolidation-gated.
@@ -347,7 +381,7 @@ class ArchivistModule:
             n for n, d in self.graph.nodes(data=True)
             if n != SELF_NODE
             and d.get("tier", TIER_PROVISIONAL) == TIER_PROVISIONAL
-            and d.get("tier0_cycles", 0) >= PRUNE_TIER0_CYCLES
+            and d.get("tier0_cycles", 0) >= self.PRUNE_TIER0_CYCLES
         ]
         for n in to_remove:
             self.graph.remove_node(n)

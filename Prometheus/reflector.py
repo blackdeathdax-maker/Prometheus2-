@@ -43,6 +43,10 @@ class ReflectorModule:
         self.archivist = archivist
         self.pulse_count = 0
         self.last_schema_scan_pulse = 0
+        # Instance attribute, not just the module-level constant -- lets
+        # the Debug tab's sliders tune this live. Same "not yet
+        # numerically tuned" placeholder as everywhere else (§10).
+        self.SCHEMA_STABILIZATION_THRESHOLD = SCHEMA_STABILIZATION_THRESHOLD
 
     # ------------------------------------------------------------------
     # 1. Structural self-report (pre-existing, unchanged)
@@ -140,7 +144,7 @@ class ReflectorModule:
 
         created = []
         for (felt_state, relation_set), event_nodes in pair_events.items():
-            if len(event_nodes) < SCHEMA_STABILIZATION_THRESHOLD:
+            if len(event_nodes) < self.SCHEMA_STABILIZATION_THRESHOLD:
                 continue
             schema_id = self._schema_id(felt_state, relation_set)
             if schema_id in graph:
@@ -166,8 +170,10 @@ class ReflectorModule:
                                 placement="explicit", created_at=datetime.now().isoformat())
             created.append(schema_id)
 
-        if created:
-            self.archivist.save()
+        # No self.archivist.save() here (§4C) -- detect_schemas() is one
+        # sub-step of prometheus.py's Consolidation pass; the orchestrator
+        # checkpoints once, after every sub-step (trust pass, re-parenting,
+        # schema detection, efficacy) has run, not after each individually.
         return created
 
     def name_schema(self, schema_id: str, word: str):

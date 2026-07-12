@@ -24,6 +24,18 @@ class Prometheus:
     T2 = 0.8
     HYSTERESIS = 0.05
 
+    # Fatigue growth (per tick, scaled by urgency) and per-state recovery
+    # rates. Consolidation recovers more than Pruning -- it's the
+    # restorative state, Pruning is the costly one (fixed bug: Consolidation
+    # previously applied zero recovery at all, trapping the system in a
+    # permanent Consolidation<->Pruning oscillation that made Learning, and
+    # therefore all graph growth, unreachable after the first few ticks).
+    # All three remain undecided tuning placeholders (§10) -- named here
+    # specifically so the Debug tab's sliders can adjust them live.
+    FATIGUE_GROWTH_RATE = 0.2
+    FATIGUE_RECOVERY_CONSOLIDATION = 0.5
+    FATIGUE_RECOVERY_PRUNING = 0.7
+
     # Regulation spike threshold (§4.1) and dampening cap (§4.4). Not yet
     # numerically tuned per spec §10 item 8 -- placeholders, documented.
     # Thresholds are on synthesizer.py's arousal-axis intensity signal
@@ -250,7 +262,7 @@ class Prometheus:
     # Fatigue / state cycling
     # ------------------------------------------------------------------
     def _update_fatigue(self, somatic):
-        self.fatigue = min(1.0, self.fatigue + somatic.urgency * 0.2)
+        self.fatigue = min(1.0, self.fatigue + somatic.urgency * self.FATIGUE_GROWTH_RATE)
 
     def _cycle_state(self):
         """Hysteresis-banded state cycling (§5 stability requirement)."""
@@ -268,11 +280,26 @@ class Prometheus:
 
         if self.state == "Consolidation":
             self._run_consolidation()
+            # §5: "fatigue must have its own recovery curve (drops during
+            # Consolidation) so the system self-cycles rather than
+            # ratcheting into permanent Pruning." This was named as a
+            # requirement in the design but never implemented -- Consolidation
+            # applied zero recovery, while Pruning (the costlier, more
+            # effortful state) recovered 30%. That inversion created a
+            # stable Consolidation<->Pruning oscillation that never dropped
+            # back below the Learning re-entry threshold, so Learning
+            # (and therefore all graph growth) became unreachable after
+            # the first few ticks. Consolidation should recover more than
+            # Pruning, since it's the restorative state, not the costly one.
+            # Rate is an undecided tuning placeholder (§10) -- exposing
+            # this via a debug-tab slider is the planned next step rather
+            # than guessing a "correct" number here.
+            self.fatigue *= self.FATIGUE_RECOVERY_CONSOLIDATION
         elif self.state == "Pruning":
             pruned = self.archivist.prune()
             if pruned:
                 print(f"Pruning: removed {pruned} stale Tier-0 node(s).")
-            self.fatigue *= 0.7  # Recovery (§5: "fatigue must have its own recovery curve")
+            self.fatigue *= self.FATIGUE_RECOVERY_PRUNING  # Recovery (§5: "fatigue must have its own recovery curve")
 
     def _run_consolidation(self):
         """
@@ -286,6 +313,14 @@ class Prometheus:
         reparented = self.association.run_reparenting_pass()
         new_schemas = self.reflector.detect_schemas()
         self._evaluate_pending_regulation()
+
+        # §4C: the single checkpoint call for this pass -- everything
+        # above mutates the graph and/or hormonal state without saving
+        # individually (see the "No self.save() here" comments in
+        # archivist.py, reflector.py, and hormonal.py's step()). This is
+        # the one clock persistence is gated to.
+        self.archivist.save()
+        self.bio.save_state()
 
         if trust_summary.get("promotions") or trust_summary.get("demotions"):
             print(f"Consolidation trust pass: {trust_summary}")

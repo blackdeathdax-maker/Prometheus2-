@@ -58,7 +58,25 @@ class BioSystem:
     NOT evaluate transitions itself -- see prometheus.py.
     """
 
+    # §4C persistence split: fast-layer hormones reset to their __init__
+    # resting-baseline values on restart (a restarted agent shouldn't wake
+    # up mid-spike from before it was last closed); only slow-layer
+    # hormones (temperament) persist. Matches decay_fast()'s own
+    # fast-layer set below, plus dopamine (dopaminergic_tone is fast-layer
+    # per the original core.py module table) which decay_fast doesn't
+    # currently touch but which self-study's reward bump modifies directly.
+    FAST_LAYER = ("adrenaline", "cortisol", "dopamine")
+    SLOW_LAYER = ("oxytocin", "testosterone", "estrogen", "thyroxine", "serotonin")
+
     def __init__(self):
+        # Tunable decay rate, exposed as an instance attribute (not a bare
+        # literal inside _compute_hormonal_flux) so the Debug tab's
+        # sliders can adjust it live. This is the rate every hormone
+        # decays toward its 0.5 baseline each tick -- the single biggest
+        # lever on how fast urgency (and therefore fatigue, §5) climbs.
+        # Still an undecided placeholder (§10), same as everywhere else.
+        self.HORMONE_DECAY_RATE = 0.05
+
         self._hormones = {
             "adrenaline": 0.3,
             "cortisol": 0.4,
@@ -87,14 +105,18 @@ class BioSystem:
                 "hormones": {k: round(v, 3) for k, v in self._hormones.items()},
                 "somatic": self.somatic.to_dict(),
             })
-            self.save_state()
+            # No self.save_state() here (§4C) -- step() runs every single
+            # pulse. Persistence is Consolidation-gated only; prometheus.py
+            # calls save_state() once at the end of a Consolidation pass,
+            # same checkpoint call as archivist.save().
         return self.somatic
 
     def _compute_hormonal_flux(self) -> Dict:
         """Metabolic decay + external influence."""
         for h in self._hormones:
             baseline = 0.5
-            self._hormones[h] = self._hormones[h] * 0.95 + baseline * 0.05
+            rate = self.HORMONE_DECAY_RATE
+            self._hormones[h] = self._hormones[h] * (1 - rate) + baseline * rate
         return self._hormones
 
     def _compute_somatic_readout(self, hormones: Dict) -> SomaticReadout:
@@ -179,12 +201,16 @@ class BioSystem:
                     self._hormones[h] = max(0.0, min(1.0, self._hormones[h] + deltas[h]))
 
     def save_state(self):
+        """§4C: only slow-layer hormones (temperament) + epoch are
+        durable. Fast-layer hormones and the last somatic reading are
+        deliberately NOT written -- a restarted agent should wake up at
+        resting baseline, not mid-spike from whenever it was last closed."""
         try:
             os.makedirs(_DATA_DIR, exist_ok=True)
+            slow_layer_snapshot = {h: self._hormones[h] for h in self.SLOW_LAYER}
             with open(BIOSYSTEM_STATE_PATH, "w") as f:
                 json.dump({
-                    "hormones": self._hormones,
-                    "somatic": self.somatic.to_dict(),
+                    "slow_layer_hormones": slow_layer_snapshot,
                     "epoch": self.epoch.value,
                     "log_count": len(self.logger),
                 }, f, indent=2)
@@ -192,14 +218,22 @@ class BioSystem:
             logger.warning("BioSystem.save_state failed: %s", e)
 
     def load_state(self):
+        """§4C: restores slow-layer baseline + epoch only. Fast-layer
+        hormones stay at their __init__ resting-baseline defaults --
+        loading never touches them. Also reads the old pre-§4C save
+        format's "hormones" key as a slow-layer-only fallback for
+        backward compatibility with checkpoints written before this fix,
+        rather than silently discarding them."""
         if os.path.exists(BIOSYSTEM_STATE_PATH):
             try:
                 with open(BIOSYSTEM_STATE_PATH, "r") as f:
                     data = json.load(f)
-                self._hormones.update(data.get("hormones", {}))
-                somatic_data = data.get("somatic", {})
-                if somatic_data:
-                    self.somatic = SomaticReadout(**somatic_data)
+                slow_layer_snapshot = data.get("slow_layer_hormones") or {
+                    k: v for k, v in data.get("hormones", {}).items() if k in self.SLOW_LAYER
+                }
+                for h in self.SLOW_LAYER:
+                    if h in slow_layer_snapshot:
+                        self._hormones[h] = slow_layer_snapshot[h]
                 epoch_value = data.get("epoch")
                 if epoch_value:
                     try:
