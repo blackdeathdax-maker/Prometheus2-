@@ -125,14 +125,14 @@ if st.session_state.prom is not None:
 else:
     st.info("Click 'Start System' to begin.")
     fatigue = getattr(prom, 'fatigue', 0)
-            if fatigue < getattr(Prometheus, 'T1', 0.3):
-                fatigue_level = "Low"
-            elif fatigue < getattr(Prometheus, 'T2', 0.7):
-                fatigue_level = "Medium"
-            else:
-                fatigue_level = "High"
+    if fatigue < getattr(Prometheus, 'T1', 0.3):
+            fatigue_level = "Low"
+    elif fatigue < getattr(Prometheus, 'T2', 0.7):
+            fatigue_level = "Medium"
+    else:
+        fatigue_level = "High"
             st.metric("Fatigue", fatigue_level)
-        except Exception as e:
+    except Exception as e:
             st.error(f"State display error: {e}")
             st.code(traceback.format_exc())
 
