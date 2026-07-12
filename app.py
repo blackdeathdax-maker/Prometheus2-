@@ -24,17 +24,14 @@ if st.sidebar.button("Start System", disabled=st.session_state.prom is not None)
         st.session_state.prom = Prometheus()
         st.sidebar.success("System started")
     except Exception as e:
-        st.error(f"Failed to start Prometheus: {e}")
+        st.error(f"Failed to start: {e}")
         st.code(traceback.format_exc(), language="python")
 
 if st.session_state.prom is not None:
     prom = st.session_state.prom
 
-    # ==================== SIDEBAR INPUT ====================
     st.sidebar.subheader("Input")
-    user_text = st.sidebar.text_area(
-        "Say something to Prometheus", key="user_text", height=80
-    )
+    user_text = st.sidebar.text_area("Say something to Prometheus", key="user_text", height=80)
 
     if st.sidebar.button("Send") and user_text.strip():
         try:
@@ -53,23 +50,21 @@ if st.session_state.prom is not None:
             st.code(traceback.format_exc(), language="python")
 
     st.sidebar.subheader("Stimulus")
-    focus = st.sidebar.text_input("Focus", "Knowledge", key="focus")
-    intensity = st.sidebar.slider("Intensity", 0.0, 1.0, 0.7, key="intensity")
+    focus = st.sidebar.text_input("Focus", "Knowledge", key="focus_input")
+    intensity = st.sidebar.slider("Intensity", 0.0, 1.0, 0.7, key="intensity_slider")
     if st.sidebar.button("Trigger Event"):
         try:
-            if hasattr(prom, "stimulus") and hasattr(prom.stimulus, "trigger_internal_event"):
+            if hasattr(prom, 'stimulus'):
                 prom.stimulus.trigger_internal_event(intensity, focus)
                 st.sidebar.success("Event triggered")
             else:
-                st.sidebar.warning("Stimulus module not available yet")
+                st.sidebar.warning("Stimulus not available")
         except Exception as e:
             st.error(f"Stimulus error: {e}")
             st.code(traceback.format_exc(), language="python")
 
-    # ==================== TABS ====================
-    tab_graph, tab_state, tab_reflection, tab_debug = st.tabs(
-        ["Graph", "State", "Reflection", "Debug"]
-    )
+    # Tabs
+    tab_graph, tab_state, tab_reflection, tab_debug = st.tabs(["Graph", "State", "Reflection", "Debug"])
 
     # GRAPH TAB
     with tab_graph:
@@ -79,31 +74,56 @@ if st.session_state.prom is not None:
             try:
                 prom.archivist.store(new_node, source="user")
                 st.success(f"Added {new_node}")
+                st.rerun()
             except Exception as e:
-                st.error(f"Add node error: {e}")
+                st.error(str(e))
 
         try:
             html = render_graph_html(prom.archivist)
-            st.html(html)
+            st.components.v1.html(html, height=750, scrolling=True)
         except Exception as e:
-            st.error(f"Graph rendering error: {e}")
+            st.error(f"Graph render error: {e}")
             st.code(traceback.format_exc(), language="python")
-            st.subheader("Raw Graph Data (Fallback)")
+            # Fallback
+            st.subheader("Raw Graph Data")
+            g = prom.archivist.graph
             st.json({
-                "node_count": prom.archivist.graph.number_of_nodes(),
-                "edge_count": prom.archivist.graph.number_of_edges(),
-                "nodes": list(prom.archivist.graph.nodes(data=True))
+                "nodes": len(g.nodes()),
+                "edges": len(g.edges()),
+                "sample_nodes": list(g.nodes())[:20]
             })
 
     # STATE TAB
     with tab_state:
         st.subheader("Current State")
         try:
-            felt_state = prom.synthesizer.get_current_felt_state()
-            st.metric("Felt State", felt_state)
-            st.metric("Epoch", getattr(getattr(prom, 'bio', None), 'epoch', type('obj', (object,), {'value': 'Unknown'}))().value)
-            st.metric("Operating Mode", str(getattr(prom, 'state', 'Unknown')))
+            felt = prom.synthesizer.get_current_felt_state()
+            st.metric("Felt State", felt)
+            st.metric("Epoch", getattr(getattr(prom, 'bio', None), 'epoch', 'N/A'))
+            st.metric("Node Count", prom.archivist.graph.number_of_nodes())
+        except Exception as e:
+            st.error(f"State error: {e}")
 
+    # REFLECTION TAB (simplified)
+    with tab_reflection:
+        st.subheader("Reflection & Schemas")
+        try:
+            st.write("Check console or add more pulses for schemas.")
+            metrics = prom.reflector.observe()
+            st.json(metrics)
+        except Exception as e:
+            st.error(f"Reflection error: {e}")
+
+    # DEBUG TAB
+    with tab_debug:
+        st.markdown("<div style='background:#402020;padding:8px;border-radius:4px;'><b>RAW STATE (Read-only)</b></div>", unsafe_allow_html=True)
+        try:
+            st.json(prom.bio.get_raw_variables())
+        except Exception as e:
+            st.error(str(e))
+
+else:
+    st.info("Click 'Start System' to begin.")
             fatigue = getattr(prom, 'fatigue', 0)
             if fatigue < getattr(Prometheus, 'T1', 0.3):
                 fatigue_level = "Low"
