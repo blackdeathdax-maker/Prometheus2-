@@ -124,7 +124,7 @@ if st.session_state.prom is not None:
 
 else:
     st.info("Click 'Start System' to begin.")
-            fatigue = getattr(prom, 'fatigue', 0)
+    fatigue = getattr(prom, 'fatigue', 0)
             if fatigue < getattr(Prometheus, 'T1', 0.3):
                 fatigue_level = "Low"
             elif fatigue < getattr(Prometheus, 'T2', 0.7):
