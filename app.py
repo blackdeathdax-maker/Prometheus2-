@@ -31,12 +31,12 @@ if st.session_state.prom is not None:
             st.error(f"Send error: {e}")
             st.code(traceback.format_exc(), language="python")
     if st.sidebar.button("Pulse"):
-    try:
-        prom.pulse()
-        st.sidebar.success("Pulse completed")
-    except Exception as e:
-        st.error(f"Pulse error: {e}")
-        st.code(traceback.format_exc(), language="python")
+        try:
+            prom.pulse()
+            st.sidebar.success("Pulse completed")
+        except Exception as e:
+            st.error(f"Pulse error: {e}")
+            st.code(traceback.format_exc(), language="python")
     st.sidebar.subheader("Stimulus")
     focus = st.sidebar.text_input("Focus", "Knowledge")
     intensity = st.sidebar.slider("Intensity", 0.0, 1.0, 0.7)
