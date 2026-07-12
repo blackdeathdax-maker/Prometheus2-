@@ -23,12 +23,20 @@ if st.session_state.prom is not None:
         "Say something to Prometheus", key="user_text", height=80
     )
     if st.sidebar.button("Send") and user_text.strip():
-        prom.queue_input(user_text.strip(), source="user")
+    try:
         st.sidebar.success("Queued for next pulse")
-
+        # Existing call
+        prom_queue_input(user_text.strip(), source="user")
+    except Exception as e:
+        st.error(f"Send error: {e}")
+        st.code(traceback.format_exc(), language="python")
     if st.sidebar.button("Pulse"):
+    try:
         prom.pulse()
-
+        st.sidebar.success("Pulse completed")
+    except Exception as e:
+        st.error(f"Pulse error: {e}")
+        st.code(traceback.format_exc(), language="python")
     st.sidebar.subheader("Stimulus")
     focus = st.sidebar.text_input("Focus", "Knowledge")
     intensity = st.sidebar.slider("Intensity", 0.0, 1.0, 0.7)
@@ -57,8 +65,7 @@ if st.session_state.prom is not None:
             # In-memory generate_html() per the Task 1 fix -- no filesystem
             # write, so this can't silently fail or race across sessions.
             html = render_graph_html(prom.archivist)
-            st.components.v1.html(html, height=700)
-
+            st.html(html)   # or st.iframe if it's an external src
     # ================================================================
     # TAB: STATE -- Current felt state and epoch (§4B)
     # ================================================================
