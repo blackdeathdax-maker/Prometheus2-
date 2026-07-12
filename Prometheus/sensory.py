@@ -2,7 +2,7 @@ import logging
 import re
 from typing import List, Optional, Tuple
 
-from prometheus.core import Message
+from .core import Message
 
 logger = logging.getLogger(__name__)
 
