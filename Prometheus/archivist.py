@@ -23,6 +23,11 @@ TIER_TRUSTED = 2
 # having a self to relate things to.
 SELF_NODE = "SELF"
 
+# §2.1b concerns-other placeholder: generic OTHER entity node for relational
+# edges involving someone other than SELF (jealousy, embarrassment, social
+# emotions generally).
+OTHER_NODE = "OTHER"
+
 # --- Trust scoring weights (§3.2). None of these are numerically tuned in
 # the spec (§10 item 4 is flagged as the single highest-priority remaining
 # item) -- these are documented placeholders, not claimed-final values.
@@ -65,6 +70,7 @@ class ArchivistModule:
         self.graph = nx.MultiDiGraph()
         self.load()
         self._seed_self_node()
+        self._seed_other_node()
 
     # ------------------------------------------------------------------
     # §2.1b item 1 -- the one non-emergent exception in the whole design.
@@ -76,6 +82,26 @@ class ArchivistModule:
                 last_reinforced=datetime.now(),
                 source="axiom",
                 tier=TIER_TRUSTED,
+                regulatory_efficacy=0.5,
+                tier0_cycles=0,
+            )
+            self.save()
+
+    # ------------------------------------------------------------------
+    # §2.1b concerns-other support: seed OTHER placeholder node.
+    # ------------------------------------------------------------------
+    def _seed_other_node(self):
+        """Seeds the OTHER node for relational edges (§2.1b, §4A).
+        OTHER represents "any entity other than SELF" and is used by
+        concerns-other edges (jealousy, embarrassment, social emotions).
+        Not an axiom like SELF (not permanently Trusted), but initialized
+        at Working tier so it doesn't get pruned before accumulating edges."""
+        if OTHER_NODE not in self.graph:
+            self.graph.add_node(
+                OTHER_NODE,
+                last_reinforced=datetime.now(),
+                source="schema",
+                tier=TIER_WORKING,
                 regulatory_efficacy=0.5,
                 tier0_cycles=0,
             )
