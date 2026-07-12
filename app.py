@@ -23,7 +23,7 @@ if st.session_state.prom is not None:
         "Say something to Prometheus", key="user_text", height=80
     )
     if st.sidebar.button("Send") and user_text.strip():
-    try:
+        try:
         st.sidebar.success("Queued for next pulse")
         # Existing call
         prom_queue_input(user_text.strip(), source="user")
