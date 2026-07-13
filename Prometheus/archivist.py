@@ -254,6 +254,23 @@ class ArchivistModule:
             if node == SELF_NODE:
                 continue  # permanent axiom, never re-evaluated (§2.1b item 1)
             data = self.graph.nodes[node]
+            if data.get("is_schema"):
+                # Bug fix: Schema Nodes were falling through to the generic
+                # trust-tier formula, using a "schema" source tag that isn't
+                # in SOURCE_WEIGHT at all (silently defaulting to 0.3, the
+                # same base as an unconfirmed user assertion). A Schema Node
+                # represents a pattern validated by its OWN stabilization
+                # mechanism (§2.1b's hysteresis-over-N-recurrences at
+                # creation) -- subjecting it a second time to the
+                # epistemic-fact trust system is a category error, and
+                # concretely meant a schema's score could drift below the
+                # promotion threshold (e.g. after a WORKING_THRESHOLD slider
+                # adjustment) and get demoted, then eventually pruned --
+                # silently erasing a validated emotional pattern through a
+                # mechanism that was never meant to touch it. Same treatment
+                # as SELF_NODE: exempt entirely, not just given a favorable
+                # score.
+                continue
             current = data.get("tier", TIER_PROVISIONAL)
 
             # Non-reinforcement decay (§3.4 mechanism 2): track cycles
