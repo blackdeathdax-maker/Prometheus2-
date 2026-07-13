@@ -1,7 +1,7 @@
 import random
 
 from .hormonal import BioSystem, Epoch
-from .archivist import ArchivistModule, TIER_WORKING, TIER_TRUSTED
+from .archivist import ArchivistModule, TIER_WORKING, TIER_TRUSTED, SELF_NODE, OTHER_NODE
 from .executive import ExecutiveModule
 from .synthesizer import SynthesizerModule
 from .reflector import ReflectorModule
@@ -236,27 +236,79 @@ class Prometheus:
     def _select_self_study_target(self):
         """(a) active/trusted nodes with few children, or (b) emotionally
         salient nodes weighted by *current* felt state (§5.1) -- historical
-        emotional weighting stays inside Consolidation, not here."""
+        emotional weighting stays inside Consolidation, not here.
+
+        Fixes a real bug found by running the system: the out_degree<3 cap
+        previously only applied to the primary (Working+ tier) candidate
+        filter. Both fallback paths had no cap at all, so once that pool
+        emptied out (which happens fast -- a dictionary-sourced node clears
+        the Working threshold on its own base score alone, no corroboration
+        needed), self-study fell through to fallbacks that could keep
+        piling unlimited children onto an already-large hub -- producing
+        exactly the runaway starburst clusters seen in testing.
+
+        Second, related bug: requiring tier>=Working to even be a
+        *candidate* structurally excluded every fresh/user-typed node,
+        which starts Provisional. That's a chicken-and-egg deadlock --
+        self-study is one of the main ways a node accumulates the
+        corroboration needed to promote past Provisional, but a Provisional
+        node could never be selected for self-study in the first place.
+        This is why user input sat in a disconnected, unexpanded chain
+        while dictionary hubs absorbed all self-study attention.
+        """
         graph = self.archivist.graph
         if graph.number_of_nodes() == 0:
             return None
 
-        candidates = [
-            n for n, d in graph.nodes(data=True)
-            if d.get("tier", 0) >= TIER_WORKING and graph.out_degree(n) < 3 and not d.get("is_schema")
-        ]
-        if candidates:
-            return random.choice(candidates)
+        def has_room(n, d):
+            return (
+                graph.out_degree(n) < 3
+                and not d.get("is_schema")
+                and n not in (SELF_NODE, OTHER_NODE)
+            )
 
-        # (b) fallback: whatever node is currently anchoring the felt
-        # state, if any.
+        working_candidates = [
+            n for n, d in graph.nodes(data=True)
+            if d.get("tier", 0) >= TIER_WORKING and has_room(n, d)
+        ]
+        # (b) NEW: Provisional nodes with room, source-tagged non-self-generated
+        # (i.e. real user/dictionary input, not the agent's own prior
+        # self-study output) -- gives fresh input a genuine shot at
+        # self-study attention instead of waiting on a tier it may never
+        # reach without exactly this kind of reinforcement.
+        provisional_candidates = [
+            n for n, d in graph.nodes(data=True)
+            if d.get("tier", 0) < TIER_WORKING and d.get("source") != "self_generated" and has_room(n, d)
+        ]
+
+        if working_candidates and provisional_candidates:
+            # Weighted toward provisional: established hubs already got
+            # their initial attention, fresh nodes need it more. Not a
+            # tuned ratio (§10) -- worth a slider if this needs finer
+            # control later.
+            pool = provisional_candidates if random.random() < 0.6 else working_candidates
+            return random.choice(pool)
+        if provisional_candidates:
+            return random.choice(provisional_candidates)
+        if working_candidates:
+            return random.choice(working_candidates)
+
+        # (c) fallback: whatever node is currently anchoring the felt
+        # state, if any -- but only if it also still has room. Previously
+        # uncapped, which was the main source of runaway single-node growth.
         key = self.synthesizer.get_current_basin_key()
         anchors = self.felt_state_anchors.get(key, [])
         if anchors:
-            return anchors[-1]
+            anchor = anchors[-1]
+            if anchor in graph and has_room(anchor, graph.nodes[anchor]):
+                return anchor
 
-        # Last resort: any node at all.
-        return random.choice(list(graph.nodes)) if graph.number_of_nodes() else None
+        # (d) last resort: any node with room, not just any node at all
+        # (same fix -- this used to be truly uncapped).
+        low_degree_any = [n for n, d in graph.nodes(data=True) if has_room(n, d)]
+        if low_degree_any:
+            return random.choice(low_degree_any)
+        return None
 
     # ------------------------------------------------------------------
     # Fatigue / state cycling
