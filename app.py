@@ -16,6 +16,21 @@ if st.sidebar.button("Start System", disabled=st.session_state.prom is not None)
     st.session_state.prom = Prometheus()
     st.sidebar.success("System started")
 
+with st.sidebar.expander("Reset Persistent Memory"):
+    st.caption(
+        "Deletes every on-disk checkpoint (§4C): the knowledge graph, "
+        "chronos's rolling log, hormonal's slow-layer baseline + epoch, "
+        "and the basin/schema landscape. Cannot be undone."
+    )
+    confirm_reset = st.checkbox("I understand this permanently erases all memory", key="confirm_reset")
+    if st.button("Reset Memory", disabled=not confirm_reset):
+        removed = Prometheus.reset_persistent_memory()
+        st.session_state.prom = None  # discard the live instance -- __init__ only
+                                       # loads from disk once, at creation, so the
+                                       # old in-memory state would otherwise survive
+                                       # even after the files on disk are gone.
+        st.success(f"Memory reset. Removed {len(removed)} file(s). Click 'Start System' to begin fresh.")
+
 if st.session_state.prom is not None:
     prom = st.session_state.prom
     st.sidebar.subheader("Input")
