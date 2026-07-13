@@ -1,3 +1,4 @@
+import os
 import random
 
 from .hormonal import BioSystem, Epoch
@@ -373,6 +374,7 @@ class Prometheus:
         # the one clock persistence is gated to.
         self.archivist.save()
         self.bio.save_state()
+        self.synthesizer.save_state()
 
         if trust_summary.get("promotions") or trust_summary.get("demotions"):
             print(f"Consolidation trust pass: {trust_summary}")
@@ -485,3 +487,26 @@ class Prometheus:
         for _ in range(num_pulses):
             self.pulse()
         print("Run complete.")
+
+    @staticmethod
+    def reset_persistent_memory():
+        """Deletes every module's on-disk checkpoint (§4C): the knowledge
+        graph, chronos's rolling log, hormonal's slow-layer baseline +
+        epoch, and the basin/schema landscape. Does NOT touch a live
+        instance's in-memory state -- callers must also discard their
+        current Prometheus() object and create a fresh one (e.g. clear
+        st.session_state.prom in app.py) for a reset to actually take
+        effect, since __init__ only loads from disk once, at creation.
+        Safe to call even if some/all files don't exist yet. Returns the
+        list of paths actually removed, for a confirmation message."""
+        from .archivist import EPISTEMIC_GRAPH_PATH
+        from .chronos import CHRONOS_LOG_PATH
+        from .hormonal import BIOSYSTEM_STATE_PATH
+        from .synthesizer import BASIN_STATE_PATH
+
+        removed = []
+        for path in (EPISTEMIC_GRAPH_PATH, CHRONOS_LOG_PATH, BIOSYSTEM_STATE_PATH, BASIN_STATE_PATH):
+            if os.path.exists(path):
+                os.remove(path)
+                removed.append(path)
+        return removed

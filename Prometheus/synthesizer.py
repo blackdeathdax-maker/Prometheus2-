@@ -1,5 +1,16 @@
 from collections import defaultdict
 from typing import Dict, Tuple
+import json
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+
+_DATA_DIR = os.environ.get(
+    "PROMETHEUS_DATA_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
+)
+BASIN_STATE_PATH = os.path.join(_DATA_DIR, "basin_state.json")
 
 
 class SynthesizerModule:
@@ -23,13 +34,27 @@ class SynthesizerModule:
     # §4.5). Applied once per Consolidation pass, same cadence as the rest
     # of basin formation (§2.1a point 6).
     DECAY_RATE = 0.85
-    DESTABILIZATION_FLOOR = 1.0
+    # Bug fix: this was 1.0, which is higher than a single fresh visit
+    # (basin_grid starts a new key at exactly 1.0). Since decay applies
+    # every Consolidation pass and 1.0*0.85=0.85 < 1.0, ANY bin that
+    # hadn't already reached ~4 hits got deleted on its very first decay
+    # pass -- before it could ever accumulate toward STABILIZATION_THRESHOLD
+    # (3). Combined with Consolidation firing every few ticks (post-fatigue
+    # -fix), this meant basins essentially never survived long enough to
+    # stabilize, regardless of how long the system ran -- reproducing
+    # exactly the reported "consistently Unformed" symptom. The floor
+    # should catch basins that WERE stabilized and have since gone
+    # unused for a long time, not erase fresh candidates on their first
+    # non-reinforced pass. Still a §10 tuning placeholder, but 1.0 was
+    # not just "untuned," it was structurally wrong.
+    DESTABILIZATION_FLOOR = 0.2
 
     def __init__(self):
         self.basin_grid = defaultdict(float)
         self.stabilized_basins: Dict[Tuple[float, float, float], str] = {}
         self.current_felt_state = "Unformed"
         self._current_key: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self.load_state()
 
     def _project_axes(self, raw: Dict[str, float]) -> Tuple[float, float, float]:
         """Composite axis formulas per §2.1a. Exact weighting/normalization
@@ -114,3 +139,50 @@ class SynthesizerModule:
             f"Consolidation: {newly_stabilized} new basin(s), "
             f"{destabilized} destabilized, {len(self.stabilized_basins)} total stabilized."
         )
+
+    # ------------------------------------------------------------------
+    # Persistence (§4C). Previously entirely missing -- the whole
+    # emotional web (basin_grid, stabilized_basins) lived purely in
+    # memory and reset to empty on every fresh SynthesizerModule()
+    # instantiation, meaning basin-formation progress never survived an
+    # app restart, and a genuine "reset memory" action had no dedicated
+    # target for this module (it just happened by accident on restart,
+    # while archivist.py/hormonal.py's data would silently persist and
+    # get out of sync with a "reset" emotional web). Same JSON-file
+    # pattern as archivist.py/hormonal.py/chronos.py. Checkpointed once,
+    # at the end of Consolidation, by prometheus.py -- not on every tick.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _key_to_str(key: Tuple[float, float, float]) -> str:
+        """Tuple keys aren't valid JSON object keys -- encode losslessly
+        as a delimited string, decoded back to a tuple on load."""
+        return "|".join(str(v) for v in key)
+
+    @staticmethod
+    def _str_to_key(s: str) -> Tuple[float, float, float]:
+        parts = s.split("|")
+        return (float(parts[0]), float(parts[1]), float(parts[2]))
+
+    def save_state(self):
+        try:
+            os.makedirs(_DATA_DIR, exist_ok=True)
+            data = {
+                "basin_grid": {self._key_to_str(k): v for k, v in self.basin_grid.items()},
+                "stabilized_basins": {self._key_to_str(k): v for k, v in self.stabilized_basins.items()},
+            }
+            with open(BASIN_STATE_PATH, "w") as f:
+                json.dump(data, f, indent=2)
+        except OSError as e:
+            logger.warning("SynthesizerModule.save_state failed: %s", e)
+
+    def load_state(self):
+        if os.path.exists(BASIN_STATE_PATH):
+            try:
+                with open(BASIN_STATE_PATH, "r") as f:
+                    data = json.load(f)
+                for k_str, v in data.get("basin_grid", {}).items():
+                    self.basin_grid[self._str_to_key(k_str)] = v
+                for k_str, basin_id in data.get("stabilized_basins", {}).items():
+                    self.stabilized_basins[self._str_to_key(k_str)] = basin_id
+            except (json.JSONDecodeError, OSError, TypeError, ValueError, IndexError) as e:
+                logger.warning("SynthesizerModule.load_state failed, starting fresh: %s", e)

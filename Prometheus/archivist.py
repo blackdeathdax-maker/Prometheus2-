@@ -407,12 +407,33 @@ class ArchivistModule:
                 with open(EPISTEMIC_GRAPH_PATH, "r") as f:
                     data = json.load(f)
                 self.graph = nx.readwrite.json_graph.node_link_graph(data)
+                self._deserialize_timestamps()
             except (json.JSONDecodeError, OSError, KeyError, TypeError) as e:
                 logger.warning(
                     "ArchivistModule.load failed (%s); starting with an empty graph instead of crashing.",
                     e,
                 )
                 self.graph = nx.MultiDiGraph()
+
+    def _deserialize_timestamps(self):
+        """save() writes `last_reinforced` via json.dump's `default=str`,
+        which serializes datetime objects to ISO strings -- but
+        node_link_graph() never converts them back on load. Every node
+        created *this session* gets a real datetime.now() (store()/
+        link()), so a loaded graph ends up with a mix of string and
+        datetime timestamps on the same field, and any comparison across
+        both (e.g. _most_active_node()'s sort, retrieve()'s sort) raises
+        `TypeError: '<' not supported between instances of 'str' and
+        'datetime.datetime'`. Fixing this once here, at the load boundary,
+        means every downstream consumer can assume a real datetime rather
+        than defensively handling both types at every comparison site."""
+        for _n, data in self.graph.nodes(data=True):
+            lr = data.get("last_reinforced")
+            if isinstance(lr, str):
+                try:
+                    data["last_reinforced"] = datetime.fromisoformat(lr)
+                except ValueError:
+                    data["last_reinforced"] = datetime.min
 
     def retrieve(self, key: str, bias: str = None):
         """Minimal existing behavior preserved; returns nodes matching key
