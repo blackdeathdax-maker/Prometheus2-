@@ -3,6 +3,7 @@ import random
 
 from .hormonal import BioSystem, Epoch
 from .archivist import ArchivistModule, TIER_WORKING, TIER_TRUSTED, SELF_NODE, OTHER_NODE
+from .edge_types import CATEGORICAL_EDGE_TYPES
 from .executive import ExecutiveModule
 from .synthesizer import SynthesizerModule
 from .reflector import ReflectorModule
@@ -51,6 +52,17 @@ class Prometheus:
     # background texture, not a significant event (§5.1, §9 risk 7).
     SELF_STUDY_DOPAMINE_BUMP = 0.03
 
+    # Self-study saturation fix (this revision). Retry a few different
+    # candidates within the same tick before giving up entirely, rather
+    # than wasting the whole tick on one dead-end pick. The soft cap is an
+    # escape valve: once the strict out_degree<3 pool (see
+    # _select_self_study_target) is fully exhausted -- every remaining
+    # non-barren node already at the cap -- allow a bounded amount of
+    # further growth rather than permanently halting, without reopening
+    # unlimited runaway-hub growth the strict cap exists to prevent.
+    SELF_STUDY_MAX_ATTEMPTS = 3
+    SELF_STUDY_SOFT_CAP = 6
+
     # §6.1 / §6.2 gate parameters. Same "not yet numerically tuned"
     # category as everything else in §10 -- placeholders, documented.
     NAMING_WINDOW = 20
@@ -91,6 +103,21 @@ class Prometheus:
         # Queue of external input waiting to be ingested this Learning
         # tick; when empty, self-study fires instead (§5.1).
         self._input_queue = []
+
+        # Self-study saturation fix (this revision, found from production
+        # data: node growth stalled ~104 nodes despite thousands of
+        # Learning-state pulses, throughput ~0.1 edges/pulse). Root cause:
+        # has_room()'s out_degree<3 cap is deliberate (prevents runaway
+        # hub growth, see _select_self_study_target's docstring), but
+        # self-study had no memory of which capped-out-of-room OR
+        # zero-hyponym ("barren") nodes it had already tried. Once the
+        # few productive, many-hyponym hub words hit the degree cap, a
+        # growing fraction of random picks landed on WordNet leaf terms
+        # (e.g. "brougham", "trolley coach" -- real hyponyms of "bus", but
+        # themselves childless) that silently produce nothing, forever,
+        # since the same dead ends kept getting re-picked. Tracked here so
+        # a verified-empty target is never re-selected again.
+        self._barren_self_study_targets = set()
 
         print("Prometheus Core Initialized with Fatigue Cycling")
 
@@ -211,14 +238,36 @@ class Prometheus:
         directly drain a fatigue counter -- it triggers a small hormonal
         reaction (dopamine bump) through the normal fast-layer pathway,
         and fatigue rises as a *consequence* of that, same as everything
-        else (§5.1)."""
-        target = self._select_self_study_target()
-        if target is None:
-            return
+        else (§5.1).
 
-        expansions = self.sensory.lookup_expansion(target)
-        if not expansions:
-            return
+        Saturation fix (this revision): previously picked exactly one
+        target and gave up silently if it had no WordNet hyponyms, with
+        no memory of the attempt -- so once the graph's few productive,
+        many-hyponym hub words hit the degree cap, an increasing fraction
+        of ticks landed on WordNet leaf terms (real hyponyms with no
+        hyponyms of their own) and produced nothing, forever, because the
+        same dead ends kept getting re-picked. Now retries up to
+        SELF_STUDY_MAX_ATTEMPTS different candidates per tick and
+        memoizes any confirmed-barren target in
+        self._barren_self_study_targets, permanently excluding it from
+        future selection (see _select_self_study_target's has_room)."""
+        target = None
+        expansions = []
+        for _ in range(self.SELF_STUDY_MAX_ATTEMPTS):
+            target = self._select_self_study_target()
+            if target is None:
+                return
+            expansions = self.sensory.lookup_expansion(target)
+            if expansions:
+                break
+            # Verified dead end -- memoize so this specific node is never
+            # wastefully re-picked again, freeing the random-selection
+            # pool toward nodes that can actually still produce children.
+            self._barren_self_study_targets.add(target)
+            target = None
+
+        if target is None or not expansions:
+            return  # every attempt this tick hit a confirmed dead end
 
         for child in expansions[:3]:
             definition = self.sensory.lookup_definition(child) or ""
@@ -234,7 +283,7 @@ class Prometheus:
                 1.0, self.bio._hormones["dopamine"] + self.SELF_STUDY_DOPAMINE_BUMP
             )
 
-    def _select_self_study_target(self):
+    def _select_self_study_target(self, hard_cap: int = 3):
         """(a) active/trusted nodes with few children, or (b) emotionally
         salient nodes weighted by *current* felt state (§5.1) -- historical
         emotional weighting stays inside Consolidation, not here.
@@ -256,16 +305,36 @@ class Prometheus:
         node could never be selected for self-study in the first place.
         This is why user input sat in a disconnected, unexpanded chain
         while dictionary hubs absorbed all self-study attention.
+
+        Third fix, this revision: "room" is now counted on categorical
+        out-edges only (is-a/part-of/associated-with), not relational
+        (responsible-for/violates/etc.) or composed-of edges -- a node
+        shouldn't be treated as "full" for hierarchy-branching purposes
+        because it happens to carry unrelated relational/schema edges.
+        Also excludes any node memoized in self._barren_self_study_targets
+        (confirmed zero WordNet hyponyms, §5.1 saturation fix) so dead
+        ends stop consuming picks from the random-selection pool.
+
+        `hard_cap` lets the (e) escape-valve fallback below retry with a
+        looser ceiling once the strict cap has genuinely exhausted every
+        productive node, rather than permanently halting growth.
         """
         graph = self.archivist.graph
         if graph.number_of_nodes() == 0:
             return None
 
+        def categorical_out_degree(n):
+            return sum(
+                1 for _u, _v, edata in graph.out_edges(n, data=True)
+                if edata.get("relation_type") in CATEGORICAL_EDGE_TYPES
+            )
+
         def has_room(n, d):
             return (
-                graph.out_degree(n) < 3
+                categorical_out_degree(n) < hard_cap
                 and not d.get("is_schema")
                 and n not in (SELF_NODE, OTHER_NODE)
+                and n not in self._barren_self_study_targets
             )
 
         working_candidates = [
@@ -309,6 +378,18 @@ class Prometheus:
         low_degree_any = [n for n, d in graph.nodes(data=True) if has_room(n, d)]
         if low_degree_any:
             return random.choice(low_degree_any)
+
+        # (e) escape valve (this revision): (a)-(d) all failed, meaning
+        # every non-barren node in the graph is already at hard_cap
+        # categorical children. Rather than permanently halting growth
+        # (the actual production symptom this fix addresses), retry once
+        # with a softer ceiling -- still bounded, so this doesn't reopen
+        # the unlimited-runaway-hub risk the strict cap exists to prevent,
+        # it just means "everything productive is capped" isn't a
+        # permanent dead end for the whole system.
+        if hard_cap < self.SELF_STUDY_SOFT_CAP:
+            return self._select_self_study_target(hard_cap=self.SELF_STUDY_SOFT_CAP)
+
         return None
 
     # ------------------------------------------------------------------
@@ -409,7 +490,20 @@ class Prometheus:
         """
         key = self.synthesizer.get_current_basin_key()
         anchors = self.felt_state_anchors.get(key, [])
-        regulating_nodes = self.archivist.eligible_regulation_nodes(anchors or None)
+        # Bug fix (found from production data: every node's regulatory
+        # efficacy sat at exactly the same value, 0.05 below the 0.5
+        # default, across the entire eligible pool -- only possible if a
+        # single event nudged literally everyone at once). `anchors or
+        # None` treated an empty anchor list the same as "no restriction
+        # requested," so whenever no felt-state anchor had been recorded
+        # yet (common, especially before Childhood naming has happened
+        # for a given basin), eligible_regulation_nodes(None) fell back to
+        # *every* Working/Trusted-tier node in the graph -- not the
+        # felt-state-scoped set §4.2 specifies. Passing `anchors` directly
+        # (even when empty) means an empty anchor list correctly produces
+        # zero eligible nodes, which hits the pre-existing "legitimate
+        # state, nothing eligible yet" early-return below instead.
+        regulating_nodes = self.archivist.eligible_regulation_nodes(anchors)
 
         if not regulating_nodes:
             # §4.2: legitimate state (nothing eligible yet), not an error.
