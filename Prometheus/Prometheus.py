@@ -183,7 +183,7 @@ class Prometheus:
             avd=self.synthesizer.get_current_basin_key(),
         )
 
-        self._update_fatigue(somatic)
+        self._update_fatigue()
         self._cycle_state()
         self.maybe_advance_epoch()
 
@@ -314,8 +314,20 @@ class Prometheus:
     # ------------------------------------------------------------------
     # Fatigue / state cycling
     # ------------------------------------------------------------------
-    def _update_fatigue(self, somatic):
-        self.fatigue = min(1.0, self.fatigue + somatic.urgency * self.FATIGUE_GROWTH_RATE)
+    def _update_fatigue(self):
+        """Fatigue growth (§5) previously read somatic.urgency directly --
+        the raw SomaticReadout returned by bio.step(), i.e. hidden-layer
+        output that bypasses synthesizer.py entirely. Every other
+        decision point in this file (regulation §4.1, executive bias) was
+        already careful to route only through
+        synthesizer.get_current_intensity(); fatigue was the one
+        exception, in real violation of the Core Emergence Principle
+        despite this file's own docstring/comments elsewhere insisting on
+        it. Fixed to use the same synthesized intensity signal (arousal
+        component of the current basin key, §2.1a) as everything else --
+        no raw hidden-layer read anywhere in this method now."""
+        intensity = self.synthesizer.get_current_intensity()
+        self.fatigue = min(1.0, self.fatigue + intensity * self.FATIGUE_GROWTH_RATE)
 
     def _cycle_state(self):
         """Hysteresis-banded state cycling (§5 stability requirement)."""

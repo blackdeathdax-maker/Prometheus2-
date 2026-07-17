@@ -50,6 +50,10 @@ class SynthesizerModule:
     DESTABILIZATION_FLOOR = 0.2
 
     def __init__(self):
+        self.GRID_RESOLUTION = SynthesizerModule.GRID_RESOLUTION
+        self.STABILIZATION_THRESHOLD = SynthesizerModule.STABILIZATION_THRESHOLD
+        self.DECAY_RATE = SynthesizerModule.DECAY_RATE
+        self.DESTABILIZATION_FLOOR = SynthesizerModule.DESTABILIZATION_FLOOR
         self.basin_grid = defaultdict(float)
         self.stabilized_basins: Dict[Tuple[float, float, float], str] = {}
         self.current_felt_state = "Unformed"
@@ -65,7 +69,15 @@ class SynthesizerModule:
         return arousal, valence, dominance
 
     def _bin_key(self, arousal: float, valence: float, dominance: float) -> Tuple[float, float, float]:
-        return (round(arousal, 1), round(valence, 1), round(dominance, 1))
+        # Previously hardcoded round(x, 1) regardless of GRID_RESOLUTION's
+        # value -- the constant existed but changing it did nothing. Now
+        # actually drives the rounding, so it's a real tunable (§10 item 11)
+        # rather than a placeholder that only looked like one.
+        return (
+            round(arousal, self.GRID_RESOLUTION),
+            round(valence, self.GRID_RESOLUTION),
+            round(dominance, self.GRID_RESOLUTION),
+        )
 
     def update_from_core(self, raw_variables: Dict[str, float]):
         """

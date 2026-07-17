@@ -3,8 +3,19 @@ import re
 from typing import List, Optional, Tuple
 
 from .core import Message
+from .edge_types import (
+    EDGE_IS_A, EDGE_PART_OF, EDGE_VIOLATES, EDGE_RESPONSIBLE_FOR,
+    EDGE_TEMPORAL_CONTRAST, EDGE_CONCERNS_OTHER,
+)
 
 logger = logging.getLogger(__name__)
+
+# Dictionary source (§2.2, §5.1) is WordNet via nltk.corpus.wordnet --
+# glosses (lookup_definition), hyponyms (lookup_expansion, self-study
+# children), hypernyms (lookup_hypernym, re-parenting), and synonyms
+# (lookup_synonyms, canonicalization) all come from the same corpus. This
+# is why nltk is a requirement even though nothing else in the design uses
+# NLP -- previously undocumented anywhere in the spec.
 
 try:
     import nltk
@@ -94,14 +105,14 @@ class SensoryModule:
             if m:
                 parent = _first_noun_phrase(m.group(1))
                 if parent:
-                    return parent, "part-of"
+                    return parent, EDGE_PART_OF
 
         for pat in _HIERARCHY_PATTERNS:
             m = pat.match(text)
             if m:
                 parent = _first_noun_phrase(m.group(1))
                 if parent:
-                    return parent, "is-a"
+                    return parent, EDGE_IS_A
 
         return None
 
@@ -118,38 +129,85 @@ class SensoryModule:
 
         # violates -- conflicts with a standard/value linked to SELF
         if "should not" in text or "shouldn't" in text or "wrong" in text or "not supposed to" in text:
-            found.append("violates")
+            found.append(EDGE_VIOLATES)
 
         # responsible-for -- SELF as agent of an action/outcome
         if "i did" in text or "my fault" in text or " i caused" in f" {text}" or "i made" in text:
-            found.append("responsible-for")
+            found.append(EDGE_RESPONSIBLE_FOR)
 
         # temporal-contrast -- relates a node to a differing past state
         # (nostalgia). Keyword-level only, per spec: "using timestamps
         # chronos.py already logs" rather than any semantic comparison.
         if "used to" in text or "back then" in text or "remember when" in text or "before, " in text:
-            found.append("temporal-contrast")
+            found.append(EDGE_TEMPORAL_CONTRAST)
 
         # concerns-other -- involves a distinct entity other than SELF
         # (jealousy, embarrassment, social emotions generally). Cheap
         # heuristic: third-person pronoun or "they/he/she/someone" present.
         if re.search(r"\b(he|she|they|someone|another person|my friend|my sister|my brother)\b", text):
-            found.append("concerns-other")
+            found.append(EDGE_CONCERNS_OTHER)
 
         return found
 
     def lookup_expansion(self, node: str):
-        """Real dictionary lookup using WordNet for self-study expansion.
+        """Self-study expansion (§5.1): "an existing 'colors' node gets
+        children like 'blue,' 'white' pulled autonomously from the
+        dictionary." That's a hyponym relationship (subtype), NOT a
+        synonym one -- a prior version of this method returned
+        syn.lemmas() (same-synset synonyms, e.g. "colour"/"coloring" for
+        "colors"), which can never actually produce the parent->child
+        taxonomy §5.1 describes, since synonyms aren't children. Fixed to
+        use syn.hyponyms(), with the old synonym behavior preserved
+        separately in lookup_synonyms() for its own, different, use
+        (canonicalization/dedup -- see that method's docstring).
         Returns an empty list rather than raising if WordNet isn't
         available, so self-study degrades gracefully offline instead of
         crashing the pulse loop."""
         if not _WORDNET_AVAILABLE:
             return []
+        children = []
+        for syn in wordnet.synsets(node):
+            for hyponym in syn.hyponyms():
+                for lemma in hyponym.lemmas():
+                    children.append(lemma.name().replace("_", " "))
+        return list(set(children))[:5]
+
+    def lookup_synonyms(self, node: str):
+        """Same-synset synonyms (e.g. "color" -> "colour," "coloring").
+        NOT used for self-study expansion (a synonym is the same concept
+        wearing a different word, not a child of it) -- intended use is
+        canonicalization/dedup: association.py can check this before
+        creating a new node, so "color" and "colour" reinforce one shared
+        node instead of splitting corroboration across two. Not yet wired
+        into place_node()'s create path -- flagged as an open item, same
+        shape as §11's archive rehydration problem, just showing up
+        earlier in the live graph rather than after archiving exists."""
+        if not _WORDNET_AVAILABLE:
+            return []
         synonyms = []
         for syn in wordnet.synsets(node):
             for lemma in syn.lemmas():
-                synonyms.append(lemma.name())
+                synonyms.append(lemma.name().replace("_", " "))
         return list(set(synonyms))[:5]
+
+    def lookup_hypernym(self, node: str) -> Optional[str]:
+        """First WordNet hypernym (the broader category `node` belongs
+        to), e.g. "blue" -> "color". Used by association.py's re-parenting
+        pass (§2.3 mechanism 3) as the authoritative firmer parent for a
+        co-occurrence-placed node, instead of trying to regex-parse a
+        gloss with parse_hierarchy() -- WordNet's own taxonomy already
+        gives the answer directly, no pattern-matching needed. Returns
+        None if there's no hypernym (already a root concept) or WordNet
+        is unavailable."""
+        if not _WORDNET_AVAILABLE:
+            return None
+        synsets = wordnet.synsets(node)
+        if not synsets:
+            return None
+        hypernyms = synsets[0].hypernyms()
+        if not hypernyms:
+            return None
+        return hypernyms[0].lemmas()[0].name().replace("_", " ")
 
     def lookup_definition(self, node: str) -> Optional[str]:
         """WordNet gloss for `node`, used as the definitional text

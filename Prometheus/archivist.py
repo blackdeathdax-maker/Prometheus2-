@@ -5,6 +5,11 @@ import networkx as nx
 from datetime import datetime
 from typing import Dict, List, Optional
 
+from .edge_types import (
+    TRUST_BEARING_EDGE_TYPES, NODE_STANDARD, NODE_BASIN, NODE_SCHEMA, NODE_SELF,
+    EDGE_ASSOCIATED_WITH, EDGE_IS_A,
+)
+
 logger = logging.getLogger(__name__)
 
 _DATA_DIR = os.environ.get(
@@ -101,6 +106,7 @@ class ArchivistModule:
                 tier=TIER_TRUSTED,
                 regulatory_efficacy=0.5,
                 tier0_cycles=0,
+                node_type=NODE_SELF,
             )
             self.save()
 
@@ -121,6 +127,7 @@ class ArchivistModule:
                 tier=TIER_WORKING,
                 regulatory_efficacy=0.5,
                 tier0_cycles=0,
+                node_type=NODE_STANDARD,
             )
             self.save()
 
@@ -141,6 +148,7 @@ class ArchivistModule:
                 tier=tier,
                 regulatory_efficacy=0.5,
                 tier0_cycles=0,
+                node_type=NODE_STANDARD,
             )
         else:
             self.graph.nodes[entity]["last_reinforced"] = datetime.now()
@@ -151,7 +159,7 @@ class ArchivistModule:
                     self.graph.add_node(
                         target, source=source, tier=TIER_PROVISIONAL,
                         last_reinforced=datetime.now(), regulatory_efficacy=0.5,
-                        tier0_cycles=0,
+                        tier0_cycles=0, node_type=NODE_STANDARD,
                     )
                 self.graph.add_edge(entity, target, relation_type=rel, source=source,
                                      created_at=datetime.now().isoformat())
@@ -177,7 +185,8 @@ class ArchivistModule:
             if n not in self.graph:
                 self.graph.add_node(n, source=source, tier=TIER_PROVISIONAL,
                                      last_reinforced=datetime.now(),
-                                     regulatory_efficacy=0.5, tier0_cycles=0)
+                                     regulatory_efficacy=0.5, tier0_cycles=0,
+                                     node_type=NODE_STANDARD)
         self.graph.add_edge(node_a, node_b, relation_type=relation_type, source=source,
                              placement=placement, created_at=datetime.now().isoformat())
         self.graph.nodes[node_a]["last_reinforced"] = datetime.now()
@@ -224,6 +233,17 @@ class ArchivistModule:
         incident_sources = set()
         edge_count = 0
         for _u, _v, edata in list(self.graph.in_edges(node, data=True)) + list(self.graph.out_edges(node, data=True)):
+            # §3.2/§10: only categorical edges (is-a/part-of/associated-with)
+            # count as epistemic corroboration. Relational edges
+            # (responsible-for/violates/temporal-contrast/concerns-other)
+            # and composed-of edges represent recurrence-of-pattern or
+            # structural composition, not independent confirmation of a
+            # fact -- a node frequently on the receiving end of `violates`
+            # edges was previously drifting toward Trusted purely for
+            # showing up often in guilt-shaped schema patterns, which has
+            # nothing to do with whether the node is true.
+            if edata.get("relation_type") not in TRUST_BEARING_EDGE_TYPES:
+                continue
             edge_count += 1
             esrc = edata.get("source", "user")
             if esrc != "self_generated":  # §2.2/§9 risk 5: excluded from diversity signal
@@ -361,7 +381,7 @@ class ArchivistModule:
                 continue
             in_edges = list(self.graph.in_edges(node, data=True))
             cooccurrence_parent = any(
-                d.get("placement") == "cooccurrence" and d.get("relation_type") == "associated-with"
+                d.get("placement") == "cooccurrence" and d.get("relation_type") == EDGE_ASSOCIATED_WITH
                 for _u, _v, d in in_edges
             )
             if not cooccurrence_parent:
@@ -371,7 +391,7 @@ class ArchivistModule:
                 candidates.append(node)
         return candidates
 
-    def reparent(self, node: str, new_parent: str, relation_type: str = "is-a"):
+    def reparent(self, node: str, new_parent: str, relation_type: str = EDGE_IS_A):
         """Executes a re-parent: drops the old co-occurrence edge(s) into
         `node`, adds the new, firmer typed edge."""
         if node not in self.graph or new_parent not in self.graph:

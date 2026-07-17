@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 from .archivist import SELF_NODE, TIER_PROVISIONAL, TIER_WORKING
+from .edge_types import RELATIONAL_EDGE_TYPES, EDGE_COMPOSED_OF, NODE_SCHEMA
 
 
 class OverrideSignal:
@@ -17,7 +18,6 @@ class OverrideSignal:
 # (§10 item 13) -- not yet numeric in the spec.
 SCHEMA_STABILIZATION_THRESHOLD = 3
 
-_RELATIONAL_TYPES = ("responsible-for", "violates", "temporal-contrast", "concerns-other")
 
 
 class ReflectorModule:
@@ -130,7 +130,7 @@ class ReflectorModule:
         event_relations: Dict[str, List[tuple]] = {}
         for u, v, data in graph.edges(data=True):
             rel = data.get("relation_type")
-            if rel in _RELATIONAL_TYPES and u in (SELF_NODE, "OTHER"):
+            if rel in RELATIONAL_EDGE_TYPES and u in (SELF_NODE, "OTHER"):
                 event_relations.setdefault(v, []).append((rel, data.get("created_at")))
 
         for event_node, rels in event_relations.items():
@@ -157,16 +157,23 @@ class ReflectorModule:
                 regulatory_efficacy=0.5,
                 tier0_cycles=0,
                 is_schema=True,
+                node_type=NODE_SCHEMA,
                 named=False,
                 name=None,
                 basin=felt_state,
                 relation_types=sorted(relation_set),
             )
+            # composed-of (§6A, this revision), not associated-with: this
+            # is a permanent structural fact about what the schema is made
+            # of, not a tentative co-occurrence placement -- keeping it
+            # distinct also keeps it out of _trust_score's corroboration
+            # count (TRUST_BEARING_EDGE_TYPES is categorical-only) and out
+            # of archivist.reparenting_candidates()'s associated-with scan.
             graph.add_edge(schema_id, felt_state if felt_state in graph else SELF_NODE,
-                            relation_type="associated-with", source="schema", placement="explicit",
+                            relation_type=EDGE_COMPOSED_OF, source="schema", placement="explicit",
                             created_at=datetime.now().isoformat())
             for en in event_nodes:
-                graph.add_edge(schema_id, en, relation_type="associated-with", source="schema",
+                graph.add_edge(schema_id, en, relation_type=EDGE_COMPOSED_OF, source="schema",
                                 placement="explicit", created_at=datetime.now().isoformat())
             created.append(schema_id)
 
