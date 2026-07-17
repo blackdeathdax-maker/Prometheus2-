@@ -269,11 +269,44 @@ class Prometheus:
         if target is None or not expansions:
             return  # every attempt this tick hit a confirmed dead end
 
+        # Anchor fix (this revision, found from production data after the
+        # regulation-eligibility fix): felt_state_anchors was previously
+        # only ever populated inside _ingest(), which only runs for
+        # explicitly queued user/dictionary input -- despite _ingest's own
+        # docstring claiming to be "shared by both externally-queued input
+        # and self-study" (it never actually was). Under typical usage,
+        # the overwhelming majority of Learning ticks are self-study, not
+        # queued input (Run Batch queues nothing), so felt_state_anchors
+        # stayed effectively empty. Once regulation was correctly scoped
+        # to anchored nodes only (previous fix), this meant it almost
+        # always found zero eligible candidates instead of the whole
+        # graph -- regulatory efficacy sitting at the untouched 0.5
+        # default for every node, never exercised at all, which is worse
+        # than the original bug in practice even though more "correct."
+        # Fixed by recording the same felt-state -> node anchor link
+        # _ingest() does, for self-study's own placements.
+        basin_key = self.synthesizer.get_current_basin_key()
+        felt_state = self.synthesizer.get_current_felt_state()
+        placed_children = []
         for child in expansions[:3]:
             definition = self.sensory.lookup_definition(child) or ""
-            self.association.place_node(child, definition=definition, source="dictionary",
-                                         context_node=target)
+            result = self.association.place_node(child, definition=definition, source="dictionary",
+                                                   context_node=target)
+            placed_children.append(result.get("term") or child)
         self.archivist.store(target, source="dictionary")  # reinforce parent's last_reinforced
+
+        if felt_state != "Unformed":
+            for child_node in placed_children:
+                self.chronos.record_felt_state_link(basin_key, child_node)
+                self.felt_state_anchors.setdefault(basin_key, []).append(child_node)
+            # `target` recurs across multiple self-study ticks (until it
+            # hits the degree cap), unlike each tick's freshly-created
+            # children -- anchoring it too gives §6.1's naming-reliability
+            # check and §4.2's regulation candidate pool a genuinely
+            # consistent, repeatedly-reinforced node to work with, not
+            # just a growing list of one-off terms.
+            self.chronos.record_felt_state_link(basin_key, target)
+            self.felt_state_anchors.setdefault(basin_key, []).append(target)
 
         # Small, scaled-down dopaminergic bump (§5.1, §9 risk 7) via the
         # same fast-layer pathway as any other event -- no bespoke
