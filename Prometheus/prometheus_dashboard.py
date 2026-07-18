@@ -19,10 +19,11 @@ Two things implemented per the spec:
     apart the way stimulus.py's edge type once did from §6A's list.
 """
 import logging
+from typing import Optional
 
 from pyvis.network import Network
 
-from .edge_types import (
+from Prometheus.edge_types import (
     EDGE_STYLE, DEFAULT_EDGE_STYLE, NODE_SHAPE, TIER_OPACITY,
     SCHEMA_UNNAMED_COLOR, SCHEMA_NAMED_COLOR, SELF_COLOR,
     NODE_STANDARD, NODE_BASIN, NODE_SCHEMA, NODE_SELF,
@@ -85,23 +86,39 @@ def _edge_visual(relation_type: str) -> dict:
     return EDGE_STYLE.get(relation_type, DEFAULT_EDGE_STYLE)
 
 
-def render_graph_html(archivist, height: str = "700px", width: str = "100%") -> str:
+def render_graph_html(archivist, node_subset: Optional[set] = None,
+                       height: str = "700px", width: str = "100%") -> str:
     """
     Builds the Pyvis network from archivist.graph and returns the rendered
     HTML as a string via generate_html() -- no filesystem write (Task 1
     fix), so this can't silently fail on a read-only/sandboxed filesystem
     or race with Streamlit's rerun cycle. app.py passes the result
     straight to st.components.v1.html().
+
+    `node_subset` (new, this revision -- §11 pull-forward): when supplied,
+    only nodes in the subset are rendered (typically
+    archivist.working_memory_nodes()'s output), and only edges where both
+    endpoints are in the subset. This is the actual fix for §11's
+    rendering-cost/readability problem at scale -- rendering the full live
+    graph every time doesn't scale past a few hundred nodes and multi-
+    parenting makes it unreadable regardless of tuning; a bounded
+    neighborhood sidesteps both. None (default) renders the full graph,
+    preserving old behavior for callers that want it (e.g. an explicit
+    "show full graph" opt-in).
     """
     net = Network(height=height, width=width, directed=True, notebook=False, cdn_resources="in_line")
     net.barnes_hut()
 
     graph = archivist.graph
+    nodes_to_render = graph.nodes(data=True) if node_subset is None else (
+        (n, d) for n, d in graph.nodes(data=True) if n in node_subset
+    )
 
-    for node, data in graph.nodes(data=True):
+    for node, data in nodes_to_render:
         visual = _node_visual(node, data)
         label = data.get("name") or node
-        title_bits = [f"tier: {data.get('tier', 0)}", f"source: {data.get('source', 'unknown')}"]
+        title_bits = [f"tier: {data.get('tier', 0)}", f"source: {data.get('source', 'unknown')}",
+                      f"activation: {data.get('activation', 0.0):.2f}"]
         if data.get("is_schema"):
             title_bits.append(f"named: {data.get('named', False)}")
         net.add_node(
@@ -117,6 +134,8 @@ def render_graph_html(archivist, height: str = "700px", width: str = "100%") -> 
     # an event node can carry both responsible-for and violates at once)
     # are each added individually, not collapsed.
     for u, v, key, data in graph.edges(keys=True, data=True):
+        if node_subset is not None and (u not in node_subset or v not in node_subset):
+            continue
         relation_type = data.get("relation_type", "associated-with")
         style = _edge_visual(relation_type)
         net.add_edge(
