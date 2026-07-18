@@ -131,12 +131,11 @@ class ReflectorModule:
         for u, v, data in graph.edges(data=True):
             rel = data.get("relation_type")
             if rel in RELATIONAL_EDGE_TYPES and u in (SELF_NODE, "OTHER"):
-                event_relations.setdefault(v, []).append((rel, data.get("created_at")))
+                event_relations.setdefault(v, []).append((rel, data))
 
         for event_node, rels in event_relations.items():
-            relation_set = frozenset(r for r, _ts in rels)
-            timestamps = [ts for _r, ts in rels if ts]
-            felt_state = self._felt_state_near(timestamps[0] if timestamps else None)
+            relation_set = frozenset(r for r, _d in rels)
+            felt_state = self._resolve_felt_state(rels)
             if felt_state is None or felt_state == "Unformed":
                 continue
             key = (felt_state, relation_set)
@@ -196,6 +195,88 @@ class ReflectorModule:
     def schema_count(self) -> int:
         """Used by prometheus.py for the §6.2 Adolescence->Maturity gate."""
         return sum(1 for _n, d in self.archivist.graph.nodes(data=True) if d.get("is_schema"))
+
+    def schema_candidate_report(self, top_n: int = 5) -> Dict:
+        """
+        Diagnostic, read-only mirror of detect_schemas()'s grouping logic
+        (§2.1b) -- shows how close the system is to forming a Schema Node
+        without waiting for one to actually stabilize, and without
+        mutating the graph. Added because "No stable Schema Nodes formed
+        yet" gave zero visibility into *why* -- whether relational edges
+        exist at all, how many are being silently dropped for occurring
+        before any felt-state basin had stabilized (§2.1a's "Unformed"
+        case, permanently excluded from candidacy, not retried later),
+        and how close any surviving (felt_state, relation_set) pair
+        actually is to SCHEMA_STABILIZATION_THRESHOLD. Safe to call every
+        Reflection-tab render, not just at Consolidation -- it never
+        creates or modifies a node.
+        """
+        graph = self.archivist.graph
+        event_relations: Dict[str, List[tuple]] = {}
+        for u, v, data in graph.edges(data=True):
+            rel = data.get("relation_type")
+            if rel in RELATIONAL_EDGE_TYPES and u in (SELF_NODE, "OTHER"):
+                event_relations.setdefault(v, []).append((rel, data))
+
+        pair_events: Dict[tuple, List[str]] = {}
+        dropped_unformed = 0
+        for event_node, rels in event_relations.items():
+            relation_set = frozenset(r for r, _d in rels)
+            felt_state = self._resolve_felt_state(rels)
+            if felt_state is None or felt_state == "Unformed":
+                dropped_unformed += 1
+                continue
+            key = (felt_state, relation_set)
+            pair_events.setdefault(key, []).append(event_node)
+
+        candidates = []
+        for (felt_state, relation_set), event_nodes in pair_events.items():
+            count = len(event_nodes)
+            candidates.append({
+                "felt_state": felt_state,
+                "relation_types": sorted(relation_set),
+                "count": count,
+                "threshold": self.SCHEMA_STABILIZATION_THRESHOLD,
+                "remaining": max(0, self.SCHEMA_STABILIZATION_THRESHOLD - count),
+            })
+        candidates.sort(key=lambda c: c["remaining"])
+
+        return {
+            "total_relational_event_nodes": len(event_relations),
+            "dropped_unformed_felt_state": dropped_unformed,
+            "candidate_pairs": candidates[:top_n],
+        }
+
+    def _resolve_felt_state(self, rels: List[tuple]) -> Optional[str]:
+        """Resolves the felt state active when a set of relational edges
+        was created. Prefers `felt_state_at_creation`, stamped directly on
+        the edge at creation time by association.link_relational() (this
+        revision) -- reliable, since it's the ground truth at the moment
+        of creation, not a reconstruction. Falls back to the old
+        timestamp-nearest-neighbor lookup via _felt_state_near() only for
+        edges that predate this fix (e.g. relational edges already saved
+        in an existing graph checkpoint) and therefore don't carry the
+        stamped field. See archivist.link()'s docstring for why the old
+        path alone was unreliable: it could only ever find the *previous*
+        tick's felt state (never the current tick's, since _ingest()
+        always runs before that same tick's chronos.record_pulse()), or
+        nothing at all on the very first pulse ever / right after a
+        felt-state transition -- silently and permanently dropping a
+        relational edge from schema candidacy even when a real, named
+        felt state was active. `rels` is a list of (relation_type, edge_data)
+        tuples for one event node, as built by detect_schemas/
+        schema_candidate_report's grouping loop."""
+        for _rel, data in rels:
+            stamped = data.get("felt_state_at_creation")
+            if stamped:
+                return stamped
+        # Fallback: no edge in this group was stamped (pre-fix data) --
+        # reconstruct from the earliest available timestamp, same as
+        # before this revision.
+        timestamps = [d.get("created_at") for _r, d in rels if d.get("created_at")]
+        if not timestamps:
+            return None
+        return self._felt_state_near(timestamps[0])
 
     def _felt_state_near(self, timestamp_iso: Optional[str]) -> Optional[str]:
         if not timestamp_iso:

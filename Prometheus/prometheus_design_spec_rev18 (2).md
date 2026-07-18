@@ -1,0 +1,496 @@
+# Prometheus — Living Design Spec
+
+**Purpose of this document:** single source of truth for the project's design decisions. Paste the relevant section into any new conversation (with Claude, Grok, Gemini, etc.) instead of re-explaining from memory. Update this doc whenever a decision changes — don't let decisions live only in chat history.
+
+**Last updated:** 2026-07-16 (rev. 18 — post-implementation review pass: two undocumented modules added to §7, a boundary-principle bug fixed in fatigue, WordNet confirmed as the dictionary source, self-study's hyponym/hypernym/synonym distinction resolved, re-parenting's silent no-op fixed, a new `composed-of` edge type added, a canonical edge-type module created, and Graph-tab visual encoding (§10 item 21) resolved.)
+**Status:** v1 architecture complete and implemented (see accompanying codebase). §11 captures the deferred v2 working-memory/attention/rendering feature area. §12 (new) is a review log for gaps found by reading the actual running code against the spec, as distinct from §9/§10's forward-looking risks and tuning items.
+
+**Contents:** §1 Project Concept · §2 Two Webs (2.1 Emotional Web, 2.1a Basin Formation, 2.1b Complex Schemas, 2.2 Knowledge Web, 2.3 Hierarchy Placement, 2.4 Trust vs. Depth) · §3 Trust Tier System · §4 Regulation Cross-Link · §4A reflector.py · §4B UI/Dashboard · §4C Persistence · §4D Tick Scheduling · §5 Fatigue-Driven State Cycling (5.1 Self-Study, 5.2 Pruning Trigger) · §6 Developmental Epochs · §6A Node/Edge Data Schema · §6B Edge-Type Vocabulary Module (new) · §7 Module Responsibilities · §8 Immediate Tasks · §9 Known Risks · §10 Open Questions · §11 v2 Roadmap · §12 Review Log (new)
+
+---
+
+## 1. Project Concept
+
+Prometheus is a neuromorphic cognitive simulation: an agent that develops emotional and cognitive maturity through simulated biology rather than fixed rules. Hidden hormonal/somatic state drives a two-web knowledge system that grows, consolidates, and prunes itself over time, progressing through three developmental epochs gated by demonstrated competence — not timers or event counts.
+
+**Hard boundary:** An LLM may eventually serve as a *speech/expression layer only* (translating internal state into language). It must never be the cognitive engine. All reasoning, growth, and regulation logic must remain deterministic, biologically-modeled logic — not delegated to a generative model. This boundary is easy to erode by accident once an LLM is in the pipeline for any purpose — treat it as a hard constraint in every future design/coding session.
+
+**Core emergence principle — the hidden/visible boundary is about agency, not display.** The rule that "the executive layer cannot read core.py" is not a UI-privacy rule — it exists because the whole premise of emergence in this project is that felt states, graph structure, and self-regulation behavior must be *inferred and named by the agent through experience*, never read directly off a raw variable. An agent with programmatic access to its own raw hormonal values would be a fundamentally different, and strictly worse, system relative to this design's goals. Consequently:
+- A **human operator** may view raw core.py values freely (§4B Debug tab) — this changes nothing about the agent's cognition and is purely external instrumentation.
+- **No module that participates in the agent's own decision loop** — including `prometheus.py`, the orchestrator — may ever route core.py's raw values into anything the agent's own logic conditions on. `prometheus.py` already only reads visible-layer felt states for orchestration decisions (transitions §6, regulation triggers §4.1–4.2); this is consistent with what's designed but is now stated as a named, non-negotiable principle rather than an incidental property.
+- The Debug tab (§4B) is therefore the **only** sanctioned path from core.py to anything outside hormonal.py/core.py, and it is a dead end — read-only, display-only, with zero code path back into agent logic.
+
+---
+
+## 2. System Architecture: Two Webs
+
+### 2.1 Emotional Web (the engine)
+- Small, dense, slow-changing.
+- Nodes represent felt-state signatures (clusters of somatic state translated into named states).
+- Drives construction and weighting of the knowledge web.
+- Also receives feedback from the knowledge web during Adolescence (regulation — see §4).
+
+### 2.1a Felt-state formation — topographical basins (resolved)
+
+Rejects both extremes considered earlier: **not** fixed hand-defined emotion categories (would graduate the agent to Adolescence-equivalent competence with no actual growth — the agent would just be classifying against pre-written labels), and **not** generic statistical clustering (introduces an opaque, boundary-drifting process in tension with the "no black-box in the engine" principle, and conflicts with §6.1's stability requirement). Instead: felt states are **attractor basins in a topographical landscape**, formed entirely from the agent's own lived trajectory through state-space — grounded in dynamical-systems models of emotion (state as basins the system settles into and revisits), not classification.
+
+**Mechanism:**
+1. **Composite axes (hand-defined, but not raw core.py fields).** synthesizer.py projects core.py's raw variables onto a small number of deterministic composite dimensions — a PAD-style (Pleasure/Arousal/Dominance) three-axis model: **arousal** (heart_rate + respiration_rate), **valence** (dopaminergic_tone − cortisol_load), and **dominance/control** (vascular_constriction + muscle_tension, both correlating with threat/reduced-control physiology — low dominance reads as "this is happening to me," high as "I can act on this"). Three axes rather than two specifically to avoid emotions collapsing together that shouldn't (e.g., anger and fear sit at nearly identical arousal/valence coordinates but differ sharply in dominance). These axes are chosen in advance (you're defining *what dimensions exist*), but this is categorically different from defining regions on them — the axes are a coordinate system, not an emotional vocabulary.
+2. **No pre-defined regions.** Nothing marks any point on the arousal/valence plane as "Distress" or "Calm" in advance. The landscape starts flat/unformed — a Childhood agent genuinely has no stable felt states yet, because it hasn't lived enough to have any.
+3. **Basin formation via dwell-time density.** chronos.py's logged trajectory through arousal-valence-dominance space builds a grid-based dwell-time histogram (deliberately the simplest inspectable option — no ML clustering, no arbitrary distance metric or cluster count). Peaks in accumulated density — places the trajectory has repeatedly visited and returned to — are candidate basins.
+4. **Basin stabilization = the Childhood naming milestone.** A candidate basin becomes a genuine named felt state (and earns a knowledge-web node link, per §6.1) only once it's been revisited enough to be a real recurring pattern, evaluated the same way as everything else needing hysteresis in this design — this **is** the concrete mechanism behind §6.1's "reliably names its own emotional states," not a separate classification exercise layered on top of it.
+5. **Basin birth/death (decay).** A basin that stops being revisited should flatten back out over time, mirroring non-reinforcement decay used elsewhere (§3.4, §4.5) — an emotional pattern the agent has outgrown can genuinely fade rather than being permanent once formed, for consistency with the rest of the design.
+6. **Cadence.** Basin detection/refinement (histogram update, stabilization check, decay) happens **during Consolidation only** — same clock as trust, efficacy, re-parenting, and reflector — so a single noisy tick can never reshape what a felt state means. This is what satisfies §6.1's stability requirement mechanically.
+
+**What synthesizer.py actually outputs, tick to tick:** the current point in arousal-valence-dominance space is checked against the *existing, stabilized* basin map (built as of the last Consolidation pass) to find the nearest/matching basin — that lookup is what produces the "current Felt State" the rest of the system reads. The landscape itself only changes at Consolidation; the lookup against it is cheap and live every tick.
+
+**Open item carried into §10:** grid resolution for the dwell-time histogram, and the revisit-count/duration threshold for basin stabilization, are not yet numeric — same tuning category as fatigue thresholds, only resolvable empirically once a vertical slice is running.
+
+**Scope boundary — basic emotions from biomarkers alone; complex emotions require §2.1b.** A three-axis PAD landscape gives robust coverage of *basic/body-state emotions* (joy, fear, anger, sadness, disgust, surprise, calm, and gradations) — these are physiologically definable and should genuinely differentiate well, including previously-collapsed pairs like anger vs. fear (separated by dominance). It does **not**, and structurally cannot, produce *complex/social/abstract emotions* (guilt, nostalgia, jealousy, pride) from richer biomarkers alone — these are defined by relational or narrative content (a self-concept, a past/present comparison, another person as a referent), not body state. See §2.1b: this design reaches complex emotions not through biomarkers but by recognizing that the knowledge web already builds the relational structure they require.
+
+### 2.1b Complex Emotional Schemas — resolved
+
+Complex/social emotions become reachable not by adding more biomarkers, but by recognizing that the knowledge web already builds the relational/schematic structure they require. A complex emotion is modeled as a **recurring co-occurrence of a stabilized basic basin (§2.1a) with a specific relational graph pattern**, not a new point in PAD space.
+
+**Same principle as §2.1a's axes-vs-regions distinction, applied one layer up:** the four relational edge types below are a hand-defined *vocabulary of relation kinds* (like arousal/valence/dominance being hand-defined axes) — but which *combinations* of those edges constitute a recognized complex emotion is never hand-specified, and is discovered entirely from recurrence in the agent's own experience (like basin regions on the PAD axes). No fixed mapping of "these edges together = guilt" exists anywhere in the design.
+
+**1. The self-node — a deliberate, necessary exception to "everything is earned."** A single, permanent `SELF` node is seeded directly into the Trusted tier at initialization, not earned through corroboration like every other node in the system. This is necessary because no experience can precede having a self to relate things to — it's the one deliberate axiom in an otherwise fully emergent design, worth flagging explicitly as an intentional exception rather than an inconsistency.
+
+**2. New relational edge types**, extending §2.3's typing scheme beyond categorical (`is-a`/`part-of`/`associated-with`) into narrative/relational:
+- `responsible-for` — SELF linked as agent of an action/outcome node (guilt, pride).
+- `violates` — a node conflicts with a standard/value node linked to SELF (guilt, shame).
+- `temporal-contrast` — a node relates to a past state differing from the current one, using timestamps chronos.py already logs (nostalgia).
+- `concerns-other` — a node involves a distinct entity node representing someone other than SELF (jealousy, embarrassment, social emotions generally).
+
+sensory.py detects candidates for these edges at ingestion using the same deterministic, pattern/keyword-level approach already used for explicit negation (§3.4) — no new NLP machinery, e.g. "I shouldn't have done that" flags `responsible-for` + `violates` candidates near the current event node.
+
+**3. Detection is reflector.py's job**, and gives real justification to the consistency-auditing capability previously deferred to v2 (§4A) — not speculative anymore, now solving an actual capability gap. Reflector scans chronos.py's logged history (Consolidation-gated, same clock as everything else) for **any** repeated co-occurrence of a stabilized basin with a *consistent* relational edge pattern — genuinely emergent, not matched against pre-written combinations. Reflector has no advance knowledge that a given combination "means" guilt or pride; it only recognizes that a specific combination has recurred enough to count as a stable pattern (same hysteresis-over-N-recurrences principle used throughout this design) and creates a Schema Node for it. Psychology terms like "guilt-shaped" or "pride-shaped" are illustrative labels for *this document*, to help reason about whether the mechanism is working — they are never written into the detection logic itself.
+
+**4. Storage — a new node class: Schema Nodes.** Once a co-occurrence pattern stabilizes (same hysteresis-over-N-recurrences principle used throughout this design), it becomes its own node — linking back to the basic basin(s) it's composed from and the specific relational edges that define it. A Schema Node is created **unnamed** — its existence is just "this recurring pattern is real and stable," nothing more.
+
+**4a. Naming a Schema Node works exactly like §6.1, not by pre-assignment.** No combination of relational edges is hand-labeled "guilt" or "pride" in advance — that would just be fixed categories smuggled in through the relational side door instead of the PAD side door already rejected in §2.1a. A Schema Node earns a name only if and when the agent's actual dictionary/user input happens to link a word to it, through the same felt-state-to-knowledge-node linkage mechanism used for basic basins. If no such linkage ever occurs, the schema remains real, stable, and recognized by the system, but unnamed — a pattern the agent has experienced without yet having a word for it, which is arguably a more honest state than forcing a label onto it.
+
+**5. Epoch placement — the concrete mechanism behind §6.2.** Schema formation requires a stabilized basic basin *and* accumulated relational edges *and* enough recurrence of their co-occurrence — strictly later-developing than basic basin naming (§6.1). Adopted as the actual competence check behind Adolescence → Maturity: "structural resilience" becomes *the agent has formed some number of stable Schema Nodes*, replacing the looser variance-based placeholder previously in §6.2 with a real, evaluable milestone.
+
+**Known compounding risk:** this deepens the cold-start concern already flagged for basic basins (§9 risk 6) by one layer — Schema Nodes need relational edges to exist *and* recur *and* co-occur with a stabilized basin, so Adolescence-to-Maturity progression could be considerably slower or more data-hungry than basic Childhood naming. This is honest emergence, not a flaw, but should be expected rather than discovered as a surprise.
+
+### 2.2 Knowledge/Schema Web (the content)
+- Large, hierarchical.
+- **Dictionary source: WordNet, via `nltk.corpus.wordnet`** (confirmed this revision — previously undocumented anywhere in the spec despite `nltk` being a listed requirement with no other explanation). `sensory.py` draws four distinct things from the same corpus, each for a different purpose (§5.1, §2.3): glosses (`lookup_definition`, feeds `parse_hierarchy`'s pattern-matching), hyponyms (`lookup_expansion`, self-study children), hypernyms (`lookup_hypernym`, re-parenting parent), and synonyms (`lookup_synonyms`, canonicalization — not yet wired into node creation, see §10 new item).
+- Built from three input sources, handled differently:
+  - **Dictionary-sourced input** — treated as more authoritative, higher starting trust weight.
+  - **User input** — provisional by default, must earn trust over time.
+  - **Self-generated (idle autonomous expansion)** — see §5.1. Dictionary-sourced by content, but tagged distinctly so it doesn't count toward the diversity signal the way externally-corroborated edges do (prevents the agent gaming its own trust metrics via self-expansion).
+- Structured with trust tiers (see §3) layered onto a hierarchical/abstraction structure.
+
+### 2.3 Hierarchy placement mechanics (resolved)
+Two placement paths, both producing **typed edges** (`is-a`, `part-of`, `associated-with` — not generic edges; typing is what makes the graph actually hierarchical rather than just densely connected):
+
+1. **Dictionary-pattern parsing (primary, for dictionary input).** Definitional phrasing often contains the hierarchy for free ("blue: a color resembling the sky" → `blue is-a color`). sensory.py pattern-matches definitional structures ("X is a Y," "X: a type of Y," etc.) to extract explicit parent-child edges at ingestion — no inference model needed.
+2. **Co-occurrence context (fallback, primarily for user input).** When no explicit relationship is parseable, the new node attaches to whichever existing node was most active (highest recent corroboration, or dominant in current felt-state context) at time of ingestion. Produces an `associated-with` edge, not a false `is-a` claim — co-occurrence is weaker evidence than a stated relationship and must not be mislabeled as one.
+3. **Re-parenting.** Nodes placed via co-occurrence (option 2) are not permanently fixed. If a node accumulates enough independent corroboration to justify a firmer/different parent, re-evaluation happens **during Consolidation** (§5) — same pass that already re-evaluates trust, rather than a separate mechanism. **Mechanism fixed this revision:** the pass was previously a silent no-op — `association.run_reparenting_pass()` only found a firmer parent via an optional `definitions: Dict[str, str]` map of cached gloss text, but `prometheus.py`'s Consolidation call never supplied one, so every eligible candidate fell through unre-parented despite this mechanism being documented as resolved since rev 7. Now uses `sensory.lookup_hypernym()` as the primary path — WordNet's own taxonomy gives the authoritative broader category directly (e.g. "blue" → "color"), no gloss-parsing needed — with the `definitions`-dict/`parse_hierarchy` path kept as a secondary option for a future non-WordNet dictionary source that supplies definition text instead.
+
+### 2.4 Trust tier vs. hierarchy depth — resolved: orthogonal axes
+Trust (tier: Provisional/Working/Trusted, §3) and structural position (edge type/depth, §2.3) are **separate properties on the same node, not the same dimension.** A node can be structurally deep and still Tier 0 (asserted once, unconfirmed). A node can be shallow and Trusted (well-corroborated, simple fact). Collapsing these into one axis would falsely force "abstract" and "confident" to move together. Both properties are tracked independently per node.
+
+---
+
+## 3. Trust Tier System
+
+### 3.1 Tiers
+- **Tier 0 — Provisional**: newly created, low/no corroboration.
+- **Tier 1 — Working**: corroborated by a small number of *diverse* sources, or dictionary-original.
+- **Tier 2 — Trusted/Schema**: heavily corroborated, diverse sources, survived consolidation passes without contradiction.
+
+### 3.2 Trust score inputs (not raw edge count alone)
+1. **Edge count** — corroboration signal.
+2. **Edge diversity** — edges from different sources/sessions count more than repeated edges from the same context (prevents hub-node inflation and repetition-gaming).
+3. **Source weight at creation** — dictionary origin starts higher than user-asserted.
+4. **Emotional-state-at-encoding** *(optional/stretch)* — nodes formed under regulated/calm felt-states get a small trust bonus; nodes formed under high-arousal/spike states start lower.
+5. **Edge type restriction (fixed this revision).** Only categorical edges (`is-a`/`part-of`/`associated-with`, §2.3) count toward corroboration/diversity. Relational edges (`responsible-for`/`violates`/`temporal-contrast`/`concerns-other`, §2.1b) and the new `composed-of` structural edge (§6B) were previously counted identically to categorical edges in `archivist._trust_score`, which meant a node frequently on the receiving end of, say, `violates` edges could drift toward Trusted purely for recurring in a guilt-shaped pattern — a claim about recurrence, not about truth. §2.1b already draws the epistemic-trust-vs-regulatory-efficacy distinction; this closes the parallel gap between epistemic trust and edge type that hadn't been drawn. See `edge_types.TRUST_BEARING_EDGE_TYPES` (§6B).
+
+### 3.3 Promotion & Demotion — timing
+- **Consolidation-gated, not live.** Tier changes are only evaluated during the Consolidation state (see §5), not during Learning.
+- Rationale: matches the biological metaphor (structural reorganization happens offline, not while awake/encoding); provides free hysteresis against single-session noise; reuses an already-designed mechanism instead of adding a new evaluation pathway.
+- Promotion/demotion require the threshold condition to hold across **N consecutive consolidation passes** (hysteresis), not a single pass. Exact N not yet tuned.
+
+### 3.4 Demotion mechanics — v1 scope
+Two mechanisms only, for now:
+1. **Explicit negation/correction** — detected when user input contains negation/correction language referencing a recently-active node (e.g., "no, that's wrong," "actually X is not Y"). Detection is keyword/pattern-level (regex-adjacent), not semantic. No NLP model required.
+2. **Non-reinforcement decay** — a node that isn't corroborated across successive consolidation passes loses trust gradually, using the same decay-toward-baseline pattern already used in the hormonal layer.
+
+**Explicitly deferred (not in v1):**
+- Structural contradiction detection (pre-defined exclusivity categories, e.g. "hot" vs "cold" as siblings).
+- Semantic/embedding-based contradiction detection. Reasoning: even free/local embedding models (a) still function as an opaque neural component inside what's meant to be a transparent, deterministic engine, conflicting with the LLM-boundary principle in spirit; (b) solve "these are topically related" much better than "these disagree" — similarity ≠ contradiction; (c) require a new inference pipeline and new threshold-tuning burden. Revisit only if v1 in practice shows a real gap.
+- Demotion should be **gradual, one tier at a time**, not multi-tier drops from a single contradiction — consistent with hysteresis used elsewhere.
+
+---
+
+## 4. Emotional Engine ↔ Knowledge Web Cross-Link (Regulation) — resolved
+
+Regulation is how the knowledge web reaches back into the emotional engine, fulfilling Adolescence's design goal ("use knowledge nodes to regulate somatic states"). Built entirely from existing mechanisms — no new subsystem class introduced.
+
+**4.1 Detection.** prometheus.py monitors felt-state intensity each tick against a spike threshold, using the same hysteresis-band pattern as the fatigue T1/T2 checks (§5) rather than a bespoke trigger. This naturally concentrates regulation activity in Adolescence, since that's the epoch defined by high surge/turmoil.
+
+**4.2 Node selection.** From the stable felt-state → node anchor established in Childhood (§6.1), prometheus.py looks at connected knowledge-web nodes, **restricted to Working or Trusted tier only** (§3.1). Provisional nodes are excluded — an unconfirmed node has no business being relied on to talk the system down from a spike. This restriction falls directly out of the existing tier system, no new logic required.
+
+**4.3 Dampening mechanism.** Regulation **accelerates core.py's existing fast-layer decay** (`decay_fast`, called at a higher-than-normal rate) rather than applying an arbitrary counter-delta. This models regulation as *returning to baseline faster*, not *canceling the feeling* — a better fit for what emotional regulation actually is.
+
+**4.4 Dampening is capped, not instant.** Per-tick dampening strength is capped as a fraction of the spike, scaled by the regulating node's efficacy (§4.5). A single high-efficacy node cannot fully flatten a spike in one tick — this preserves genuine turbulence in Adolescence (undermining this would defeat the epoch's purpose) while still giving real regulation capacity. The cap should scale with epoch: Adolescence gets meaningful but partial capacity; Maturity's stability comes from baseline hardening (§6.2), not from regulation strength increasing further.
+
+**4.5 Regulatory efficacy — a new, separate score.** Not folded into epistemic trust (§3) — a node can be a well-trusted fact while being useless as a coping mechanism, and vice versa. Two independent properties per node (same pattern as the trust/hierarchy-depth orthogonality in §2.4):
+- **Epistemic trust** (§3) — is this true/corroborated.
+- **Regulatory efficacy** — has using this node to self-soothe historically worked.
+
+Efficacy is evaluated **during Consolidation only**, not live — same evaluation point as trust and re-parenting, one clock. Check whether felt-state intensity dropped faster than baseline decay alone would predict, over the ticks following a regulation attempt; success nudges efficacy up, failure nudges it down.
+
+**4.6 Regulation costs fatigue.** A regulation attempt draws on the same fatigue economy as self-study (§5.1) rather than being a free action — actively engaging a coping strategy is effortful, not free, in real cognition. This also naturally self-limits regulation from being invoked every tick without needing a separate cooldown mechanism.
+
+---
+
+## 4A. reflector.py — resolved scope
+
+Reflector reads the finished state of the graph and produces insight *about* it — metacognition, not cognition. It does not grow, place, score-for-trust, or regulate; those belong to association.py, archivist.py, and prometheus.py respectively (§2.3, §3, §4). Three responsibilities:
+
+1. **Structural self-report.** Periodic summary of graph shape: dense vs. sparse regions, hub nodes, hierarchy balance, proportion of Provisional vs. Working vs. Trusted nodes. Feeds the dashboard's high-level view and can supply self-study's (§5.1) "active/trusted nodes with few children" targeting, rather than association.py identifying gaps ad hoc.
+2. **Regulatory self-awareness.** Aggregates regulatory efficacy scores (§4.5) across all regulation-capable nodes to surface which actually work — the agent's model of its own coping strategies, not just their use.
+3. **Complex-schema detection (§2.1b).** Scans chronos.py's logged history for recurring co-occurrence of a stabilized basic basin with a specific relational edge pattern (SELF + `responsible-for`/`violates`/`temporal-contrast`/`concerns-other`, §2.1b), forming Schema Nodes once a pattern stabilizes. This is genuine structural pattern-matching over existing typed data, not black-box inference — it absorbs and gives concrete purpose to the consistency-auditing capability originally sketched here, now solving an actual capability gap (reaching complex emotions) rather than a speculative one.
+
+**Still explicitly deferred (not in v1):** flagging structurally ambiguous nodes unrelated to emotional schemas (e.g., conflicting `is-a` parents with no self-referential content) or "known true but unhelpful" nodes where high epistemic trust and low regulatory efficacy diverge. This narrower consistency-auditing case still carries the scope-creep risk flagged for embeddings-based contradiction detection (§3.4) and remains a v2 candidate.
+
+**Cadence:** Consolidation-gated, same clock as trust promotion/demotion, re-parenting, and regulatory efficacy scoring (§3.3, §2.3, §4.5) — one clock for all offline reprocessing, consistent with the rest of the design, rather than a separate reporting cadence.
+
+---
+
+## 4B. UI / Dashboard — resolved
+
+Tabbed layout (chosen over a single dense view — Streamlit's rerun model means a single view re-renders everything on every interaction; tabs let the graph panel stay static while other panels update independently).
+
+1. **Graph tab** — the knowledge/schema web (Pyvis). Visual encoding: trust tier (§3.1) → node color/opacity (Provisional faint → Trusted solid); edge type — both categorical (§2.3, `is-a`/`part-of`/`associated-with`) and relational (§2.1b, `responsible-for`/`violates`/`temporal-contrast`/`concerns-other`) and structural (§6B, `composed-of`) — → distinct line style per type, since edge typing is what makes this a hierarchy-with-relationships rather than a blob. Regulatory efficacy (§4.5) is **not** overlaid here — kept in the Reflection tab, since it's a philosophically distinct property from epistemic trust and cramming both onto one node's visual encoding gets muddy. **Resolved this revision (§6B):** `basin`/`schema`/`self` node types now have their own shape+color encoding (diamond/hexagon/star respectively), since tier-coloring never applied to them and no alternative had been defined until now.
+2. **State tab** — felt state (named, current, always visible — the point of synthesizer.py's translation layer); epoch name (Childhood/Adolescence/Maturity) with **no visible progress meter toward the next transition** — showing one would turn an earned developmental milestone into a bar to min-max, undermining the "earned, not counted" philosophy (§6); current operating mode (Learning/Consolidation/Pruning, §5); fatigue shown as an **abstracted level indicator** (e.g., low/medium/high) rather than a raw number — consistent with felt states already being abstracted from core.py, not a direct numeric leak.
+3. **Reflection tab** — reflector.py's structural self-report + regulatory self-awareness + detected Schema Nodes (§4A, §2.1b — surfacing recognized recurring emotional patterns, named if the agent has linked a word to them, otherwise shown as unnamed stable schemas), with a visible "last updated" timestamp, since this is Consolidation-gated and should read as periodic self-assessment, not a live feed.
+4. **Debug tab** — the one sanctioned exception to the hidden/visible boundary (§ System Level Boundaries, original spec). Displays raw core.py values directly (heart_rate, respiration_rate, dopaminergic_tone, cortisol_load, vascular_constriction, muscle_tension). Must be rendered visually distinct from the other tabs (e.g., warning color, explicit "raw internal state — not part of the cognitive model" labeling) so it's unmistakably an instrument panel, not part of the felt-state system. Read-only in this direction — debug tab data must never feed back into any other UI panel's logic.
+
+**Task 1 fix, now with real content to render:** build the Pyvis network in memory, call `.generate_html()`, pass the resulting string directly to `st.components.v1.html()` — no filesystem write, avoiding the silent-failure mode on read-only/sandboxed filesystems or races with Streamlit's rerun cycle. Node/edge styling pulls from archivist.py's per-node tier and edge-type data at render time.
+
+---
+
+## 4C. Persistence — resolved
+
+**Scope: single agent instance for v1.** One save file, no multi-instance/named-agent support. Simpler, and nothing in the design implies multi-instance was ever a goal — revisit only if a real need appears later.
+
+**What persists (durable learning only):**
+- Both graphs — knowledge web (nodes, typed edges including relational types from §2.1b, tier, source tag) and emotional web (SELF node, Schema Nodes).
+- The basin landscape (§2.1a) — stabilized basin boundaries/dwell-time histogram, not raw trajectory.
+- Regulatory efficacy scores (§4.5).
+- Current epoch (§6).
+- core.py's **slow-layer baseline only** (the permanently-shifted cortisol/vascular_constriction constants from the epoch SHIFT MECHANISM) — this is temperament, and is durable by definition.
+
+**What does not persist in full:**
+- **Fast-layer values** (current heart_rate, current dopaminergic_tone, etc.) — reset to resting baseline on restart. These are moment-to-moment state, not learning; a restarted agent shouldn't wake up mid-spike from before it was last closed.
+- **chronos.py's raw log** — kept only as a **bounded rolling window** (enough ticks to support the §6.1/§6.2 evaluation windows), not the agent's full lifetime history. This follows the same principle used everywhere else in the design: durable memory is the *consolidated summary* (graphs, tiers, basins, schemas), not the raw event feed. Avoids unbounded disk growth without needing a separate pruning mechanism for the log itself.
+
+**When saves happen:** checkpointed **only at Consolidation**, the same clock as trust/efficacy/basin/schema evaluation (§3.3, §4.5, §2.1a, §2.1b) — one clock for all offline reprocessing, now including persistence. Consequence, stated honestly rather than hidden: a crash mid-Learning loses whatever accumulated since the last Consolidation (new Provisional nodes, recent chronos entries) — but this isn't really a gap, since nothing is *durable* until it survives Consolidation's evaluation anyway, same as everything else in this design.
+
+**Format:** plain JSON, not a binary/pickle format — networkx graphs serialize cleanly to node-link JSON, and JSON keeps the saved state human-inspectable, consistent with the project's no-black-box transparency principle and useful for debugging across the multi-tool workflow.
+
+---
+
+## 4D. Tick Scheduling under Streamlit — resolved
+
+**Chosen: catch-up simulation, interaction-driven only (no background process for v1).** No separate persistent process. On each Streamlit rerun (app opened, user interacts), prometheus.py checks wall-clock time elapsed since the last recorded tick (from the §4C checkpoint) and advances the simulation by computing however many Learning/self-study/Consolidation cycles that elapsed time implies, all at once, before rendering. "Idle time" is real but experienced retroactively in a batch at next open, not continuously in the background.
+
+**Why, over a genuine background process:** fits Streamlit's actual request-response execution model instead of fighting it — no persistent process to keep alive independently of the dashboard, no threading/session-state complexity (a well-known Streamlit pain point). The catch-up computation is largely code that has to exist anyway, since it's just "replay Consolidation-driven ticks until wall-clock time is caught up," reusing the same checkpointing logic from §4C rather than adding new machinery.
+
+**Known tradeoff, stated honestly:** an agent opened infrequently (e.g., once a week) will show a sudden batch of accumulated self-study/development at open-time rather than organically gradual change. Acceptable for v1; **a genuine background process (a persistent service independent of Streamlit) is a legitimate v2 upgrade** if continuous real-time development becomes a priority — deliberately deferred, not because it's a bad idea, but because it's a materially bigger infrastructure lift than anything else in this build, closer in weight to the Streamlit learning curve itself.
+
+**New tuning item:** a real-time-to-simulated-tick mapping (how many simulated ticks one elapsed minute/hour represents) is required for the catch-up computation — not yet numeric, same tuning category as fatigue thresholds (folded into §10).
+
+---
+
+## 5. Fatigue-Driven State Cycling
+
+The system cycles between three operating states, determined by a fatigue signal (derived from existing biomarkers — cortisol_load, dopaminergic depletion, time-since-last-consolidation, etc. — exact composite formula not yet finalized).
+
+- **Learning** (`fatigue < T1`): active encoding of new input (dictionary + user) into the knowledge web, driven by current felt state.
+- **Consolidation** (`T1 ≤ fatigue < T2`): offline reprocessing of chronos.py's felt-state history; reinforces high-arousal experiences, flattens low-arousal ones; **only point at which trust tiers are promoted/demoted**; slow-layer hormonal baseline shifts happen here (not instantly at epoch transition).
+- **Pruning** (`fatigue ≥ T2`): removes low-salience, unconsolidated nodes. Should peak in Adolescence (matches real adolescent synaptic pruning), not run at constant rate across all epochs.
+
+**Required for stability (flagged, not yet implemented):**
+- Hysteresis margin around T1/T2 to prevent flicker at boundaries.
+- Fatigue must have its own recovery curve (drops during Consolidation) so the system self-cycles rather than ratcheting into permanent Pruning.
+- Minimum-occurrence floor before any reliability/promotion check is eligible to fire (prevents trivial early-tick milestone completion).
+
+**Open question:** are T1/T2 fixed constants, or epoch-dependent (e.g., adolescent pruning threshold lower than adult)? Not yet decided — flagged as coupling two systems that are easier to reason about independently at first pass.
+
+### 5.1 Autonomous idle expansion (self-study) — resolved
+
+**WordNet relation used: hyponyms, not synonyms (bug fixed this revision).** During Learning state, when no external input (user or dictionary-triggered) is queued, the agent self-initiates dictionary expansion of existing nodes rather than sitting idle (e.g., an existing "colors" node gets children like "blue," "white" pulled autonomously via WordNet hyponym lookup). A prior implementation of `sensory.lookup_expansion` returned same-synset *synonyms* (`syn.lemmas()` — e.g. "colour," "coloring" for "colors") rather than hyponyms (`syn.hyponyms()`), which structurally cannot produce the parent→child taxonomy this section has always described, since a synonym isn't a child of the term it's a synonym of. Fixed to use hyponyms; the old synonym behavior is preserved separately as `lookup_synonyms()` for a different purpose (canonicalization — see §10 new item), not self-study.
+
+- **Node selection**: a mix of (a) active/trusted nodes with few children (targets obvious gaps in things it already half-knows) and (b) emotionally salient nodes, weighted by **current** felt state at the moment of self-study (not historical emotional weighting — that behavior stays inside Consolidation, which already owns history-based reprocessing).
+- **Mechanism, not a new fatigue tap**: self-study does **not** directly drain a fatigue counter. Instead, successful self-expansion triggers a small hormonal reaction in core.py (a modest dopaminergic tone bump — mild curiosity/satisfaction signal), through the same fast-layer pathway as any other event. Fatigue rises as a *consequence* of that hormonal activity, same as everything else — no bespoke self-study fatigue mechanism needed.
+- **Magnitude must be scaled down** relative to externally-triggered hormonal deltas, so self-study reads as gentle background texture rather than producing felt-state territory that's supposed to represent significant external events. This also keeps external experience the dominant driver of the emotional engine by construction, without needing a separate decay-rate rule.
+- **Self-limiting loop**: low fatigue → idle self-study → small hormone bump → fatigue rises → eventually crosses T1 → forced into Consolidation, where self-generated nodes get evaluated for trust like anything else → fatigue drops during Consolidation → cycle repeats. No separate cap or graph-size gate needed — reuses the existing fatigue clock.
+- **Known risk**: this creates a *new instance* of the general runaway-loop risk (§9 item 1) — emotional salience picks a node → self-study produces more emotional signal → shifts what's salient next → compounding. Scaled-down magnitude is the primary mitigation; decay rate between self-study cycles must be fast enough relative to delta size to settle rather than compound. Not yet numerically verified — flag as a tuning item once the vertical slice is running.
+
+### 5.2 Pruning Trigger — resolved
+
+Pruning is the terminal stage of the same non-reinforcement mechanism already used for demotion (§3.4), not a separate judgment call.
+
+- **Rule:** a node becomes eligible for removal when it (a) is at Tier 0 (Provisional) — whether newly created and never promoted, or demoted down to the floor via §3.4's non-reinforcement decay — **and** (b) has received no new corroboration (no new edge) across N_prune consecutive Consolidation passes since reaching or remaining at that floor. Demotion and pruning form one continuum: Trusted → Working → Provisional → pruned, all driven by the same non-reinforcement signal.
+- **Scope:** knowledge-web, tier-bearing nodes only. `basin`/`schema`/`self` node types (§6A) don't carry a tier and are exempt from this rule — basins already have their own decay mechanism (§2.1a point 5), and the same non-reinforcement pattern extends naturally to schema nodes rather than routing through archivist's tier-based sweep.
+- **Cascade cleanup:** removing a node also removes any edge referencing it as `source_id` or `target_id` (§6A) — no orphaned edges left pointing at nonexistent nodes.
+- **Epoch-scaling:** intentionally left as an open numeric question rather than resolved here — the original spec calls for pruning to peak in Adolescence (mirroring real synaptic pruning), which would mean N_prune is lower (more aggressive) in Adolescence than Childhood/Maturity. This is the same fixed-vs-epoch-dependent-threshold question already open for T1/T2 (§5, §10 item 6) — tracked as one shared open decision rather than duplicated.
+
+---
+
+## 6. Developmental Epochs
+
+Transitions are **earned via competence checks**, evaluated by `prometheus.py` (the orchestrator — see §7), not by hormonal.py and not by simple event counters.
+
+### 6.1 Childhood → Adolescence
+Gate: the agent **reliably and consistently** links a given felt-state signature to the **same** knowledge-web node across repeated occurrences (i.e., convergence — "naming" — not just linkage). This is now mechanically concrete via §2.1a: a felt state *is* a stabilized attractor basin in arousal-valence-dominance space, and "naming" is the act of that stabilized basin acquiring a durable, reused link to a knowledge-web node. Requirements:
+- Basin stabilization (§2.1a) is itself a precondition — there's no "naming" to evaluate until a basin exists at all.
+- Linkage (association exists between a stabilized basin and a node) is a further precondition; naming (link is stable/reused across repeated visits to that basin) is the actual gate — three layered competencies, not one.
+- "Reliably" = consistency rate above some threshold over a rolling window of the last N occurrences of a given basin being revisited, using chronos.py's logged history as the evaluation window.
+- Must have a minimum-occurrence floor before eligibility (prevents trivial completion with a sparse early graph or landscape).
+- Exact consistency threshold, window size (N), minimum floor, and basin stabilization threshold (§2.1a): **not yet tuned**.
+
+### 6.2 Adolescence → Maturity
+Gate: now mechanically concrete via §2.1b — "cognitive schemas achieve structural resilience" means **the agent has formed some number of stable Schema Nodes** (complex emotional schemas: recurring co-occurrence of a stabilized basic basin with a consistent, emergent relational edge pattern — no specific pattern hand-designated in advance as "this counts"), evaluated with the same hysteresis-over-N-recurrences principle used throughout this design, rather than a raw count of regulation events. Regulation-event outcomes (§4.5) may still feed into which basins/schemas are considered stable, but the gate itself is Schema Node formation. Exact count/threshold of Schema Nodes required, and their own stabilization window: not yet numeric — same tuning category as §6.1's thresholds.
+
+---
+
+## 6A. Node / Edge Data Schema — resolved
+
+Canonical field list, consolidating every property that has accumulated across this design. This is the shared contract for any tool writing code against the graphs — the single highest-risk gap for cross-tool drift if left implicit.
+
+**Node — common fields (every node):**
+- `id` — unique identifier.
+- `label` — display name; **may be null/unset** for unnamed Schema Nodes (§2.1b) or freshly-created co-occurrence-placed nodes awaiting naming.
+- `web` — `"knowledge"` or `"emotional"` (§2.1/§2.2).
+- `node_type` — `"standard"` | `"basin"` | `"schema"` | `"self"` (the SELF node, §2.1b).
+- `source` — `"dictionary"` | `"user"` | `"self_generated"` (§2.2, §5.1) — governs starting trust weight and diversity-signal exclusion.
+- `tier` — `Provisional` | `Working` | `Trusted` (§3.1). **Not applicable to `basin`/`schema`/`self` node types** — trust tiers represent epistemic corroboration of facts; basins/schemas represent recurrence, a different kind of evidence. Kept as a separate concept rather than folding these node types into the tier system with special-cased defaults.
+- `created_at` / `last_reinforced_at` — timestamps, needed for non-reinforcement decay (§3.4) and `temporal-contrast` edges (§2.1b).
+- `corroboration_edges` — structure supporting the diversity signal (§3.2): distinguishes distinct sources/sessions, not just a raw count.
+- `regulatory_efficacy` — float; **null/unset if never used in regulation**, not zero — zero would falsely imply "tried and failed" rather than "never attempted" (§4.5).
+
+**Node — type-specific fields:**
+- `basin` nodes: `pad_coordinates` (arousal, valence, dominance centroid), `dwell_density`, `stabilized: bool` (§2.1a).
+- `schema` nodes: `component_basins` (links to basin nodes), `component_edges` (the relational-edge pattern that defines it), `stabilized: bool` (§2.1b).
+
+**Edge — common fields:**
+- `id` — unique identifier (edges are individually addressable, not just keyed by source/target/type — needed to distinguish repeat corroboration events over time from a single persistent edge, per §3.2's corroboration tracking).
+- `source_id`, `target_id`.
+- `edge_type` — `is-a` | `part-of` | `associated-with` (§2.3) | `responsible-for` | `violates` | `temporal-contrast` | `concerns-other` (§2.1b) | `composed-of` (§6B, new). **This list is now a closed, canonical enum enforced by `edge_types.py` (§6B)**, not just documentation — see below for why that distinction matters.
+- `created_at`, `source` — same provenance tracking as nodes (dictionary/user/self_generated); edges also feed the diversity signal.
+- `placement_method` — `"parsed"` | `"co-occurrence"` (§2.3) — determines re-parenting eligibility at Consolidation.
+
+---
+
+## 6B. Edge-Type Vocabulary Module — new, resolved
+
+**Problem found this revision:** §6A's edge-type list was a closed enum in prose only. Nothing in code imported from a shared source of truth — every module (`archivist.py`, `association.py`, `sensory.py`, `reflector.py`, `stimulus.py`) typed edge-type strings as literals. This is exactly the cross-tool-drift risk §9 risk 4 was written to guard against, and it had already happened once, silently: `stimulus.py`'s synthetic-event injector was creating edges typed `related_to` — a string that never appeared anywhere in §6A's canonical list, because nothing existed to import instead of typing a new one by hand.
+
+**Fix: `edge_types.py`, a new shared module.** Exports:
+- Named constants for all eight edge types (`EDGE_IS_A`, `EDGE_PART_OF`, `EDGE_ASSOCIATED_WITH`, `EDGE_RESPONSIBLE_FOR`, `EDGE_VIOLATES`, `EDGE_TEMPORAL_CONTRAST`, `EDGE_CONCERNS_OTHER`, `EDGE_COMPOSED_OF`).
+- Grouping sets: `CATEGORICAL_EDGE_TYPES`, `RELATIONAL_EDGE_TYPES`, `STRUCTURAL_EDGE_TYPES`, `ALL_EDGE_TYPES`, and `TRUST_BEARING_EDGE_TYPES` (= categorical only, §3.2 item 5).
+- Node-type constants (`NODE_STANDARD`, `NODE_BASIN`, `NODE_SCHEMA`, `NODE_SELF`), matching §6A's `node_type` field.
+- The Graph-tab color/style map (below), so the vocabulary and its visual encoding live in one place and can't drift apart from each other either.
+
+`archivist.py`, `association.py`, `sensory.py`, `reflector.py`, and `stimulus.py` now all import edge-type strings from here rather than typing literals. `stimulus.py`'s `related_to` is fixed to use the canonical `associated-with` (semantically identical — synthetic co-occurrence, not a stated relationship).
+
+**New edge type: `composed-of`.** Previously, `reflector.detect_schemas()` linked a Schema Node to its component basin/event nodes using `associated-with` — the same type used for §2.3's tentative, re-parenting-eligible co-occurrence placements. This conflated two different claims: "this node is loosely, provisionally attached here, might move" (the co-occurrence sense) versus "this is a permanent structural fact about what this schema is composed of" (the schema sense). It was only accidentally safe from being treated as a re-parenting candidate, because `archivist.reparenting_candidates()` also requires `placement == "cooccurrence"`, which schema edges never carry — incidental protection, not designed protection. `composed-of` is now its own type: used only for Schema Node → component-basin and Schema Node → component-event edges, excluded from `TRUST_BEARING_EDGE_TYPES` (§3.2 item 5) same as the relational types, and given its own visual treatment (below) rather than looking identical to a weak co-occurrence link on the Graph tab.
+
+**Graph-tab visual encoding (resolves §10 item 21, "Open gap" flagged in §4B item 1):**
+
+*Edges* — color by category, style/dash pattern distinguishes individual types within a category:
+| Type | Category | Color family | Style |
+|---|---|---|---|
+| `is-a` | categorical | blue, dark | solid, thick |
+| `part-of` | categorical | blue, mid | solid, medium |
+| `associated-with` | categorical | blue, light | solid, thin (deliberately faint — §2.3's weakest claim) |
+| `responsible-for` | relational | orange/red | dashed, fine |
+| `violates` | relational | orange/red | dashed, coarse |
+| `temporal-contrast` | relational | orange/red | dotted |
+| `concerns-other` | relational | orange/red | dash-dot |
+| `composed-of` | structural | purple | dotted |
+
+*Nodes* — shape by `node_type`, color/opacity by tier (standard only) or type-specific data (basin/schema):
+| node_type | Shape | Color rule |
+|---|---|---|
+| `standard` | dot | tier → opacity (Provisional faint → Trusted solid), unchanged from §4B |
+| `basin` | diamond | keyed to the basin's own valence centroid (§6A's `pad_coordinates`) — informative, not arbitrary |
+| `schema` | hexagon | gray if unnamed, green once named (§2.1b item 4a) — makes "recognized but not yet named" visually distinct at a glance |
+| `self` | star | fixed gold — the one axiom (§2.1b item 1), never confusable with any other node |
+
+Regulatory efficacy (§4.5) remains deliberately **not** encoded on the Graph tab, per §4B's existing rationale — kept in the Reflection tab as a philosophically distinct property from epistemic trust.
+
+**Implementation note:** this requires `node_type` to actually be a stored field, which §6A specified but no module was setting. `archivist.py`'s node-creation paths (`store`, `link`, `_seed_self_node`, `_seed_other_node`) now set it explicitly; `reflector.detect_schemas()` sets it on new Schema Nodes. Older checkpoints saved before this field existed render via a fallback inference (schema flag / known SELF id / else standard) rather than crashing, in `prometheus_dashboard.py`.
+
+**`prometheus_dashboard.py` — also newly written this revision.** This file was referenced by `app.py`'s import and named in every prior spec revision's §7 table, but was never actually present in the project. Reconstructed to implement both the long-standing Task 1 fix (in-memory `generate_html()`, no filesystem write) and the visual encoding above, pulling entirely from `edge_types.py`'s style map rather than re-declaring colors locally.
+
+---
+
+## 7. Module Responsibilities (Updated)
+
+| Module | Layer | Responsibility |
+|---|---|---|
+| `core.py` | Hidden | Raw somatic variables (heart_rate, respiration_rate, dopaminergic_tone — fast layer; cortisol_load, vascular_constriction — slow layer; muscle_tension — fast layer, feeds dominance axis, §2.1a). No semantic meaning. **Known overload**: dopaminergic_tone currently feeds valence, the fatigue composite, and the self-study reward bump (§5.1) simultaneously — flagged in §9 as a potential coupling artifact, not yet resolved. |
+| `hormonal.py` | Hidden | Fast/slow chemical decay math, Epoch enum. **Stays pure** — does not read association.py or chronos.py directly. Receives epoch-shift instructions from prometheus.py. |
+| `synthesizer.py` | Boundary | Projects core.py raw state onto composite arousal/valence/dominance (PAD) axes and looks up the current point against the stabilized basin map (§2.1a) to produce the current named Felt State. Only output the rest of the system may read. Does not modify the basin map itself — that's a Consolidation-time operation. |
+| `executive.py` | Visible | **Added to this table this revision — real, wired-in module previously missing from §7 despite being imported and run every tick.** Tracks drift in the synthesized intensity signal (`synthesizer.get_current_intensity()`) to compute a `BIAS_EXPLORE`/`BIAS_STABILIZE`/`BIAS_NEUTRAL` bias signal. Correctly reads only synthesizer output, never raw somatic/hormonal state, consistent with the Core Emergence Principle. **Open item (§10, new):** the computed bias is currently only logged (via `chronos.record_pulse`) and passed to `reflector.issue_directive()` for override comparison — nothing in `_ingest()` or `_self_study()` actually branches on it, despite the method being named `bias_processing`. Not yet a documented consumer of its own output. |
+| `stimulus.py` | Test harness | **Added to this table this revision.** `SyntheticStimulusEngine` — test/demo harness for injecting synthetic hormonal spikes (`trigger_internal_event`) and bulk synthetic nodes (`inject_chaotic_data`) without going through the normal sensory/association ingestion path. Not part of the agent's own cognition; exposed directly in app.py's sidebar ("Stimulus" controls) and the tester guide. Synthetic events are tagged `source="self_generated"` (excluded from diversity signal, §9 risk 5) and now use the canonical `associated-with` edge type (§6B) rather than the previously undocumented `related_to`. |
+| `association.py` | Visible | Grows the knowledge/schema web from felt states + dictionary/user/self-generated input. Handles hierarchy placement (dictionary-pattern parsing + co-occurrence fallback, §2.3) and typed edges, including relational edge types (`responsible-for`, `violates`, `temporal-contrast`, `concerns-other`, §2.1b). Detects explicit negation for demotion (v1). Re-parenting (§2.3 mechanism 3) now actually executes, via WordNet hypernym lookup rather than the previously-dead definitions-dict path. |
+| `archivist.py` | Visible | Pruning: executes the concrete trigger rule (§5.2 — Provisional + N_prune unreinforced Consolidation passes → removal, with cascade edge cleanup), trust-tier bookkeeping (promotion/demotion execution during Consolidation, now restricted to categorical-edge corroboration only, §3.2 item 5), re-parenting evaluation for co-occurrence-placed nodes (§2.3), regulatory efficacy scoring (§4.5). Sets `node_type` on all node-creation paths (§6A/§6B). |
+| `chronos.py` | Visible | Time-series log of felt-state history, arousal-valence-dominance trajectory (feeds §2.1a's dwell-time histogram), and decay steps — the evaluation window for milestone/consolidation checks. Also the source of timestamps for `temporal-contrast` edges (§2.1b). |
+| `reflector.py` | Visible | **Resolved (§4A, extended by §2.1b):** structural self-report (graph shape, hub nodes, tier distribution) + regulatory self-awareness (aggregates efficacy scores, §4.5) + complex-schema detection (scans for recurring basin + relational-edge co-occurrence patterns, forming Schema Nodes, §2.1b — this absorbs and gives concrete purpose to the consistency-auditing capability previously deferred). Consolidation-gated. Schema composition edges now use `composed-of` (§6B), not `associated-with`. |
+| `sensory.py` | Input | Ingests dictionary tokens (confirmed this revision: WordNet via `nltk.corpus.wordnet`, §2.2), user input, and self-generated idle-expansion lookups (§5.1); tags each by source for trust-weighting purposes (§3.2) and diversity-signal exclusion for self-generated content. Also detects candidate relational edges (`responsible-for`, `violates`, `temporal-contrast`, `concerns-other`, §2.1b) via the same deterministic pattern/keyword approach used for negation detection (§3.4). Four distinct WordNet lookups, each for a different purpose: `lookup_definition` (glosses, feeds `parse_hierarchy`), `lookup_expansion` (hyponyms, self-study children — fixed this revision, previously returned synonyms), `lookup_hypernym` (re-parenting parent, new), `lookup_synonyms` (canonicalization, new, not yet wired into node creation — §10). |
+| `edge_types.py` | Shared vocabulary | **New this revision (§6B).** Canonical edge-type and node-type constants, grouping sets (categorical/relational/structural, trust-bearing), and the Graph-tab color/style map. Every module that creates or reads a typed edge imports from here rather than typing a literal — the fix for the `stimulus.py` "related_to" drift instance found this revision. |
+| `prometheus.py` | Orchestrator | Owns cross-layer epoch transition checks (reads both hidden and visible layers); coordinates tick sequencing, including the §4D catch-up computation on each Streamlit rerun; detects regulation triggers and selects the regulating node (§4.1–4.2); owns save/load of the persistence checkpoint at Consolidation (§4C); is the *only* module permitted to see across the full hidden/visible boundary. **Boundary bug fixed this revision:** `_update_fatigue` was reading `somatic.urgency` directly — raw hidden-layer output from `bio.step()` — bypassing `synthesizer.py` entirely, in violation of the Core Emergence Principle this same file's other decision points (regulation, executive bias) were already careful to respect. Now conditions on `synthesizer.get_current_intensity()` like everything else. |
+| `app.py` | Interface | Streamlit entry point. Hosts the tabbed layout: Graph / State / Reflection / Debug (§4B). |
+| `prometheus_dashboard.py` | Interface | **Written this revision — referenced by app.py and named in every prior spec revision's table, but never actually present in the project until now.** Pyvis graph rendering for the Graph tab. Implements the long-standing Task 1 fix (in-memory `generate_html()` instead of `net.show()`, avoiding the silent-failure mode on read-only/sandboxed filesystems or races with Streamlit's rerun cycle) and the full visual encoding from §6B, pulling styling from `edge_types.py` rather than re-declaring it locally. |
+
+---
+
+## 8. Immediate Development Tasks (from original spec)
+- [ ] **Task 1**: Refactor `prometheus_dashboard.py` to render Pyvis via in-memory `generate_html()`, per the tabbed UI design in §4B.
+- [ ] **Task 2**: Define the Epoch enumeration and transition checkers — now clarified to live primarily in `prometheus.py` (cross-layer check) with the enum itself in `hormonal.py`.
+- [ ] **Task 3 (new)**: Build the tabbed Streamlit layout (§4B) — Graph / State / Reflection / Debug — as the container for Task 1's dashboard.
+
+---
+
+## 9. Known Risks (carried forward, not yet mitigated in code)
+1. **Runaway feedback loops** — felt states drive graph growth; without an explicit dampening term in the cross-link (§4), Adolescence risks getting stuck in permanent turmoil rather than resolving toward Maturity. **Second instance**: the self-study loop (§5.1) — salience picks a node, self-study produces hormonal signal, signal shifts future salience. Mitigated in design by scaled-down self-study hormone magnitude, but decay-rate-vs-delta-size balance is unverified until the system actually runs.
+2. **Unbounded slow-layer drift** — cortisol/baseline variables need floors/decay tuned so a bad stretch doesn't permanently bake in a dysregulated temperament before Maturity's stabilization logic can apply.
+3. **Layer boundary is a convention, not enforced** — Python won't stop `association.py` (or, more critically, `prometheus.py`) from importing `core.py` directly. No lint rule or runtime guard yet. This is the **highest-stakes risk in the design**, not a minor code-hygiene issue: per the Core Emergence Principle (§ Project Concept), any accidental path from core.py's raw values into the agent's own decision logic — even just prometheus.py conditioning a choice on cortisol_load directly instead of a synthesized felt state — undermines the central premise that felt states and behavior are *inferred*, not read off a variable. Real risk given multiple LLM tools writing different modules across sessions, since none of them can be assumed to preserve an unenforced convention. Worth a runtime guard (e.g., core.py's SomaticCore refusing to be imported outside an allowlist of hidden-layer modules) once implementation starts, not just a docstring warning.
+4. **Cross-tool drift** — the largest practical risk identified in this whole design process. Mitigate by: (a) keeping this doc updated as the single source of truth, (b) pasting relevant sections into new sessions rather than relying on model memory, (c) keeping design and implementation conversations separate — implementation sessions should receive a finalized spec, not co-develop one.
+5. **Self-generated trust gaming** — without the distinct tagging described in §2.2, an agent could inflate its own node's trust/diversity signals by repeatedly self-expanding around it. Mitigated in design (self-generated edges excluded from diversity signal) but needs enforcement at the archivist.py trust-scoring step, not just at creation.
+6. **Childhood cold-start / basin sparsity** — since felt states are now emergent basins (§2.1a) rather than fixed categories, a young agent may have a genuinely flat, unformed landscape for a long stretch, with no basin stable enough to name. This is intended (real growth, not instant classification) but means Childhood could last far longer or shorter than expected depending on how much the agent's trajectory naturally revisits similar regions — worth watching once the vertical slice is running, since this directly determines how long Childhood *feels* in practice, not just architecturally.
+7. **dopaminergic_tone overload** — this single variable currently feeds the valence axis (§2.1a), the fatigue composite (§5), and the self-study reward bump (§5.1) simultaneously. This risks an artifact where every self-study action mechanically nudges valence positive regardless of whether the expansion was meaningful, entangling "feeling good" with "just self-studied" rather than these being independently earned. Not yet resolved — worth revisiting once the vertical slice makes the entanglement visible in practice, or deciding it's an acceptable, even thematically appropriate, coupling (self-study genuinely is mildly pleasant by definition).
+8. **`concerns-other` collapses every non-SELF party into one generic `OTHER` node (documented this revision, not yet resolved).** §2.1b describes this edge type as involving "a distinct entity node representing someone other than SELF," which reads as though different people could be distinguished from one another. The implementation seeds a single universal `OTHER` placeholder for all of them (`archivist._seed_other_node`), meaning jealousy-about-person-A and embarrassment-about-person-B are structurally indistinguishable — both are just `concerns-other` edges pointing at the same node. This is a real modeling limitation with consequences for what Schema Nodes can represent (no schema can be specific to a particular relationship), not a bug, but it was previously undocumented anywhere. Resolving it properly would mean sensory.py extracting a named entity from text rather than a fixed placeholder — a bigger lift than anything else in this list, and arguably its own open design question rather than a quick fix.
+9. **Boundary-principle leak found and partially fixed this revision — one instance remains.** `prometheus._update_fatigue` was reading `somatic.urgency` (raw hidden-layer `SomaticReadout`) directly, bypassing `synthesizer.py`; this is now fixed (§7 table, `prometheus.py` row). However, the same class of leak still exists in `reflector.py`'s structural self-report: `chronos.record_pulse()` stores the raw `somatic` object every tick (reasonable — it's persisted for logging), but `reflector.observe()`'s spinning/stagnant detection reads `entry["somatic"].get("urgency"/"tension")` straight out of that stored raw data to compute `variance`/`urgency_trend`, which then feeds `evaluate()`'s `FORCE_RESET`/`FORCE_EXPLORE` override — a real decision, conditioned on raw hidden-layer values, not a synthesized signal. This is a second, distinct instance of risk 3 (the "highest-stakes risk in the design") that wasn't caught in this revision's fixes and should be treated as a live open item, not assumed resolved just because the fatigue instance was.
+
+---
+
+## 10. Open Questions Requiring Decisions Before Further Coding
+1. ~~Two-web cross-link mechanics~~ — **Resolved (§4): regulation via accelerated fast-layer decay, capped by tier-restricted efficacy score, fatigue-costed, evaluated at Consolidation.**
+2. ~~`reflector.py`'s actual job~~ — **Resolved (§4A): structural self-report + regulatory self-awareness + complex-schema detection (§2.1b), Consolidation-gated. Narrow node-ambiguity auditing still deferred to v2.**
+3. ~~Trust-tier axis vs. abstraction-depth axis~~ — **Resolved (§2.4): orthogonal, tracked independently.**
+4. Fatigue composite formula and T1/T2 thresholds — need concrete values or a tuning plan. **Now the highest-priority remaining item — all major architecture is resolved; what remains is numeric tuning.**
+5. ~~Adolescence → Maturity gate~~ — **Resolved (§2.1b, §6.2): Schema Node formation, not variance-based.** Remaining: exact count/threshold of Schema Nodes required (folded into item 14 below).
+6. Hysteresis window sizes (N consolidation passes) for both state-cycling and trust promotion/demotion — not yet numeric.
+7. Self-study hormone delta magnitude and decay rate (§5.1) — needs actual numbers, likely only tunable empirically once a vertical slice is running.
+8. Regulation dampening cap and its epoch-scaling curve (§4.4), and initial/default regulatory efficacy value for a newly-eligible node (§4.5) — not yet numeric.
+9. Fatigue level abstraction thresholds for the State tab's low/medium/high indicator (§4B) — needs to map to the same T1/T2 bands as §5, not a separate scale.
+10. Composite axis formulas (arousal/valence, §2.1a) — the general shape (heart_rate+respiration_rate; dopaminergic_tone−cortisol_load) is set, but exact weighting/normalization is not.
+11. Dwell-time histogram grid resolution and basin stabilization threshold (revisit count/duration, §2.1a) — not yet numeric, same tuning category as fatigue thresholds.
+12. Basin decay rate (§2.1a point 5) for non-reinforced felt states — not yet numeric.
+13. Schema Node stabilization threshold (§2.1b) — how many recurrences of a basin+relational-edge-pattern co-occurrence before it counts as a stable schema — not yet numeric, same tuning category as basin stabilization.
+14. Number/threshold of Schema Nodes required for the Adolescence → Maturity gate (§6.2) — not yet numeric.
+15. sensory.py's pattern/keyword rules for detecting `responsible-for`/`violates`/`temporal-contrast`/`concerns-other` candidates (§2.1b) — approach is set (deterministic, same style as negation detection) but the actual rule set isn't written yet.
+16. ~~Persistence~~ — **Resolved (§4C): single-instance, checkpointed at Consolidation, durable state = both graphs + basin landscape + efficacy scores + epoch + slow-layer baseline only, bounded rolling chronos window, plain JSON format.**
+17. ~~Tick/scheduling loop under Streamlit~~ — **Resolved (§4D): catch-up simulation on rerun, no background process for v1. Background process deferred as a deliberate v2 upgrade.**
+18. ~~Node/edge data schema~~ — **Resolved (§6A): full canonical field list defined for nodes and edges, including type-specific fields for basin/schema nodes and edge IDs for corroboration-event tracking.**
+19. ~~Pruning's concrete trigger~~ — **Resolved (§5.2): terminal stage of non-reinforcement decay — Provisional + N_prune unreinforced Consolidation passes → removed, with cascade edge cleanup. Epoch-scaling of N_prune remains an open numeric question, tracked jointly with T1/T2 (item 6).**
+20. Real-time-to-simulated-tick mapping for the §4D catch-up computation — not yet numeric.
+21. **Visual encoding for `basin`/`schema`/`self` node types on the Graph tab (§4B)** — ~~tier-based coloring doesn't apply to these node types (§6A), and no alternative encoding has been defined yet.~~ **Resolved (§6B): shape+color map defined and implemented in `prometheus_dashboard.py`.**
+22. **`sensory.lookup_synonyms()` is implemented but not wired into node creation (§2.2, new).** Canonicalization/dedup — checking whether an incoming term is a known synonym of an existing node before creating a new one, so "color" and "colour" reinforce one shared node instead of splitting corroboration — was identified as a real, separate use for WordNet synonyms distinct from self-study's hyponym expansion. The lookup exists; `association.place_node()` doesn't call it yet. Same shape as §11's archive-rehydration problem (avoid silent duplicates), just showing up earlier, in the live graph rather than after archiving exists. Left open deliberately — needs a decision on where the check goes (before `store()`? before the hierarchy-placement fallback?) and what edge type would record the relationship (`synonym-of`/`equivalent-to`, not yet added to §6B's vocabulary) before it's implemented, not a numeric-tuning item.
+23. **`executive.py`'s bias signal has no documented consumer (§7, new).** `bias_processing()` computes `BIAS_EXPLORE`/`BIAS_STABILIZE`/`BIAS_NEUTRAL` every tick from intensity drift, but nothing in `_ingest()` or `_self_study()` currently branches on the result — it's only logged (`chronos.record_pulse`) and checked for override by `reflector.issue_directive()`. Either a real consumer needs to be designed (e.g. self-study's node-selection weighting, §5.1, could plausibly prefer exploration-style targets under `BIAS_EXPLORE`), or the module's actual scope should be documented as "drift signal for logging/override only" rather than implying it steers processing, which its own method name currently suggests it does.
+24. **`reflector.observe()`'s raw-somatic read (§9 risk 9, new) needs a fix analogous to fatigue's.** Likely direction: either compute `urgency_trend`/`tension_acceleration` from `synthesizer.get_current_intensity()` history instead of raw somatic fields in chronos entries, or accept storing both a raw and synthesized value per chronos entry and make explicit which one each consumer is allowed to read — not yet decided, flagged rather than fixed this revision since it touches chronos's stored schema, not just one call site.
+
+---
+
+## 11. v2 Roadmap — Working Memory, Attention, and Rendering at Scale
+
+**Status: deliberately deferred, not part of the resolved v1 architecture.** Three problems surfaced during implementation/testing that all turn out to be one underlying mechanism wearing different hats — worth building as one coherent feature rather than three separate patches when this is picked up.
+
+**The problems:**
+1. **Rendering lags badly around ~300 nodes.** The Graph tab currently renders the entire live knowledge graph every time; Pyvis/vis.js's force-directed layout doesn't scale gracefully past a few hundred nodes.
+2. **Self-study's target selection is too random.** Even after the out_degree-cap and Provisional-pool fixes (§5.1 implementation notes), selection is still closer to weighted-random than anything resembling attention or focus.
+3. **Heavy multi-parenting makes the graph visually unreadable regardless of node count.** A node like "green" legitimately belongs under both a `colors` schema and a `grass`/`plant`/`lifeforms` chain — multiple valid parents across unrelated branches. Force-directed layout has no good answer for this; the node gets pulled toward a compromise position between clusters, and at real scale (multiple abstraction tiers, cross-branch links) this produces a hairball almost regardless of tuning. This is a structural limit of force-directed layouts under heavy multi-parenting, not a bug specific to this implementation.
+
+**The unifying idea: an activation-based working-memory layer**, the same concept as ACT-R's declarative/working-memory split — not a novel/risky invention, a well-trodden pattern in cognitive architecture. Each node gets an activation score, boosted when touched (ingested, self-study-expanded, used as a regulation anchor) and decaying over time (same Consolidation clock as everything else in this design — one more thing on the existing clock, not a new one). "Working memory" = the top-K nodes by activation at any moment.
+
+**How this resolves all three problems at once:**
+- **Rendering**: the Graph tab renders only the working-memory set (or a 1–2 hop neighborhood around whatever's currently active/selected), not the full graph. Bounded render cost regardless of how large long-term memory grows.
+- **Self-study targeting**: instead of `random.choice()` over an eligible pool, self-study targets the highest-activation node(s) in working memory — a real, non-arbitrary attention mechanism rather than another hand-tuned heuristic layered onto the existing fallback chain.
+- **Multi-parenting readability**: neighborhood-focused rendering (per "Rendering" above) sidesteps the hairball problem directly — a click on "green" shows its immediate parents and their immediate neighbors, not the whole cross-linked structure at once. A cheap complementary fix, once this exists: pick one edge type as load-bearing for layout (e.g. `is-a`/`part-of`) and render cross-branch/`associated-with` edges as thin, de-emphasized reference lines rather than giving them equal physical pull in the layout.
+
+**Archiving (cold storage), a related but distinct extension:** move long-untouched, low-activation nodes out of the live graph entirely into a separate JSON archive, rather than just excluding them from rendering. This matters because a Consolidation pass currently iterates the *entire* live graph every cycle regardless of what's rendered — at scale that's a growing per-tick cost, not just a display issue. This is the same principle already used elsewhere in the design (chronos bounds its rolling window, basins decay rather than accumulate forever) applied to the knowledge graph itself.
+
+**Open design questions to resolve when this is actually built, not now:**
+- **Archive trigger, distinct from pruning.** Pruning removes nodes that never earned trust. Archiving is the opposite case — a well-established Trusted/Working node that simply hasn't been touched in a long time. Natural shape: `Trusted/Working tier + activation below floor for N consolidation passes → archive`. Needs its own threshold(s), not reused from pruning's.
+- **Rehydration.** If the agent later re-encounters an archived concept (e.g. "blue" comes up again after being archived), the system must check the archive index *before* creating a new node — otherwise a silent duplicate forms, splitting the corroboration history that earned the original node its trust tier in the first place. This is the piece most likely to need careful design, not a quick bolt-on.
+- **Per-consumer archive-awareness.** Everything that currently walks `archivist.graph` directly (reflector's structural report, schema detection, regulation's node lookup, self-study's candidate scan) needs an explicit decision once cold storage exists: should it only ever see "hot" working memory (arguably correct for regulation/self-study — you act on what's active, not your entire lifetime of facts), or does it need to reach into cold storage too (arguably correct for something like the deferred consistency-auditing capability, §4A, if that's ever built)? Decide per-consumer, not with one blanket answer.
+- **Activation formula and K (working-memory size)** — not yet numeric, same tuning category as everything in §10; only resolvable empirically once this is running.
+
+---
+
+## 12. Review Log — this revision (2026-07-16)
+
+A different kind of pass than §9/§10: not new forward-looking risks or numeric-tuning items, but gaps found by actually reading the running code against the spec text and fixing what was safe to fix immediately. Recorded here so a future session can see what changed and why, rather than re-discovering the same gaps from scratch.
+
+**Fixed in code this revision:**
+1. `sensory.lookup_expansion` used WordNet synonyms (`syn.lemmas()`) where §5.1 has always described hyponyms (children) — self-study could never have produced the taxonomy the section describes. Fixed to use `syn.hyponyms()`; synonym behavior preserved separately as `lookup_synonyms()` for canonicalization (§10 item 22, not yet wired in).
+2. `association.run_reparenting_pass()` was a silent no-op — `prometheus.py` never supplied the `definitions` map the old gloss-parsing path required, so §2.3 mechanism 3 never actually executed despite being documented as resolved since rev 7. Fixed to use `sensory.lookup_hypernym()` (WordNet's own taxonomy) as the primary path.
+3. `prometheus._update_fatigue` read `somatic.urgency` directly (raw hidden-layer value), violating the Core Emergence Principle. Fixed to use `synthesizer.get_current_intensity()`. **Note:** a parallel instance in `reflector.observe()` was found but not fixed — see §9 risk 9 / §10 item 24.
+4. `archivist._trust_score` counted every incident edge toward corroboration/diversity regardless of type, letting relational (`responsible-for`/`violates`/etc.) and schema-composition edges inflate epistemic trust for reasons unrelated to truth. Fixed to restrict corroboration counting to categorical edge types only (§3.2 item 5).
+5. `stimulus.py` used an undocumented `related_to` edge type, never part of §6A's canonical list — a real, already-occurred instance of the cross-tool-drift risk §9 risk 4 exists to name. Fixed to use `associated-with`.
+6. `reflector.detect_schemas()` used `associated-with` for Schema Node composition edges, conflating a permanent structural fact ("this is what the schema is made of") with a tentative, re-parenting-eligible co-occurrence placement. Fixed via new `composed-of` edge type (§6B).
+7. `synthesizer.GRID_RESOLUTION` was defined but never actually consumed — `_bin_key` hardcoded `round(x, 1)` regardless of the constant's value, and it also wasn't exposed as a Debug-tab slider unlike every other basin-formation parameter. Fixed to actually drive the rounding; still needs the app.py slider added (not done this revision — app.py wasn't touched).
+8. No shared vocabulary module existed for edge types or node types, despite §6A specifying both as closed enums. New `edge_types.py` created; `archivist.py`, `association.py`, `sensory.py`, `reflector.py`, `stimulus.py` migrated to import from it instead of typing literals.
+9. `node_type` (§6A field) was specified but never set anywhere. Backfilled on all of `archivist.py`'s node-creation paths and on Schema Node creation in `reflector.py`.
+10. `prometheus_dashboard.py` — referenced by `app.py` and named in every prior spec revision's §7 table, but never actually present in the project. Written this revision, implementing both the long-standing Task 1 fix and the new §6B visual encoding.
+
+**Documented but deliberately not fixed this revision** (real gaps, correctly left as open decisions rather than quick patches):
+- `concerns-other`'s collapse to a single generic `OTHER` node (§9 risk 8) — fixing this properly means named-entity extraction in `sensory.py`, a materially bigger change than anything else in this list.
+- `reflector.observe()`'s raw-somatic boundary leak (§9 risk 9 / §10 item 24) — touches chronos's stored schema, not a single call site; needs its own design pass.
+- `executive.py`'s bias signal having no real consumer (§10 item 23) — needs a decision on where it should plug in, not just a wiring fix.
+- `sensory.lookup_synonyms()` not being wired into node creation for canonicalization (§10 item 22) — needs a decision on placement and a new edge type first.
+
+**Not investigated this revision:** `app.py` itself was not modified — the new `GRID_RESOLUTION` slider (item 7 above) and any UI surfacing of `composed-of`/node_type-based legend text are still open follow-ups for whoever next touches the dashboard.
+
+**Addendum (found on first real deploy, same day):** `prometheus_dashboard.py` used a relative import (`from .edge_types import ...`) for the new shared vocabulary module. This works when everything sits inside one package, which is how it was tested — but breaks in the actual repo layout, where `prometheus_dashboard.py` lives at the repo root as a plain top-level module (imported by `app.py` via `from prometheus_dashboard import render_graph_html`, no package prefix) while `edge_types.py` lives inside the `Prometheus/` package subfolder alongside `archivist.py`. A relative import only resolves against a parent package; at the root, there isn't one — `ImportError: attempted relative import with no known parent package`. Fixed to `from Prometheus.edge_types import ...`, the same absolute-import pattern `app.py` already uses for `Prometheus.Prometheus`. **Root cause of the miss:** this session's compile/import testing flattened every file into one directory rather than reproducing the actual root-vs-package split, so the one new file that crosses that boundary (`prometheus_dashboard.py` is the only module imported top-level rather than through the package) was never tested in a layout that could have caught this. Re-verified against a simulated copy of the real layout before re-shipping.
+
+**Addendum 2 (found from production data after real deployment, same day).** Two more real bugs found by reading actual production symptoms rather than synthetic testing — a screenshot of the Reflection tab after ~3500+ pulses showed (a) every one of 102 regulation-capable nodes reporting the *identical* regulatory efficacy value (0.4500, both "most" and "least" effective lists), and (b) node/edge counts essentially flat (104 nodes, throughput ~0.10 edges/pulse) despite the system spending most of its time in Learning state.
+
+1. **Regulation eligibility bug (§4.2).** `prometheus._apply_regulation` computed `eligible_regulation_nodes(anchors or None)` — `anchors or None` treats an *empty* anchor list identically to "no restriction requested," so whenever no felt-state anchor had been recorded yet for the active basin (common, especially early on, or after a basin destabilizes/reforms), `eligible_regulation_nodes(None)` fell back to *every* Working/Trusted-tier node in the graph rather than the felt-state-scoped set §4.2 actually specifies. A single regulation event under this condition nudges the entire eligible pool's efficacy by the same amount at once — exactly the uniform-0.4500 symptom observed, and consistent with regulation rarely re-firing afterward (arousal settling back toward baseline, rarely re-crossing the spike threshold without an external stimulus). Fixed: `prometheus.py` now passes `anchors` directly (even when empty), so an empty anchor list correctly yields zero eligible nodes and hits the pre-existing (previously unreachable) "legitimate state, nothing eligible yet" early return.
+
+2. **Self-study saturation (§5.1).** Node growth stalling near ~104 nodes despite continued Learning-state ticks traced to `_select_self_study_target`'s `has_room` filter (`out_degree < 3`, deliberate — prevents runaway hub growth) combined with zero memory of which candidates had already been tried. WordNet hyponym expansion legitimately produces leaf terms with no hyponyms of their own (e.g. "brougham," "trolley coach" as hyponyms of "bus") — once the graph's few productive, many-hyponym hub words hit the degree cap, an increasing fraction of self-study's random picks landed on these dead ends and silently produced nothing, every time, forever, since the same dead ends kept getting re-selected. Fixed with three changes: (a) `_self_study` now retries up to `SELF_STUDY_MAX_ATTEMPTS` (3) different candidates per tick instead of giving up after one; (b) any confirmed-empty target is memoized in `self._barren_self_study_targets` and permanently excluded from future selection, so the random pool converges toward nodes that can actually still produce children; (c) "room" is now counted on categorical out-edges only (`is-a`/`part-of`/`associated-with`, via `edge_types.CATEGORICAL_EDGE_TYPES`), not relational/`composed-of` edges, so a node isn't falsely treated as "full" for hierarchy-branching purposes because of unrelated relational/schema participation; (d) a new escape-valve fallback: if the strict cap has genuinely exhausted every non-barren node, `_select_self_study_target` retries once with a softer ceiling (`SELF_STUDY_SOFT_CAP`, 6) rather than permanently halting graph growth — still bounded, so this doesn't reopen the unlimited-runaway-hub risk the strict cap exists to prevent.
+
+Both fixes verified against constructed scenarios mimicking the reported production state (saturated graph, no felt-state anchor recorded) before shipping — see the code comments at each fix site for the specific reasoning.
+
+**Addendum 3 (found from production data, same day, after Addendum 2's regulation-eligibility fix went live).** Addendum 2's anchor fix was correct in spirit — regulation shouldn't fall back to the whole graph — but it exposed a second, worse bug: a follow-up screenshot after a memory reset (24 nodes, pulse 566) showed every regulation-capable node sitting at the *untouched default* `0.5000`, not even the old buggy `0.45` — meaning `update_regulatory_efficacy` had likely never been called a single time in that run.
+
+**Root cause:** `felt_state_anchors` was only ever populated inside `_ingest()` — and `_ingest()` only runs for explicitly queued user/dictionary input. Under realistic usage (`Run Batch` queues no input at all; the overwhelming majority of Learning ticks are self-study), `felt_state_anchors` stayed effectively empty. Once regulation was correctly scoped to anchored nodes only, it found zero eligible candidates almost every time it fired — a stricter, "more correct" bug that was practically worse than the one it replaced, since regulation went from over-broad to essentially never-exercised. Notably, `_ingest()`'s own docstring already claimed to be *"shared by both externally-queued input and self-study"* — it never actually was; `_self_study()` calls `association.place_node()` directly and always has, since the original codebase.
+
+**Fix:** `_self_study()` now records the same felt-state → node anchor link `_ingest()` does — both for its newly-placed children and (new) for the parent `target` node itself, which is what actually recurs across multiple self-study ticks (until it hits the degree cap) and so gives §6.1's naming-reliability check and §4.2's regulation pool a genuinely consistent anchor to work with, not just a growing list of one-off child terms.
+
+**Design note, stated explicitly rather than left implicit:** this is a real scope decision, not just a bug fix — `felt_state_anchors` (and by extension chronos's felt-state-link log, which feeds §6.1's Childhood→Adolescence gate) previously reflected only conversational/dictionary-triggered experience. It now also reflects autonomous self-study activity. This is defensible — §5.1 already describes self-study node selection as meant to be "weighted by current felt state" (itself not actually implemented, a separate gap — self-study's target selection currently has no felt-state weighting at all, only tier/room-based pooling) — but it does mean the Childhood naming milestone can now be satisfied partly through idle self-study rather than exclusively through real interaction. Flagged here rather than silently expanded; revisit if that turns out to matter for what "naming" is supposed to represent.
+
+Verified against both the failure case (self-study-only run with a stabilized felt state now populates anchors and regulation finds eligible candidates) and the original regression (an `Unformed` felt state throughout still correctly yields zero anchors and zero eligible regulation nodes — the original whole-graph fallback is not reintroduced) before shipping.
+
+**Addendum 4 (same day, in response to "schemas aren't forming").** Investigated why no Schema Nodes had appeared despite substantial graph growth. Found two distinct causes, one structural/expected and one a real, fixable bug.
+
+**1. Structural (not a bug, but previously invisible) — schema formation is gated entirely on typed conversational input.** `sensory.detect_relational()` only runs inside `_ingest()`, which only fires for explicitly queued user/dictionary text (`Send`, not `Run Batch`/self-study). Self-study places dictionary hyponyms directly via `association.place_node()` and never calls relational detection — it structurally cannot produce a relational edge, so it can never contribute toward schema formation. Given most testing activity is self-study (`Run Batch` queues no input), this alone explains long stretches with zero schema progress, and it's expected behavior, not a defect — §2.1b's complex emotions are specifically meant to require self-referential narrative content, which self-study's dictionary expansion doesn't produce.
+
+**2. Real bug found and fixed: relational edges created before their own tick's chronos entry were being silently and permanently dropped from schema candidacy.** `reflector.detect_schemas()` previously reconstructed the felt state active at edge-creation time by finding the nearest *preceding* chronos history entry to the edge's timestamp (`_felt_state_near`). But `prometheus.py`'s `pulse()` always calls `_ingest()` (which creates relational edges) *before* that same tick's `chronos.record_pulse()` — so a relational edge's own timestamp is always earlier than its own tick's chronos entry. The lookup could therefore only ever find the *previous* tick's felt state, or — critically — nothing at all on the very first pulse ever, or on the first tick after a felt-state transition, since there's no earlier chronos entry to find. Any relational edge created in that situation was silently discarded from schema candidacy forever, regardless of how many more times the same pattern later recurred. Given how rare relational edges already are (gated on specific keyword phrasing, per cause 1 above), losing the *first* occurrence of a pattern to a pure timing artifact was a real, avoidable loss of exactly the data schema formation depends on.
+
+**Fix:** `archivist.link()` now accepts an optional `felt_state` parameter and stamps it directly onto the edge as `felt_state_at_creation` when supplied — ground truth recorded at the moment of creation, not reconstructed afterward. `association.link_relational()` passes this through, and `prometheus._ingest()` (which already computes `felt_state` locally via `synthesizer.get_current_felt_state()` for its own chronos-linking logic) now passes that same value into `link_relational()`. `reflector.py` gained `_resolve_felt_state()`, which prefers the stamped value and falls back to the old timestamp-reconstruction only for edges that predate this fix (e.g. relational edges already present in an existing saved graph checkpoint) — backward compatible, no data loss on upgrade, verified in testing.
+
+**Also added: `reflector.schema_candidate_report()` and a new Reflection-tab diagnostic panel.** The actual usability problem underlying "schemas aren't forming, is it just slow or is something wrong" was that there was no way to tell the difference — the UI only ever showed a binary "no stable Schema Nodes formed yet." The new read-only, non-mutating method mirrors `detect_schemas()`'s grouping logic and reports: total relational-edge-bearing event nodes, how many were dropped for occurring before any felt state had stabilized, and — for every surviving `(felt_state, relation_set)` candidate pair — its current count against `SCHEMA_STABILIZATION_THRESHOLD` and how many more occurrences are needed. Surfaced in `app.py`'s Reflection tab under a new "Schema formation progress (diagnostic)" expander, with inline guidance on what kind of input actually produces relational edges (since self-study can't). Verified end-to-end against the real `pulse()`/`_ingest()` code path: three messages consistently triggering the same relation-type combination under a pinned felt state correctly form an unnamed Schema Node, and the diagnostic accurately reports progress at 1/3 and 2/3 before that.
+
+**Addendum 5 (same day, in response to "graph should render a focused section, self-study should learn from a focused group, and there's minimal emotional movement").** Three related asks, two of which turned out to share a root cause with §11's already-deferred working-memory concept, and one of which was a genuine missing mechanism.
+
+**1. Root cause of "minimal emotional movement": real conversational input produced zero hormonal reaction.** `hormonal.py` decays every hormone toward 0.5 baseline every tick; the only things that ever pushed back against that decay were self-study's deliberately tiny dopamine bump and the manual Stimulus trigger. `_ingest()` — which runs sensory/association/chronos logic for every typed message — never touched `bio._hormones` at all. §5.1 has always described self-study's bump as "scaled down deliberately relative to externally-triggered deltas," but no externally-triggered delta mechanism existed anywhere in the code for it to be smaller than. This is almost certainly why the PAD landscape read as flat: it was converging toward a fixed decay-equilibrium with nothing routinely disturbing it.
+
+**Fix: `prometheus._react_to_input()`, a new deterministic, rule-based hormonal reaction to real input.** Signals used, all already computed elsewhere in the pipeline (no new inference, consistent with the engine's no-black-box constraint): message length as a coarse intensity/engagement proxy; detected relational edges (§2.1b) — `violates`/`responsible-for` read as stress/guilt-adjacent (cortisol up), `concerns-other` as socially salient (mild arousal up), `temporal-contrast` as bittersweet/nostalgia-adjacent (small dopamine shift); and explicit negation/correction (§3.4) as mildly stressful (cortisol up). Deliberately larger than self-study's existing bump, restoring the size relationship §5.1 always assumed but the code never implemented. All magnitudes are new tunables (`ENGAGEMENT_DOPAMINE_BUMP`, `ENGAGEMENT_AROUSAL_SCALE`, `RELATIONAL_CORTISOL_BUMP`, `RELATIONAL_AROUSAL_BUMP`, `TEMPORAL_CONTRAST_DOPAMINE_DELTA`, `NEGATION_CORTISOL_BUMP`), same "not yet numerically tuned" placeholder status as everything else (§10), exposed as Debug-tab sliders. Only fires for `source == "user"` — dictionary-sourced self-study expansion text is deliberately excluded, since self-study's own smaller bump already covers that path.
+
+**2 & 3. "Focused rendering" and "learn from a focused group" are both §11's deferred activation-based working-memory concept**, pulled forward in v1-scoped form (no archiving to cold storage, no rehydration, no per-consumer hot/cold decision — those pieces of §11's full vision remain deliberately deferred). New: a per-node `activation` field (`archivist.py`), boosted on touch — real input (`archivist.ACTIVATION_BOOST`, default), self-study expansion (`ACTIVATION_BOOST_SELF_STUDY`, deliberately smaller, same gentler-than-real-input pattern used for the hormonal bumps), and regulation-anchor use — and decayed at Consolidation (`decay_activation()`, same clock as trust/efficacy/basins/schemas, per the design's own "one clock, not several" principle). SELF is exempt from decay (stays maximally active, consistent with its axiom status, §2.1b item 1) so it never silently falls out of the focused view.
+
+- **Self-study targeting** (`_select_self_study_target`) now uses `_weighted_choice_by_activation()` instead of uniform `random.choice()` within the eligible pool — nodes touched recently are preferentially re-expanded, with an epsilon floor (0.1) keeping untouched nodes selectable at nonzero probability so this stays exploration-with-a-bias, not pure exploitation. Verified in testing: a single high-activation node in a 10-node pool was picked ~91% of the time vs. the ~10% a uniform draw would give, while every cold node retained some chance of selection.
+- **Graph tab rendering** (`app.py`, `prometheus_dashboard.py`) now defaults to `archivist.working_memory_nodes()` — the top-K highest-activation nodes plus SELF/OTHER plus the current felt state's anchors — instead of the entire live graph, with an explicit "Show full graph" opt-in checkbox for anyone who wants the complete picture. `render_graph_html()` gained an optional `node_subset` parameter; when supplied, only nodes in the subset (and edges where both endpoints are in it) render. This is the actual fix for §11's rendering-cost/readability problem at scale, not just a diagram of one — verified against a 32-node graph rendering down to a 5-node focused view correctly.
+
+**Note on scope, stated honestly:** this is a genuine pull-forward of a v2-designated feature, not a full implementation of §11's vision. Archiving to cold storage, rehydration on re-encounter, and the per-consumer hot/cold decision (should reflector's structural report / schema detection / regulation's node lookup see only "hot" working memory or reach into cold storage too) remain exactly as deferred as §11 already describes. What's now real: the activation score itself, decayed on the Consolidation clock, driving both self-study's targeting and the Graph tab's default rendering — the two concrete, requested behaviors — without yet touching Consolidation's own per-tick cost (it still iterates the entire live graph regardless of activation, since archiving isn't implemented) or introducing any new persistence format changes (activation is just another per-node field in the same JSON checkpoint, §4C).

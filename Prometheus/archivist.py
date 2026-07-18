@@ -52,6 +52,19 @@ DEMOTION_HYSTERESIS_N = 2
 # cycles with no reinforcement -> eligible for pruning.
 PRUNE_TIER0_CYCLES = 5
 
+# Activation / working-memory layer (new, this revision -- a v1-scoped
+# pull-forward of §11's deferred activation-based working-memory concept,
+# not the full v2 vision: no archiving to cold storage, no rehydration, no
+# per-consumer hot/cold decision. Just a per-node activation score, boosted
+# on touch and decayed at Consolidation (same clock as everything else),
+# used for two things: (a) self-study preferring active nodes over uniform
+# randomness, (b) the Graph tab rendering only a bounded neighborhood
+# instead of the entire live graph. Same "not yet numerically tuned"
+# placeholder status as every other constant here (§10).
+ACTIVATION_BOOST = 1.0
+ACTIVATION_DECAY_RATE = 0.6  # fraction retained per Consolidation pass
+ACTIVATION_CAP = 10.0
+
 
 class ArchivistModule:
     """
@@ -80,6 +93,9 @@ class ArchivistModule:
         self.PROMOTION_HYSTERESIS_N = PROMOTION_HYSTERESIS_N
         self.DEMOTION_HYSTERESIS_N = DEMOTION_HYSTERESIS_N
         self.PRUNE_TIER0_CYCLES = PRUNE_TIER0_CYCLES
+        self.ACTIVATION_BOOST = ACTIVATION_BOOST
+        self.ACTIVATION_DECAY_RATE = ACTIVATION_DECAY_RATE
+        self.ACTIVATION_CAP = ACTIVATION_CAP
 
         # MultiDiGraph, not DiGraph: §2.1b requires an event node to carry
         # *more than one* simultaneous relational edge type from SELF at
@@ -107,6 +123,7 @@ class ArchivistModule:
                 regulatory_efficacy=0.5,
                 tier0_cycles=0,
                 node_type=NODE_SELF,
+                activation=ACTIVATION_CAP,  # SELF is always maximally active -- never excluded from working memory by low activation
             )
             self.save()
 
@@ -128,6 +145,7 @@ class ArchivistModule:
                 regulatory_efficacy=0.5,
                 tier0_cycles=0,
                 node_type=NODE_STANDARD,
+                activation=0.0,
             )
             self.save()
 
@@ -149,6 +167,7 @@ class ArchivistModule:
                 regulatory_efficacy=0.5,
                 tier0_cycles=0,
                 node_type=NODE_STANDARD,
+                activation=0.0,
             )
         else:
             self.graph.nodes[entity]["last_reinforced"] = datetime.now()
@@ -159,7 +178,7 @@ class ArchivistModule:
                     self.graph.add_node(
                         target, source=source, tier=TIER_PROVISIONAL,
                         last_reinforced=datetime.now(), regulatory_efficacy=0.5,
-                        tier0_cycles=0, node_type=NODE_STANDARD,
+                        tier0_cycles=0, node_type=NODE_STANDARD, activation=0.0,
                     )
                 self.graph.add_edge(entity, target, relation_type=rel, source=source,
                                      created_at=datetime.now().isoformat())
@@ -173,22 +192,44 @@ class ArchivistModule:
         # has run.
 
     def link(self, node_a: str, node_b: str, relation_type: str, source: str = "user",
-              placement: str = "explicit"):
+              placement: str = "explicit", felt_state: Optional[str] = None):
         """
         General typed-edge creator used by association.py's hierarchy
         placement (§2.3). `placement` records whether this edge came from
         explicit dictionary-pattern parsing or the co-occurrence fallback
         -- re-parenting (§2.3 mechanism 3) only ever reconsiders
         co-occurrence placements, never explicit ones.
+
+        `felt_state` (new, this revision): the felt state active at the
+        moment of creation, stamped directly onto the edge as
+        `felt_state_at_creation` when supplied. Fixes a real bug found in
+        reflector.py's schema detection: felt state was previously always
+        reconstructed after the fact via chronos._felt_state_near()'s
+        nearest-preceding-timestamp lookup, but since prometheus.py's
+        pulse() always calls _ingest() (which creates relational edges)
+        before that same tick's chronos.record_pulse(), an edge's own
+        timestamp is always earlier than its own tick's chronos entry --
+        the lookup could only ever find the *previous* tick's felt state,
+        or nothing at all on the very first pulse ever / right after a
+        felt-state transition, silently and permanently dropping a
+        relational edge from schema candidacy even though a real, named
+        felt state was active when it was created. Stamping ground truth
+        directly at creation is far more reliable than reconstructing it
+        approximately afterward. Optional and backward-compatible: edges
+        created without this (including everything in an existing saved
+        graph) fall back to the old timestamp-based reconstruction.
         """
         for n in (node_a, node_b):
             if n not in self.graph:
                 self.graph.add_node(n, source=source, tier=TIER_PROVISIONAL,
                                      last_reinforced=datetime.now(),
                                      regulatory_efficacy=0.5, tier0_cycles=0,
-                                     node_type=NODE_STANDARD)
-        self.graph.add_edge(node_a, node_b, relation_type=relation_type, source=source,
-                             placement=placement, created_at=datetime.now().isoformat())
+                                     node_type=NODE_STANDARD, activation=0.0)
+        edge_kwargs = dict(relation_type=relation_type, source=source,
+                            placement=placement, created_at=datetime.now().isoformat())
+        if felt_state is not None:
+            edge_kwargs["felt_state_at_creation"] = felt_state
+        self.graph.add_edge(node_a, node_b, **edge_kwargs)
         self.graph.nodes[node_a]["last_reinforced"] = datetime.now()
         # No self.save() here (§4C) -- see store()'s comment. link() is
         # called on every hierarchy placement and every relational edge,
@@ -364,6 +405,68 @@ class ArchivistModule:
         # No self.save() here (§4C) -- called once per regulating node,
         # potentially several times per Consolidation pass; the
         # orchestrator's single end-of-consolidation checkpoint covers it.
+
+    # ------------------------------------------------------------------
+    # Activation / working memory (new, this revision -- §11 pull-forward,
+    # v1-scoped: no archiving/rehydration, just a live per-node score).
+    # ------------------------------------------------------------------
+    def bump_activation(self, node: str, amount: Optional[float] = None):
+        """Boosts a node's activation on touch (ingestion, self-study
+        expansion, regulation anchor use). Capped so repeated rapid
+        touches within one Consolidation window can't produce an
+        ever-growing score -- the point is "currently relevant," not
+        "historically most-touched ever," which decay_activation's
+        per-pass shrinkage already handles on its own timescale."""
+        if node not in self.graph:
+            return
+        amount = self.ACTIVATION_BOOST if amount is None else amount
+        current = self.graph.nodes[node].get("activation", 0.0)
+        self.graph.nodes[node]["activation"] = min(self.ACTIVATION_CAP, current + amount)
+        # No self.save() here (§4C) -- touched constantly during Learning,
+        # same frequency problem as store()/link(); checkpointed once at
+        # end-of-Consolidation like everything else.
+
+    def decay_activation(self):
+        """Consolidation-gated (same clock as trust/efficacy/basins/
+        schemas, per the design's own "one clock, not several" principle)
+        -- activation shrinks toward zero for anything not recently
+        touched, so working-memory membership reflects current relevance,
+        not permanent historical importance. SELF is exempt (seeded at
+        ACTIVATION_CAP, §2.1b item 1's axiom status extended here: it
+        should never silently fall out of the focused Graph-tab view)."""
+        for node, data in self.graph.nodes(data=True):
+            if node == SELF_NODE:
+                continue
+            data["activation"] = data.get("activation", 0.0) * self.ACTIVATION_DECAY_RATE
+
+    def working_memory_nodes(self, top_k: int = 40, always_include: Optional[List[str]] = None) -> set:
+        """Returns the set of node ids that should count as 'in focus' --
+        the top_k highest-activation nodes, plus SELF/OTHER (always
+        relevant regardless of activation), plus any caller-supplied
+        always_include set (e.g. prometheus.py's current felt-state
+        anchors, which the archivist has no way to know about on its own
+        since felt state lives in synthesizer.py).
+
+        Used for two things (§11 pull-forward): (a) prometheus.py's
+        self-study target selection can prefer this set over the full
+        eligible pool, giving self-study something closer to genuine
+        attention/focus instead of near-uniform randomness; (b)
+        prometheus_dashboard.py's Graph-tab rendering can filter to just
+        this neighborhood instead of the entire live graph, which is the
+        actual fix for rendering cost/readability at scale that §11
+        originally proposed this mechanism for.
+        """
+        ranked = sorted(
+            self.graph.nodes(data=True),
+            key=lambda item: item[1].get("activation", 0.0),
+            reverse=True,
+        )
+        result = {n for n, _d in ranked[:top_k]}
+        result.add(SELF_NODE)
+        result.add(OTHER_NODE)
+        if always_include:
+            result.update(n for n in always_include if n in self.graph)
+        return result
 
     # ------------------------------------------------------------------
     # §2.3 mechanism 3 -- re-parenting evaluation, Consolidation-gated.

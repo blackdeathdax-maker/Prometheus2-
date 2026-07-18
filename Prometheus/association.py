@@ -125,15 +125,24 @@ class AssociationEngine:
     # detection. Called from prometheus.py's tick loop whenever sensory.py
     # detects candidates in incoming text.
     # ------------------------------------------------------------------
-    def link_relational(self, event_node: str, relation_types: List[str], source: str = "user"):
+    def link_relational(self, event_node: str, relation_types: List[str], source: str = "user",
+                         felt_state: Optional[str] = None):
         """`concerns-other` links to a generic OTHER placeholder entity
         rather than SELF, since by definition it involves someone other
-        than SELF; the other three types link SELF -> event_node."""
+        than SELF; the other three types link SELF -> event_node.
+
+        `felt_state` (new, this revision): passed through to
+        archivist.link() to stamp `felt_state_at_creation` directly on
+        each relational edge -- see archivist.link()'s docstring for why
+        this replaces the previous after-the-fact timestamp
+        reconstruction, which was silently dropping edges."""
         for rel in relation_types:
             if rel == EDGE_CONCERNS_OTHER:
-                self.archivist.link("OTHER", event_node, EDGE_CONCERNS_OTHER, source=source, placement="explicit")
+                self.archivist.link("OTHER", event_node, EDGE_CONCERNS_OTHER, source=source,
+                                     placement="explicit", felt_state=felt_state)
             else:
-                self.archivist.link(SELF_NODE, event_node, rel, source=source, placement="explicit")
+                self.archivist.link(SELF_NODE, event_node, rel, source=source,
+                                     placement="explicit", felt_state=felt_state)
 
     # ------------------------------------------------------------------
     # §2.1b item 4a: Schema Node naming trigger. Called whenever a term

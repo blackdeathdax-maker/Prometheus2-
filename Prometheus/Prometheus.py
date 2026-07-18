@@ -1,5 +1,6 @@
 import os
 import random
+from typing import List, Optional
 
 from .hormonal import BioSystem, Epoch
 from .archivist import ArchivistModule, TIER_WORKING, TIER_TRUSTED, SELF_NODE, OTHER_NODE
@@ -52,6 +53,33 @@ class Prometheus:
     # background texture, not a significant event (§5.1, §9 risk 7).
     SELF_STUDY_DOPAMINE_BUMP = 0.03
 
+    # Hormonal reaction to real input -- new, this revision. §5.1 has
+    # always described self-study's dopamine bump as "scaled down
+    # deliberately relative to externally-triggered deltas," but no
+    # externally-triggered delta mechanism existed anywhere in the code:
+    # _ingest() ran sensory/association/chronos logic and never touched
+    # bio._hormones at all. Ordinary conversation produced zero hormonal
+    # response -- the PAD landscape had nothing to disturb it except
+    # decay-toward-baseline, self-study's faint trickle, and manual
+    # Stimulus triggers, which is almost certainly why felt-state movement
+    # read as flat. Fixed via _react_to_input() (§ Core Emergence
+    # Principle note there): deterministic, rule-based reaction keyed off
+    # signals sensory.py already computes (message length as an intensity
+    # proxy, detected relational/negation edges as emotional-salience
+    # signals) -- no new NLP/sentiment inference, consistent with the
+    # engine's no-black-box constraint. Deliberately larger than
+    # self-study's bump, restoring the size relationship §5.1 always
+    # assumed but which the code never actually implemented. Same
+    # "not yet numerically tuned" placeholder status as everything else
+    # (§10) -- these are first-pass values, not claimed-final.
+    ENGAGEMENT_DOPAMINE_BUMP = 0.08
+    ENGAGEMENT_AROUSAL_SCALE = 0.05       # scaled by message length, capped
+    ENGAGEMENT_LENGTH_NORMALIZER = 100.0  # chars; length_factor = min(len/this, 1.0)
+    RELATIONAL_CORTISOL_BUMP = 0.05       # violates / responsible-for: stress/guilt-adjacent
+    RELATIONAL_AROUSAL_BUMP = 0.04        # concerns-other: social salience
+    TEMPORAL_CONTRAST_DOPAMINE_DELTA = 0.03  # temporal-contrast: bittersweet/nostalgia-adjacent
+    NEGATION_CORTISOL_BUMP = 0.05         # being corrected is mildly stressful
+
     # Self-study saturation fix (this revision). Retry a few different
     # candidates within the same tick before giving up entirely, rather
     # than wasting the whole tick on one dead-end pick. The soft cap is an
@@ -62,6 +90,15 @@ class Prometheus:
     # unlimited runaway-hub growth the strict cap exists to prevent.
     SELF_STUDY_MAX_ATTEMPTS = 3
     SELF_STUDY_SOFT_CAP = 6
+
+    # Activation / working-memory rendering default (§11 pull-forward,
+    # this revision). How many top-activation nodes the Graph tab renders
+    # by default, before a "show full graph" opt-in override.
+    WORKING_MEMORY_DEFAULT_SIZE = 40
+    # Self-study's own activation touch, deliberately smaller than
+    # archivist.ACTIVATION_BOOST (the default used for real input) --
+    # same gentler-than-external-input pattern as SELF_STUDY_DOPAMINE_BUMP.
+    ACTIVATION_BOOST_SELF_STUDY = 0.4
 
     # §6.1 / §6.2 gate parameters. Same "not yet numerically tuned"
     # category as everything else in §10 -- placeholders, documented.
@@ -129,7 +166,11 @@ class Prometheus:
 
     def _ingest(self, text: str, source: str):
         """Runs one piece of text through sensory + association + chronos
-        linking. Shared by both externally-queued input and self-study."""
+        linking. Despite this docstring previously claiming to be "shared
+        by both externally-queued input and self-study," it never
+        actually was -- _self_study() has always called
+        association.place_node() directly, bypassing this method
+        entirely. Corrected here rather than left misleading."""
         self.sensory.ingest(text)
         basin_key = self.synthesizer.get_current_basin_key()
         felt_state = self.synthesizer.get_current_felt_state()
@@ -140,6 +181,10 @@ class Prometheus:
 
         result = self.association.place_node(text, definition="", source=source, context_node=anchor)
         node = result.get("term")
+        if node:
+            self.archivist.bump_activation(node)
+        if anchor:
+            self.archivist.bump_activation(anchor)
 
         # §2.1b item 4a: try to name any unnamed schemas tied to the felt
         # state active right now (schema naming trigger when user/dictionary
@@ -149,7 +194,7 @@ class Prometheus:
 
         relations = self.sensory.detect_relational(text)
         if relations:
-            self.association.link_relational(node, relations, source=source)
+            self.association.link_relational(node, relations, source=source, felt_state=felt_state)
 
         if felt_state != "Unformed" and node:
             self.chronos.record_felt_state_link(basin_key, node)
@@ -159,10 +204,60 @@ class Prometheus:
         # node was most recently active for gradual demotion at the next
         # Consolidation pass.
         text_lower = text.lower()
-        if ("no, " in text_lower or "actually" in text_lower or "that's wrong" in text_lower) and anchor:
+        negation_flagged = ("no, " in text_lower or "actually" in text_lower or "that's wrong" in text_lower)
+        if negation_flagged and anchor:
             self.archivist.flag_negation(anchor)
 
+        # Hormonal reaction to real input (new, this revision) -- only for
+        # genuine externally-triggered input, not dictionary-sourced
+        # self-study expansion text, which self-study's own (deliberately
+        # smaller) dopamine bump already covers separately.
+        if source == "user":
+            self._react_to_input(text, relations, negation_flagged)
+
         return node
+
+    def _react_to_input(self, text: str, relations: List[str], negation_flagged: bool):
+        """Deterministic, rule-based hormonal reaction to real
+        conversational input (§ Core Emergence Principle: this must stay
+        rule-based, no sentiment-analysis/NLP model -- the same
+        constraint that already governs sensory.py's negation/relational
+        detection). Fixes the root cause behind "minimal emotional
+        movement": previously nothing in _ingest() touched bio._hormones
+        at all, so ordinary conversation produced zero somatic reaction --
+        only self-study's faint trickle and manual Stimulus events ever
+        moved the PAD landscape away from its decay-toward-baseline
+        equilibrium.
+
+        Signals used, all already computed elsewhere (no new inference):
+          - message length, as a coarse intensity/engagement proxy (longer
+            messages read as more arousing/engaging, not "understood" in
+            any semantic sense -- just a deterministic magnitude signal).
+          - detected relational edges (§2.1b, via sensory.detect_relational,
+            already called by the caller): violates/responsible-for read
+            as stress/guilt-adjacent (cortisol up); concerns-other reads
+            as socially salient (mild arousal up); temporal-contrast reads
+            as bittersweet/nostalgia-adjacent (small dopamine shift).
+          - explicit negation/correction (§3.4): being corrected is mildly
+            stressful (cortisol up).
+        Every delta is small and clamped -- this is meant to restore
+        *some* reactivity, not replace Stimulus's deliberate, larger
+        manual events."""
+        length_factor = min(len(text) / self.ENGAGEMENT_LENGTH_NORMALIZER, 1.0)
+
+        with self.bio.lock:
+            h = self.bio._hormones
+            h["dopamine"] = min(1.0, h["dopamine"] + self.ENGAGEMENT_DOPAMINE_BUMP)
+            h["adrenaline"] = min(1.0, h["adrenaline"] + self.ENGAGEMENT_AROUSAL_SCALE * length_factor)
+
+            if "violates" in relations or "responsible-for" in relations:
+                h["cortisol"] = min(1.0, h["cortisol"] + self.RELATIONAL_CORTISOL_BUMP)
+            if "concerns-other" in relations:
+                h["adrenaline"] = min(1.0, h["adrenaline"] + self.RELATIONAL_AROUSAL_BUMP)
+            if "temporal-contrast" in relations:
+                h["dopamine"] = min(1.0, h["dopamine"] + self.TEMPORAL_CONTRAST_DOPAMINE_DELTA)
+            if negation_flagged:
+                h["cortisol"] = min(1.0, h["cortisol"] + self.NEGATION_CORTISOL_BUMP)
 
     # ------------------------------------------------------------------
     # Main tick
@@ -308,6 +403,14 @@ class Prometheus:
             self.chronos.record_felt_state_link(basin_key, target)
             self.felt_state_anchors.setdefault(basin_key, []).append(target)
 
+        # Activation touch (§11 pull-forward, this revision) -- smaller
+        # than real input's default bump (archivist.ACTIVATION_BOOST),
+        # same "gentler than externally-triggered" pattern already used
+        # for the hormonal bump just below.
+        self.archivist.bump_activation(target, self.ACTIVATION_BOOST_SELF_STUDY)
+        for child_node in placed_children:
+            self.archivist.bump_activation(child_node, self.ACTIVATION_BOOST_SELF_STUDY)
+
         # Small, scaled-down dopaminergic bump (§5.1, §9 risk 7) via the
         # same fast-layer pathway as any other event -- no bespoke
         # self-study fatigue tap.
@@ -347,6 +450,18 @@ class Prometheus:
         Also excludes any node memoized in self._barren_self_study_targets
         (confirmed zero WordNet hyponyms, §5.1 saturation fix) so dead
         ends stop consuming picks from the random-selection pool.
+
+        Fourth fix, this revision (§11 pull-forward, in response to "learn
+        from a focused group" -- previously self-study picked uniformly at
+        random within each eligible pool, which is closer to weighted-
+        random than genuine attention/focus, per §11's own critique of
+        itself). Selection within working_candidates/provisional_candidates
+        is now weighted by each node's activation score (§ archivist.py's
+        new activation layer) via _weighted_choice_by_activation() --
+        nodes touched recently (real input, prior self-study, regulation
+        use) are preferentially re-expanded, while an epsilon floor keeps
+        untouched nodes from being permanently excluded (still
+        exploration, not pure exploitation).
 
         `hard_cap` lets the (e) escape-valve fallback below retry with a
         looser ceiling once the strict cap has genuinely exhausted every
@@ -390,11 +505,11 @@ class Prometheus:
             # tuned ratio (§10) -- worth a slider if this needs finer
             # control later.
             pool = provisional_candidates if random.random() < 0.6 else working_candidates
-            return random.choice(pool)
+            return self._weighted_choice_by_activation(pool)
         if provisional_candidates:
-            return random.choice(provisional_candidates)
+            return self._weighted_choice_by_activation(provisional_candidates)
         if working_candidates:
-            return random.choice(working_candidates)
+            return self._weighted_choice_by_activation(working_candidates)
 
         # (c) fallback: whatever node is currently anchoring the felt
         # state, if any -- but only if it also still has room. Previously
@@ -424,6 +539,21 @@ class Prometheus:
             return self._select_self_study_target(hard_cap=self.SELF_STUDY_SOFT_CAP)
 
         return None
+
+    def _weighted_choice_by_activation(self, pool: List[str]) -> Optional[str]:
+        """Activation-weighted random choice (§11 pull-forward, this
+        revision) -- replaces uniform random.choice() for self-study
+        target selection so recently-touched nodes are preferentially
+        re-expanded, giving self-study something closer to genuine
+        attention/focus. An epsilon floor (0.1) on every weight keeps
+        untouched nodes selectable at nonzero probability -- this stays
+        exploration-with-a-bias, not pure exploitation of whatever's
+        already active, which would risk narrowing the graph's growth to
+        an ever-smaller hot set over time."""
+        if not pool:
+            return None
+        weights = [self.archivist.graph.nodes[n].get("activation", 0.0) + 0.1 for n in pool]
+        return random.choices(pool, weights=weights, k=1)[0]
 
     # ------------------------------------------------------------------
     # Fatigue / state cycling
@@ -492,6 +622,10 @@ class Prometheus:
         reparented = self.association.run_reparenting_pass()
         new_schemas = self.reflector.detect_schemas()
         self._evaluate_pending_regulation()
+        # Activation decay (§11 pull-forward, this revision) -- same
+        # Consolidation clock as basin/trust/schema/efficacy evaluation,
+        # per the design's own "one clock, not several" principle.
+        self.archivist.decay_activation()
 
         # §4C: the single checkpoint call for this pass -- everything
         # above mutates the graph and/or hormonal state without saving
@@ -541,6 +675,13 @@ class Prometheus:
         if not regulating_nodes:
             # §4.2: legitimate state (nothing eligible yet), not an error.
             return
+
+        # Activation touch (§11 pull-forward, this revision): a node
+        # actually used for regulation is clearly currently relevant --
+        # feeds back into self-study's activation-weighted targeting and
+        # the Graph tab's focused rendering.
+        for n in regulating_nodes:
+            self.archivist.bump_activation(n)
 
         avg_efficacy = sum(
             self.archivist.graph.nodes[n].get("regulatory_efficacy", 0.5) for n in regulating_nodes
