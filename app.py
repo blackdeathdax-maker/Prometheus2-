@@ -89,9 +89,41 @@ if st.session_state.prom is not None:
                 prom.archivist.store(new_node, source="user")
                 st.success(f"Added {new_node}")
 
+            # Focused rendering (§11 pull-forward, this revision): default
+            # view shows only the top-activation working-memory
+            # neighborhood, not the entire live graph -- the actual fix
+            # for §11's rendering-cost/readability problem at scale
+            # (rendering everything doesn't scale past a few hundred
+            # nodes, and heavy multi-parenting makes it unreadable
+            # regardless of tuning). Full graph remains available as an
+            # explicit opt-in for anyone who wants the complete picture.
+            show_full = st.checkbox(
+                "Show full graph (may be slow/unreadable at scale, §11)",
+                value=False, key="show_full_graph",
+            )
+            focus_size = st.slider(
+                "Focus size (top-K active nodes)", 10, 200,
+                value=prom.WORKING_MEMORY_DEFAULT_SIZE, step=5,
+                key="graph_focus_size", disabled=show_full,
+            )
+
+            if show_full:
+                node_subset = None
+            else:
+                # Always include the current felt-state's anchors too, so
+                # the focused view stays coherent with what's actually
+                # driving behavior right now, not just historically
+                # high-activation nodes that may no longer be relevant.
+                key = prom.synthesizer.get_current_basin_key()
+                current_anchors = prom.felt_state_anchors.get(key, [])
+                node_subset = prom.archivist.working_memory_nodes(
+                    top_k=focus_size, always_include=current_anchors,
+                )
+                st.caption(f"Showing {len(node_subset)} of {prom.archivist.graph.number_of_nodes()} nodes.")
+
             # In-memory generate_html() per the Task 1 fix -- no filesystem
             # write, so this can't silently fail or race across sessions.
-            html = render_graph_html(prom.archivist)
+            html = render_graph_html(prom.archivist, node_subset=node_subset)
             st.components.v1.html(html, height=700)
 
     # ================================================================
@@ -168,6 +200,50 @@ if st.session_state.prom is not None:
                         if st.button("Name it", key=f"btn_{n}") and word.strip():
                             prom.reflector.name_schema(n, word.strip())
                             st.success(f"Named {n} -> {word.strip()}")
+
+            with st.expander("Schema formation progress (diagnostic)"):
+                st.caption(
+                    "Read-only view into why schemas do/don't exist yet, since "
+                    "'no stable Schema Nodes' alone doesn't say whether the "
+                    "system is close or nowhere near. A schema requires "
+                    "relational edges (responsible-for/violates/temporal-"
+                    "contrast/concerns-other) from typed text matching specific "
+                    "keyword patterns -- self-study alone can never produce "
+                    "these, only Send does."
+                )
+                candidate_report = prom.reflector.schema_candidate_report()
+                st.metric(
+                    "Relational-edge-bearing event nodes",
+                    candidate_report["total_relational_event_nodes"],
+                )
+                st.metric(
+                    "Dropped (occurred before any felt state had stabilized)",
+                    candidate_report["dropped_unformed_felt_state"],
+                    help=(
+                        "A relational edge created while the current felt "
+                        "state was still 'Unformed' is permanently excluded "
+                        "from schema candidacy -- not retried later."
+                    ),
+                )
+                if candidate_report["candidate_pairs"]:
+                    st.write("Closest candidate patterns to stabilizing:")
+                    for c in candidate_report["candidate_pairs"]:
+                        st.write(
+                            f"- felt state `{c['felt_state']}` + "
+                            f"{', '.join(c['relation_types'])} "
+                            f"— {c['count']}/{c['threshold']} occurrences "
+                            f"({c['remaining']} more needed)"
+                        )
+                else:
+                    st.caption(
+                        "No candidate (felt_state, relation-type) pairs yet -- "
+                        "either no relational edges exist, or all of them "
+                        "occurred before any felt state had stabilized. Try "
+                        "sending a few messages like \"I shouldn't have done "
+                        "that\" or \"that was my fault\" while the system is "
+                        "in the same felt state (check the State tab), "
+                        "repeated 3+ times."
+                    )
 
     # ================================================================
     # TAB: DEBUG -- Raw internal state (§4B, one sanctioned exception)
@@ -252,6 +328,62 @@ if st.session_state.prom is not None:
                 prom.SELF_STUDY_DOPAMINE_BUMP = st.slider(
                     "Dopamine bump per self-study expansion", 0.0, 0.3,
                     value=prom.SELF_STUDY_DOPAMINE_BUMP, step=0.01,
+                )
+
+            with st.expander("Hormonal Reaction to Input (new, this revision)"):
+                st.caption(
+                    "Previously, real conversational input produced ZERO "
+                    "hormonal response -- only self-study's faint trickle "
+                    "and manual Stimulus events moved anything. This is "
+                    "the fix: deterministic, rule-based reaction to real "
+                    "input, keyed off message length and detected "
+                    "relational/negation signals (no NLP/sentiment model)."
+                )
+                prom.ENGAGEMENT_DOPAMINE_BUMP = st.slider(
+                    "Base engagement dopamine bump (per message)", 0.0, 0.3,
+                    value=prom.ENGAGEMENT_DOPAMINE_BUMP, step=0.01,
+                )
+                prom.ENGAGEMENT_AROUSAL_SCALE = st.slider(
+                    "Arousal scale (by message length, capped)", 0.0, 0.3,
+                    value=prom.ENGAGEMENT_AROUSAL_SCALE, step=0.01,
+                )
+                prom.RELATIONAL_CORTISOL_BUMP = st.slider(
+                    "Cortisol bump: violates / responsible-for", 0.0, 0.3,
+                    value=prom.RELATIONAL_CORTISOL_BUMP, step=0.01,
+                )
+                prom.RELATIONAL_AROUSAL_BUMP = st.slider(
+                    "Arousal bump: concerns-other", 0.0, 0.3,
+                    value=prom.RELATIONAL_AROUSAL_BUMP, step=0.01,
+                )
+                prom.TEMPORAL_CONTRAST_DOPAMINE_DELTA = st.slider(
+                    "Dopamine shift: temporal-contrast", 0.0, 0.3,
+                    value=prom.TEMPORAL_CONTRAST_DOPAMINE_DELTA, step=0.01,
+                )
+                prom.NEGATION_CORTISOL_BUMP = st.slider(
+                    "Cortisol bump: explicit negation/correction", 0.0, 0.3,
+                    value=prom.NEGATION_CORTISOL_BUMP, step=0.01,
+                )
+
+            with st.expander("Activation / Working Memory (§11 pull-forward, new)"):
+                prom.archivist.ACTIVATION_BOOST = st.slider(
+                    "Activation boost per real-input touch", 0.0, 5.0,
+                    value=prom.archivist.ACTIVATION_BOOST, step=0.1,
+                )
+                prom.ACTIVATION_BOOST_SELF_STUDY = st.slider(
+                    "Activation boost per self-study touch", 0.0, 5.0,
+                    value=prom.ACTIVATION_BOOST_SELF_STUDY, step=0.1,
+                )
+                prom.archivist.ACTIVATION_DECAY_RATE = st.slider(
+                    "Activation decay rate (retained per Consolidation)", 0.0, 1.0,
+                    value=prom.archivist.ACTIVATION_DECAY_RATE, step=0.05,
+                )
+                prom.archivist.ACTIVATION_CAP = st.slider(
+                    "Activation cap (per node)", 1.0, 30.0,
+                    value=prom.archivist.ACTIVATION_CAP, step=0.5,
+                )
+                prom.WORKING_MEMORY_DEFAULT_SIZE = st.slider(
+                    "Graph tab default focus size (top-K)", 10, 200,
+                    value=prom.WORKING_MEMORY_DEFAULT_SIZE, step=5,
                 )
 
             with st.expander("Trust Tiers (§3)"):
