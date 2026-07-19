@@ -71,6 +71,28 @@ if st.session_state.prom is not None:
         prom.stimulus.trigger_internal_event(intensity, focus)
         st.sidebar.success("Event triggered")
 
+    st.sidebar.subheader("Parental Feedback (§13.2)")
+    st.sidebar.caption(
+        "Implicit guidance, 'mirror neuron' style -- colors whatever the "
+        "system is currently anchored to (check State tab's Felt State) "
+        "rather than naming or asserting anything directly."
+    )
+    pf_col1, pf_col2 = st.sidebar.columns(2)
+    with pf_col1:
+        if st.button("Approval", key="pf_approval"):
+            result = prom.give_parental_reaction("approval")
+            st.sidebar.success(f"Approval given ({len(result['anchors_colored'])} node(s) colored)")
+        if st.button("Warmth", key="pf_warmth"):
+            result = prom.give_parental_reaction("warmth")
+            st.sidebar.success(f"Warmth given ({len(result['anchors_colored'])} node(s) colored)")
+    with pf_col2:
+        if st.button("Disapproval", key="pf_disapproval"):
+            result = prom.give_parental_reaction("disapproval")
+            st.sidebar.success(f"Disapproval given ({len(result['anchors_colored'])} node(s) colored)")
+        if st.button("Concern", key="pf_concern"):
+            result = prom.give_parental_reaction("concern")
+            st.sidebar.success(f"Concern given ({len(result['anchors_colored'])} node(s) colored)")
+
     # Tabbed layout per §4B: Graph / State / Reflection / Debug
     tab_graph, tab_state, tab_reflection, tab_debug = st.tabs(
         ["Graph", "State", "Reflection", "Debug"]
@@ -245,6 +267,107 @@ if st.session_state.prom is not None:
                         "repeated 3+ times."
                     )
 
+            with st.expander("Activation / Working Memory (§11 pull-forward, diagnostic)"):
+                st.caption(
+                    "Real activation numbers, so 'is focus actually working' is "
+                    "checkable instead of just eyeballed on the Graph tab. Also "
+                    "shows felt_state_anchors' bounded window size -- this was "
+                    "previously an unbounded list that could silently grow into "
+                    "the hundreds over long runs and swamp the top-K focus "
+                    "filter; it's now capped per basin (fixed this revision)."
+                )
+                activation_report = prom.reflector.activation_report()
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Total nodes", activation_report["total_nodes"])
+                with col2:
+                    st.metric(
+                        "Nodes with nonzero activation",
+                        activation_report["nodes_with_nonzero_activation"],
+                    )
+                st.caption(f"Anchor window size (per felt state): {prom.ANCHOR_WINDOW_SIZE}")
+                key = prom.synthesizer.get_current_basin_key()
+                current_anchor_count = len(prom.felt_state_anchors.get(key, []))
+                st.caption(
+                    f"Current felt state's anchor count: {current_anchor_count} "
+                    f"(capped at {prom.ANCHOR_WINDOW_SIZE})"
+                )
+                if activation_report["top_active"]:
+                    st.write("Top active nodes:")
+                    for name, act, node_type in activation_report["top_active"]:
+                        st.write(f"- `{name}` ({node_type}): {act:.2f}")
+                else:
+                    st.caption("No nodes have any activation yet.")
+
+            with st.expander("Valence Coloring / Parental Feedback (§13.2, diagnostic)"):
+                st.caption(
+                    "Real accumulated coloring, so the mirror-neuron-style "
+                    "learning is directly checkable. A node's coloring only "
+                    "ever moves when it was the current felt-state anchor at "
+                    "the moment a Parental Feedback button was clicked -- "
+                    "nothing here is a hand-assigned valence lookup, it's "
+                    "purely a record of repeated co-occurrence."
+                )
+                coloring_report = prom.reflector.valence_coloring_report()
+                st.metric("Total colored nodes", coloring_report["total_colored_nodes"])
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.caption("Most positive")
+                    if coloring_report["most_positive"]:
+                        for name, val in coloring_report["most_positive"]:
+                            st.write(f"- `{name}`: {val:+.2f}")
+                    else:
+                        st.caption("None yet.")
+                with col2:
+                    st.caption("Most negative")
+                    if coloring_report["most_negative"]:
+                        for name, val in coloring_report["most_negative"]:
+                            st.write(f"- `{name}`: {val:+.2f}")
+                    else:
+                        st.caption("None yet.")
+
+            with st.expander("SELF / OTHER relational activity (diagnostic)"):
+                st.caption(
+                    "SELF and OTHER only ever gain edges through relational "
+                    "detection (§2.1b) -- typed input matching specific "
+                    "keyword patterns. Self-study and regulation both exclude "
+                    "SELF/OTHER by design (axioms, not growable dictionary "
+                    "concepts), so if you're testing mostly via Pulse/Run "
+                    "Batch, both will look permanently frozen -- that's "
+                    "expected, not a bug. Three of the four relation types "
+                    "(responsible-for/violates/temporal-contrast) route "
+                    "through SELF; only concerns-other routes through OTHER "
+                    "-- so third-person-heavy messages (\"he/she/they...\") "
+                    "grow OTHER, while self-referential ones (\"I did...\", "
+                    "\"my fault...\", \"I shouldn't have...\") grow SELF."
+                )
+                self_other = prom.reflector.self_other_report()
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("SELF outgoing relational edges", self_other["self"]["total"])
+                    if self_other["self"]["by_type"]:
+                        st.write(self_other["self"]["by_type"])
+                    if self_other["self"]["most_recent"]:
+                        st.caption("Most recent:")
+                        for ts, rel, target in self_other["self"]["most_recent"]:
+                            st.caption(f"  {rel} -> `{target}`")
+                with col2:
+                    st.metric("OTHER outgoing relational edges", self_other["other"]["total"])
+                    if self_other["other"]["by_type"]:
+                        st.write(self_other["other"]["by_type"])
+                    if self_other["other"]["most_recent"]:
+                        st.caption("Most recent:")
+                        for ts, rel, target in self_other["other"]["most_recent"]:
+                            st.caption(f"  {rel} -> `{target}`")
+                if self_other["self"]["total"] == 0 and self_other["other"]["total"] == 0:
+                    st.caption(
+                        "Zero relational edges anywhere yet. Try sending "
+                        "(via Send, not Pulse/Run Batch) something like "
+                        "\"I shouldn't have done that\" or \"that was my "
+                        "fault\" to grow SELF, or \"my friend did that\" to "
+                        "grow OTHER."
+                    )
+
     # ================================================================
     # TAB: DEBUG -- Raw internal state (§4B, one sanctioned exception)
     # ================================================================
@@ -362,6 +485,40 @@ if st.session_state.prom is not None:
                 prom.NEGATION_CORTISOL_BUMP = st.slider(
                     "Cortisol bump: explicit negation/correction", 0.0, 0.3,
                     value=prom.NEGATION_CORTISOL_BUMP, step=0.01,
+                )
+
+            with st.expander("Parental Feedback / Valence Coloring (§13.2, new)"):
+                prom.PARENTAL_APPROVAL_DOPAMINE = st.slider(
+                    "Dopamine bump: Approval", 0.0, 0.3,
+                    value=prom.PARENTAL_APPROVAL_DOPAMINE, step=0.01,
+                )
+                prom.PARENTAL_DISAPPROVAL_CORTISOL = st.slider(
+                    "Cortisol bump: Disapproval", 0.0, 0.3,
+                    value=prom.PARENTAL_DISAPPROVAL_CORTISOL, step=0.01,
+                )
+                prom.PARENTAL_WARMTH_DOPAMINE = st.slider(
+                    "Dopamine bump: Warmth", 0.0, 0.3,
+                    value=prom.PARENTAL_WARMTH_DOPAMINE, step=0.01,
+                )
+                prom.PARENTAL_WARMTH_CORTISOL_RELIEF = st.slider(
+                    "Cortisol relief: Warmth", 0.0, 0.3,
+                    value=prom.PARENTAL_WARMTH_CORTISOL_RELIEF, step=0.01,
+                )
+                prom.PARENTAL_CONCERN_AROUSAL = st.slider(
+                    "Arousal bump: Concern", 0.0, 0.3,
+                    value=prom.PARENTAL_CONCERN_AROUSAL, step=0.01,
+                )
+                prom.PARENTAL_CONCERN_CORTISOL = st.slider(
+                    "Cortisol bump: Concern", 0.0, 0.3,
+                    value=prom.PARENTAL_CONCERN_CORTISOL, step=0.01,
+                )
+                prom.VALENCE_COLORING_STEP = st.slider(
+                    "Valence coloring step (per reaction, per anchor)", 0.0, 0.5,
+                    value=prom.VALENCE_COLORING_STEP, step=0.01,
+                )
+                prom.VALENCE_COLORING_CAP = st.slider(
+                    "Valence coloring cap (per node)", 0.5, 3.0,
+                    value=prom.VALENCE_COLORING_CAP, step=0.1,
                 )
 
             with st.expander("Activation / Working Memory (§11 pull-forward, new)"):
