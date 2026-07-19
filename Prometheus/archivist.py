@@ -124,6 +124,7 @@ class ArchivistModule:
                 tier0_cycles=0,
                 node_type=NODE_SELF,
                 activation=ACTIVATION_CAP,  # SELF is always maximally active -- never excluded from working memory by low activation
+                valence_coloring=0.0,
             )
             self.save()
 
@@ -146,6 +147,7 @@ class ArchivistModule:
                 tier0_cycles=0,
                 node_type=NODE_STANDARD,
                 activation=0.0,
+                valence_coloring=0.0,
             )
             self.save()
 
@@ -168,6 +170,7 @@ class ArchivistModule:
                 tier0_cycles=0,
                 node_type=NODE_STANDARD,
                 activation=0.0,
+                valence_coloring=0.0,
             )
         else:
             self.graph.nodes[entity]["last_reinforced"] = datetime.now()
@@ -179,6 +182,7 @@ class ArchivistModule:
                         target, source=source, tier=TIER_PROVISIONAL,
                         last_reinforced=datetime.now(), regulatory_efficacy=0.5,
                         tier0_cycles=0, node_type=NODE_STANDARD, activation=0.0,
+                valence_coloring=0.0,
                     )
                 self.graph.add_edge(entity, target, relation_type=rel, source=source,
                                      created_at=datetime.now().isoformat())
@@ -190,6 +194,59 @@ class ArchivistModule:
         # _run_consolidation() calls archivist.save() once, after every
         # sub-step (trust pass, re-parenting, schema detection, efficacy)
         # has run.
+
+    def ensure_basin_node(self, basin_id: str, pad_coordinates: tuple, dwell_density: float = 0.0):
+        """
+        Creates or updates a real graph node for a stabilized felt-state
+        basin (§2.1a/§6A). Bug fix, this revision: synthesizer.py's
+        stabilized_basins was always just a string mapping
+        ((a,v,d) -> basin_id) -- nothing anywhere ever called
+        graph.add_node() for it. §6A specifies basin nodes as a real
+        node_type with pad_coordinates/dwell_density/stabilized fields,
+        and prometheus_dashboard.py already has rendering logic ready for
+        them (diamond shape, valence-colored) -- but since no basin node
+        ever actually existed, reflector.detect_schemas()'s "link the
+        Schema Node back to its component basin" fallback
+        (`felt_state if felt_state in graph else SELF_NODE`) always took
+        the SELF_NODE branch, silently, every time. Every schema's
+        component-basin link was quietly attaching to SELF instead of a
+        real basin entity -- misrepresenting what the schema is actually
+        composed of, and dumping extra incoming edges onto SELF that
+        don't belong there.
+
+        Basin nodes deliberately don't carry `tier` (§6A: "Not applicable
+        to basin/schema/self node types -- trust tiers represent
+        epistemic corroboration of facts; basins/schemas represent
+        recurrence, a different kind of evidence") and are exempt from
+        both the trust-tier consolidation pass and pruning, the same
+        treatment Schema Nodes and SELF already get.
+
+        Called from prometheus.py's Consolidation pass, once per
+        currently-stabilized basin, right after
+        synthesizer.consolidate_basins() runs -- so any basin
+        reflector.detect_schemas() might reference later in the same pass
+        already has a real node to link to.
+        """
+        if basin_id not in self.graph:
+            self.graph.add_node(
+                basin_id,
+                source="system",
+                node_type=NODE_BASIN,
+                last_reinforced=datetime.now(),
+                activation=0.0,
+                valence_coloring=0.0,
+                pad_coordinates=list(pad_coordinates),
+                dwell_density=dwell_density,
+                stabilized=True,
+                regulatory_efficacy=0.5,  # unused for basin nodes, kept only for schema-uniformity with other node_types' field set
+            )
+        else:
+            self.graph.nodes[basin_id]["pad_coordinates"] = list(pad_coordinates)
+            self.graph.nodes[basin_id]["dwell_density"] = dwell_density
+            self.graph.nodes[basin_id]["last_reinforced"] = datetime.now()
+        # No self.save() here (§4C) -- same reasoning as store()/link();
+        # called from the Consolidation pass, which checkpoints once at
+        # the end via prometheus.py's _run_consolidation().
 
     def link(self, node_a: str, node_b: str, relation_type: str, source: str = "user",
               placement: str = "explicit", felt_state: Optional[str] = None):
@@ -224,7 +281,7 @@ class ArchivistModule:
                 self.graph.add_node(n, source=source, tier=TIER_PROVISIONAL,
                                      last_reinforced=datetime.now(),
                                      regulatory_efficacy=0.5, tier0_cycles=0,
-                                     node_type=NODE_STANDARD, activation=0.0)
+                                     node_type=NODE_STANDARD, activation=0.0, valence_coloring=0.0)
         edge_kwargs = dict(relation_type=relation_type, source=source,
                             placement=placement, created_at=datetime.now().isoformat())
         if felt_state is not None:
@@ -315,7 +372,7 @@ class ArchivistModule:
             if node == SELF_NODE:
                 continue  # permanent axiom, never re-evaluated (§2.1b item 1)
             data = self.graph.nodes[node]
-            if data.get("is_schema"):
+            if data.get("is_schema") or data.get("node_type") == NODE_BASIN:
                 # Bug fix: Schema Nodes were falling through to the generic
                 # trust-tier formula, using a "schema" source tag that isn't
                 # in SOURCE_WEIGHT at all (silently defaulting to 0.3, the
@@ -331,6 +388,18 @@ class ArchivistModule:
                 # mechanism that was never meant to touch it. Same treatment
                 # as SELF_NODE: exempt entirely, not just given a favorable
                 # score.
+                #
+                # Basin nodes (this revision, ensure_basin_node) get the
+                # identical exemption for the identical reason: they carry
+                # no `tier` field at all (§6A -- "not applicable to
+                # basin/schema/self node types"), so without this check
+                # they'd default to TIER_PROVISIONAL here, start
+                # accumulating tier0_cycles every pass (since they're
+                # rarely touched by ordinary categorical corroboration),
+                # and eventually get silently pruned by prune()'s
+                # Tier-0-for-N-cycles rule -- deleting a graph node for a
+                # basin that synthesizer.py still considers genuinely
+                # stabilized, an inconsistency between the two.
                 continue
             current = data.get("tier", TIER_PROVISIONAL)
 
@@ -439,6 +508,31 @@ class ArchivistModule:
                 continue
             data["activation"] = data.get("activation", 0.0) * self.ACTIVATION_DECAY_RATE
 
+    # ------------------------------------------------------------------
+    # Valence coloring (§13.2, new): mirror-neuron-style implicit
+    # emotional coloring of nodes. NOT trust, NOT epistemic tier -- a
+    # third, independent per-node property (same orthogonality pattern as
+    # §2.4's trust-vs-depth and §4.5's trust-vs-regulatory-efficacy).
+    # Deliberately never set directly from a word or category -- the only
+    # way a node's coloring moves is repeated co-occurrence between "this
+    # node was the active felt-state anchor" and "a reaction happened,"
+    # via prometheus.py's give_parental_reaction(). No fixed valence
+    # lookup table exists anywhere in this design; a node's coloring is
+    # entirely a record of what it has actually been paired with.
+    # ------------------------------------------------------------------
+    def nudge_valence_coloring(self, node: str, delta: float, cap: float = 1.0):
+        """Bounded accumulator, same clamping shape as regulatory_efficacy
+        (§4.5) -- small deltas, cannot run away, symmetric positive/
+        negative range since this represents a valence axis (like
+        synthesizer.py's own -1..1 valence projection), not a magnitude."""
+        if node not in self.graph:
+            return
+        current = self.graph.nodes[node].get("valence_coloring", 0.0)
+        self.graph.nodes[node]["valence_coloring"] = max(-cap, min(cap, current + delta))
+        # No self.save() here (§4C) -- same reasoning as bump_activation();
+        # fires live, potentially every reaction, checkpointed once at the
+        # next Consolidation pass like everything else.
+
     def working_memory_nodes(self, top_k: int = 40, always_include: Optional[List[str]] = None) -> set:
         """Returns the set of node ids that should count as 'in focus' --
         the top_k highest-activation nodes, plus SELF/OTHER (always
@@ -520,6 +614,8 @@ class ArchivistModule:
         to_remove = [
             n for n, d in self.graph.nodes(data=True)
             if n != SELF_NODE
+            and not d.get("is_schema")
+            and d.get("node_type") != NODE_BASIN
             and d.get("tier", TIER_PROVISIONAL) == TIER_PROVISIONAL
             and d.get("tier0_cycles", 0) >= self.PRUNE_TIER0_CYCLES
         ]

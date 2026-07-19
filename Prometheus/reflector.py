@@ -247,6 +247,92 @@ class ReflectorModule:
             "candidate_pairs": candidates[:top_n],
         }
 
+    def activation_report(self, top_n: int = 10) -> Dict:
+        """
+        Diagnostic (§11 pull-forward, this revision): surfaces real
+        activation numbers instead of leaving "is focus/working-memory
+        actually working" as something only inferable from whether the
+        Graph tab subjectively looks focused. Added directly in response
+        to a real bug found this way -- felt_state_anchors had been
+        growing unbounded and silently swamping the top-K activation
+        filter, which was invisible without a way to see actual numbers.
+        Read-only, safe to call every Reflection-tab render.
+        """
+        graph = self.archivist.graph
+        activations = [
+            (n, d.get("activation", 0.0), d.get("node_type", "standard"))
+            for n, d in graph.nodes(data=True)
+        ]
+        activations.sort(key=lambda t: t[1], reverse=True)
+        nonzero = [a for a in activations if a[1] > 0.0]
+        return {
+            "total_nodes": len(activations),
+            "nodes_with_nonzero_activation": len(nonzero),
+            "top_active": activations[:top_n],
+        }
+
+    def valence_coloring_report(self, top_n: int = 5) -> Dict:
+        """
+        Diagnostic (§13.2, new): surfaces real valence_coloring numbers,
+        same "make it checkable, not just eyeballed" pattern as
+        activation_report/self_other_report. A node's coloring only ever
+        moves through prometheus.give_parental_reaction()'s co-occurrence
+        mechanism -- this reports what's actually accumulated, split into
+        most-positive and most-negative, so the mirror-neuron-style
+        learning is directly observable. Read-only.
+        """
+        graph = self.archivist.graph
+        colored = [
+            (n, d.get("valence_coloring", 0.0))
+            for n, d in graph.nodes(data=True)
+            if d.get("valence_coloring", 0.0) != 0.0
+        ]
+        colored.sort(key=lambda t: t[1], reverse=True)
+        return {
+            "total_colored_nodes": len(colored),
+            "most_positive": colored[:top_n],
+            "most_negative": colored[-top_n:][::-1] if colored else [],
+        }
+
+    def self_other_report(self, recent_n: int = 5) -> Dict:
+        """
+        Diagnostic (this revision, in response to "SELF never seems to
+        expand"): SELF and OTHER only ever gain new edges through
+        relational detection (§2.1b), triggered by typed input matching
+        specific keyword patterns -- self-study and regulation both
+        exclude SELF/OTHER by design (they're axioms/placeholders, not
+        dictionary concepts that grow via hyponym expansion or get used
+        as coping strategies). Three of the four relation types
+        (responsible-for/violates/temporal-contrast) route through SELF;
+        only concerns-other routes through OTHER -- so third-person-heavy
+        input will visibly grow OTHER while SELF looks comparatively
+        frozen, which can read as "SELF is broken" when it's actually
+        just receiving a different mix of triggering phrasing. Surfaces
+        raw per-type edge counts so this is checkable directly instead of
+        inferred from the Graph tab. Read-only.
+        """
+        graph = self.archivist.graph
+
+        def _edge_summary(anchor: str) -> Dict:
+            counts = Counter()
+            recent = []
+            for _u, v, data in graph.out_edges(anchor, data=True):
+                rel = data.get("relation_type")
+                if rel in RELATIONAL_EDGE_TYPES:
+                    counts[rel] += 1
+                    recent.append((data.get("created_at", ""), rel, v))
+            recent.sort(key=lambda t: t[0], reverse=True)
+            return {
+                "total": sum(counts.values()),
+                "by_type": dict(counts),
+                "most_recent": recent[:recent_n],
+            }
+
+        return {
+            "self": _edge_summary(SELF_NODE),
+            "other": _edge_summary("OTHER"),
+        }
+
     def _resolve_felt_state(self, rels: List[tuple]) -> Optional[str]:
         """Resolves the felt state active when a set of relational edges
         was created. Prefers `felt_state_at_creation`, stamped directly on
