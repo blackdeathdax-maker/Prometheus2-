@@ -1,5 +1,6 @@
 import os
 import random
+from collections import deque
 from typing import List, Optional
 
 from .hormonal import BioSystem, Epoch
@@ -80,6 +81,28 @@ class Prometheus:
     TEMPORAL_CONTRAST_DOPAMINE_DELTA = 0.03  # temporal-contrast: bittersweet/nostalgia-adjacent
     NEGATION_CORTISOL_BUMP = 0.05         # being corrected is mildly stressful
 
+    # Parental emotional feedback (§13.2, new) -- "mirror neuron" style
+    # implicit guidance. The reaction itself is JUST a small, deterministic
+    # hormone nudge (same fast-layer-only pattern as ENGAGEMENT_* above --
+    # slow-layer/temperament drift from repeated reactions is a plausible
+    # future extension, deliberately not built here, to keep this change
+    # the same size/shape as the proven _react_to_input pattern rather
+    # than opening a second new mechanism at once). What makes this
+    # *learning* rather than just mood noise is VALENCE_COLORING_STEP,
+    # applied separately in give_parental_reaction() to whichever node(s)
+    # are the CURRENT felt-state anchor -- see archivist.nudge_valence_
+    # coloring()'s docstring. No word or category ever gets a hand-
+    # assigned valence anywhere in this mechanism; coloring only
+    # accumulates through repeated real co-occurrence.
+    PARENTAL_APPROVAL_DOPAMINE = 0.06
+    PARENTAL_DISAPPROVAL_CORTISOL = 0.06
+    PARENTAL_WARMTH_DOPAMINE = 0.05
+    PARENTAL_WARMTH_CORTISOL_RELIEF = 0.03   # warmth also mildly *reduces* cortisol (safety)
+    PARENTAL_CONCERN_AROUSAL = 0.05
+    PARENTAL_CONCERN_CORTISOL = 0.03
+    VALENCE_COLORING_STEP = 0.15
+    VALENCE_COLORING_CAP = 1.0
+
     # Self-study saturation fix (this revision). Retry a few different
     # candidates within the same tick before giving up entirely, rather
     # than wasting the whole tick on one dead-end pick. The soft cap is an
@@ -124,8 +147,26 @@ class Prometheus:
 
         # Per-basin anchor nodes accumulated as input is ingested under a
         # given felt state (§4.2's "stable felt-state -> node anchor
-        # established in Childhood"). {basin_key: [node, ...]}
+        # established in Childhood"). {basin_key: deque(maxlen=ANCHOR_WINDOW_SIZE)}
+        #
+        # Bug fix (this revision): previously a plain, unbounded list,
+        # appended to on every qualifying tick by both _ingest() and
+        # _self_study() with no cap and no dedup. Over thousands of
+        # pulses in a popular felt state, this list could grow into the
+        # hundreds -- and since app.py's Graph tab and _apply_regulation
+        # both pass the *entire* list as always_include /
+        # eligible-candidate scoping, it eventually swamped both the
+        # top-K activation filter (Graph tab rendering never actually
+        # stayed focused at scale) and regulation's tier-restricted
+        # candidate pool (drifting back toward "most of the graph," the
+        # same class of problem the original anchor-scoping fix addressed
+        # earlier this session). Every other rolling-history structure in
+        # this design (chronos's log, basin dwell-time decay) is
+        # deliberately bounded, not unbounded -- this one was an
+        # oversight that never got the same treatment. Fixed with a
+        # bounded deque per basin via _record_anchor().
         self.felt_state_anchors = {}
+        self.ANCHOR_WINDOW_SIZE = 20  # same tuning-placeholder category as everything else (§10)
 
         # Pending regulation attempts awaiting efficacy evaluation at the
         # next Consolidation pass (§4.5: "evaluated during Consolidation
@@ -164,6 +205,16 @@ class Prometheus:
     def queue_input(self, text: str, source: str = "user"):
         self._input_queue.append((text, source))
 
+    def _record_anchor(self, basin_key, node: str):
+        """Bounded write path for felt_state_anchors (this revision's fix
+        for the unbounded-growth bug -- see the field's own docstring at
+        __init__). Every write to felt_state_anchors goes through here now,
+        so there's exactly one place that could reintroduce unbounded
+        growth, not three scattered call sites."""
+        if basin_key not in self.felt_state_anchors:
+            self.felt_state_anchors[basin_key] = deque(maxlen=self.ANCHOR_WINDOW_SIZE)
+        self.felt_state_anchors[basin_key].append(node)
+
     def _ingest(self, text: str, source: str):
         """Runs one piece of text through sensory + association + chronos
         linking. Despite this docstring previously claiming to be "shared
@@ -198,7 +249,7 @@ class Prometheus:
 
         if felt_state != "Unformed" and node:
             self.chronos.record_felt_state_link(basin_key, node)
-            self.felt_state_anchors.setdefault(basin_key, []).append(node)
+            self._record_anchor(basin_key, node)
 
         # Explicit negation/correction (§3.4 mechanism 1): flag whatever
         # node was most recently active for gradual demotion at the next
@@ -258,6 +309,80 @@ class Prometheus:
                 h["dopamine"] = min(1.0, h["dopamine"] + self.TEMPORAL_CONTRAST_DOPAMINE_DELTA)
             if negation_flagged:
                 h["cortisol"] = min(1.0, h["cortisol"] + self.NEGATION_CORTISOL_BUMP)
+
+    # Fixed, small, closed vocabulary of reaction types -- deliberately
+    # not free-text sentiment interpretation (that would need its own
+    # deterministic keyword layer, same as sensory.py's existing
+    # negation/relational detectors, and is a natural but separate
+    # future extension, not built here). This is a UI-level vocabulary
+    # (which button was clicked), not a knowledge-graph vocabulary -- it
+    # never names or asserts anything about a concept, only nudges
+    # somatic state and (separately) an existing node's coloring.
+    _PARENTAL_REACTION_TYPES = ("approval", "disapproval", "warmth", "concern")
+
+    def give_parental_reaction(self, reaction_type: str):
+        """
+        §13.2, new: implicit parental emotional guidance, "mirror neuron"
+        style. Two independent effects, deliberately kept separate:
+
+        1. A small, deterministic, fast-layer-only hormone nudge -- same
+           shape and magnitude class as _react_to_input(), fires live
+           (not queued/Consolidation-gated), matching how every other
+           somatic reaction in this design works (Stimulus's manual
+           trigger, self-study's dopamine bump, _react_to_input).
+
+        2. A valence_coloring nudge (archivist.nudge_valence_coloring) on
+           whichever node(s) are the CURRENT felt-state anchor -- i.e.
+           whatever the system was just "thinking about" when the
+           reaction arrived. This is the actual learning mechanism: no
+           word or category is ever assigned a valence directly here or
+           anywhere else in this design. A node's coloring only moves
+           because it happened to be active at the same moment a reaction
+           occurred, repeated over many interactions -- genuine earned
+           association, consistent with every other "no predetermined
+           categories" constraint in this spec (§2.1a, §2.1b, §13.3.1).
+
+        This method does NOT create, name, or otherwise touch the
+        knowledge graph's structure -- only existing nodes' coloring, and
+        only if something is currently anchored. If nothing is anchored
+        yet (e.g. very early in Childhood, before any basin has
+        stabilized), effect (1) still fires but effect (2) is a no-op --
+        a legitimate, non-error state, same as regulation's "nothing
+        eligible yet" case (§4.2).
+        """
+        if reaction_type not in self._PARENTAL_REACTION_TYPES:
+            raise ValueError(f"Unknown parental reaction type: {reaction_type!r}")
+
+        with self.bio.lock:
+            h = self.bio._hormones
+            if reaction_type == "approval":
+                h["dopamine"] = min(1.0, h["dopamine"] + self.PARENTAL_APPROVAL_DOPAMINE)
+            elif reaction_type == "disapproval":
+                h["cortisol"] = min(1.0, h["cortisol"] + self.PARENTAL_DISAPPROVAL_CORTISOL)
+            elif reaction_type == "warmth":
+                h["dopamine"] = min(1.0, h["dopamine"] + self.PARENTAL_WARMTH_DOPAMINE)
+                h["cortisol"] = max(0.0, h["cortisol"] - self.PARENTAL_WARMTH_CORTISOL_RELIEF)
+            elif reaction_type == "concern":
+                h["adrenaline"] = min(1.0, h["adrenaline"] + self.PARENTAL_CONCERN_AROUSAL)
+                h["cortisol"] = min(1.0, h["cortisol"] + self.PARENTAL_CONCERN_CORTISOL)
+
+        coloring_delta = {
+            "approval": self.VALENCE_COLORING_STEP,
+            "disapproval": -self.VALENCE_COLORING_STEP,
+            "warmth": self.VALENCE_COLORING_STEP * 0.7,
+            "concern": -self.VALENCE_COLORING_STEP * 0.5,
+        }[reaction_type]
+
+        key = self.synthesizer.get_current_basin_key()
+        anchors = self.felt_state_anchors.get(key, [])
+        for n in anchors:
+            self.archivist.nudge_valence_coloring(n, coloring_delta, cap=self.VALENCE_COLORING_CAP)
+            # A reaction landing on a node is itself a form of touch --
+            # feeds the same activation/working-memory signal as any
+            # other interaction with it (§11 pull-forward).
+            self.archivist.bump_activation(n)
+
+        return {"reaction": reaction_type, "anchors_colored": list(anchors)}
 
     # ------------------------------------------------------------------
     # Main tick
@@ -393,7 +518,7 @@ class Prometheus:
         if felt_state != "Unformed":
             for child_node in placed_children:
                 self.chronos.record_felt_state_link(basin_key, child_node)
-                self.felt_state_anchors.setdefault(basin_key, []).append(child_node)
+                self._record_anchor(basin_key, child_node)
             # `target` recurs across multiple self-study ticks (until it
             # hits the degree cap), unlike each tick's freshly-created
             # children -- anchoring it too gives §6.1's naming-reliability
@@ -401,7 +526,7 @@ class Prometheus:
             # consistent, repeatedly-reinforced node to work with, not
             # just a growing list of one-off terms.
             self.chronos.record_felt_state_link(basin_key, target)
-            self.felt_state_anchors.setdefault(basin_key, []).append(target)
+            self._record_anchor(basin_key, target)
 
         # Activation touch (§11 pull-forward, this revision) -- smaller
         # than real input's default bump (archivist.ACTIVATION_BOOST),
@@ -618,6 +743,22 @@ class Prometheus:
         principle (see conversation summary).
         """
         self.synthesizer.consolidate_basins()
+
+        # Bug fix, this revision: stabilized_basins was previously only
+        # ever a string mapping inside synthesizer.py -- no corresponding
+        # node ever existed in archivist.graph. Every schema's "linked
+        # back to its component basin" edge (reflector.detect_schemas)
+        # was silently falling back to SELF_NODE instead, since the basin
+        # string was never actually `in graph`. Sync real basin nodes here,
+        # before run_consolidation_pass (so they're correctly exempted
+        # from trust-tier evaluation, §6A) and before detect_schemas (so
+        # any schema formed this same pass has a real node to link to).
+        for basin_key, basin_id in self.synthesizer.stabilized_basins.items():
+            self.archivist.ensure_basin_node(
+                basin_id, pad_coordinates=basin_key,
+                dwell_density=self.synthesizer.basin_grid.get(basin_key, 0.0),
+            )
+
         trust_summary = self.archivist.run_consolidation_pass()
         reparented = self.association.run_reparenting_pass()
         new_schemas = self.reflector.detect_schemas()
