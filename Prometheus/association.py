@@ -34,7 +34,7 @@ class AssociationEngine:
     # term with its definition/context.
     # ------------------------------------------------------------------
     def place_node(self, term: str, definition: str = "", source: str = "user",
-                    context_node: Optional[str] = None) -> Dict:
+                    context_node: Optional[str] = None, max_parent_children: Optional[int] = None) -> Dict:
         """
         Places `term` into the knowledge web using §2.3's two paths:
           1. Dictionary-pattern parsing on `definition`, if it yields a
@@ -44,14 +44,44 @@ class AssociationEngine:
              in the graph) with an associated-with edge -- never mislabeled
              as is-a (§2.3 mechanism 2).
         Returns a small dict describing what happened, for logging/tests.
+
+        `max_parent_children` (new, this revision): fixes a real bug found
+        from production data -- a dense, uncapped "starburst" hub forming
+        despite self-study's degree cap (Prometheus.py's
+        _select_self_study_target). The cap only ever gated which node got
+        SELECTED as a self-study expansion target; it never actually
+        constrained what parent an edge attached to, because self-study
+        always supplies a real WordNet gloss as `definition`, so path 1
+        (dictionary-pattern parsing) usually succeeds and attaches the new
+        child to whatever parent word the GLOSS mentions -- completely
+        independent of, and uncapped relative to, the selected target. If
+        several self-study-generated words' glosses happened to reference
+        the same common word, that word became an unbounded hub, exactly
+        reproducing the runaway-growth pattern the cap was built to
+        prevent, just through the other path. When supplied, this checks
+        the parsed parent's current categorical out-degree
+        (archivist.categorical_out_degree) before committing to it; if the
+        parent is already at capacity, falls through to the co-occurrence
+        anchor instead of attaching there uncapped. None (default)
+        preserves the old, uncapped behavior -- real user/dictionary input
+        via _ingest() never passes this (it always calls with
+        definition="", so path 1 never fires for it regardless), so this
+        is scoped to self-study only.
         """
         self.archivist.store(term, source=source, tier=TIER_PROVISIONAL)
 
         parsed = self.sensory.parse_hierarchy(definition) if definition else None
         if parsed:
             parent, edge_type = parsed
-            self.archivist.link(parent, term, edge_type, source=source, placement="explicit")
-            return {"term": term, "parent": parent, "edge_type": edge_type, "placement": "explicit"}
+            at_capacity = (
+                max_parent_children is not None
+                and self.archivist.categorical_out_degree(parent) >= max_parent_children
+            )
+            if not at_capacity:
+                self.archivist.link(parent, term, edge_type, source=source, placement="explicit")
+                return {"term": term, "parent": parent, "edge_type": edge_type, "placement": "explicit"}
+            # Parsed parent is already at capacity -- fall through to the
+            # co-occurrence anchor below instead of attaching here uncapped.
 
         # Co-occurrence fallback (§2.3 mechanism 2).
         anchor = context_node or self._most_active_node(exclude=term)

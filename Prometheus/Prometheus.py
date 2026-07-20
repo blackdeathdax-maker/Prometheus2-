@@ -5,7 +5,6 @@ from typing import List, Optional
 
 from .hormonal import BioSystem, Epoch
 from .archivist import ArchivistModule, TIER_WORKING, TIER_TRUSTED, SELF_NODE, OTHER_NODE
-from .edge_types import CATEGORICAL_EDGE_TYPES
 from .executive import ExecutiveModule
 from .synthesizer import SynthesizerModule
 from .reflector import ReflectorModule
@@ -215,6 +214,29 @@ class Prometheus:
             self.felt_state_anchors[basin_key] = deque(maxlen=self.ANCHOR_WINDOW_SIZE)
         self.felt_state_anchors[basin_key].append(node)
 
+    def _get_unique_anchors(self, basin_key) -> List[str]:
+        """Bug fix, this revision (found from production data): the
+        anchor deque is a touch LOG, not a set -- it can and does contain
+        the same node multiple times (self-study re-touches its target
+        every cycle it's re-selected). Every consumer that applies a
+        per-node side effect to "the current anchors" -- regulation's
+        activation bump and regulatory-efficacy update, parental
+        feedback's valence-coloring nudge -- was previously iterating the
+        raw list directly, so a node appearing N times in the window got
+        that side effect applied N times within a SINGLE event. Concrete
+        symptom: a single Parental Feedback click reported "20 node(s)
+        colored" but the Reflection tab showed only 3 nodes with any
+        coloring at all, two of them already pinned at the cap -- because
+        those 2-3 nodes each appeared many times in the 20-entry window,
+        each repeat re-applying the same nudge in one click, while the
+        toast counted raw entries, not distinct nodes. Undermines the
+        entire "accumulates only through genuinely repeated, SEPARATE
+        co-occurrence events over time" property this mechanism depends
+        on (§13.2). Order-preserving dedup (most-recent-first callers
+        don't currently rely on order here, but preserving it is free and
+        avoids surprising anyone who later does)."""
+        return list(dict.fromkeys(self.felt_state_anchors.get(basin_key, [])))
+
     def _ingest(self, text: str, source: str):
         """Runs one piece of text through sensory + association + chronos
         linking. Despite this docstring previously claiming to be "shared
@@ -374,15 +396,15 @@ class Prometheus:
         }[reaction_type]
 
         key = self.synthesizer.get_current_basin_key()
-        anchors = self.felt_state_anchors.get(key, [])
-        for n in anchors:
+        unique_anchors = self._get_unique_anchors(key)
+        for n in unique_anchors:
             self.archivist.nudge_valence_coloring(n, coloring_delta, cap=self.VALENCE_COLORING_CAP)
             # A reaction landing on a node is itself a form of touch --
             # feeds the same activation/working-memory signal as any
             # other interaction with it (§11 pull-forward).
             self.archivist.bump_activation(n)
 
-        return {"reaction": reaction_type, "anchors_colored": list(anchors)}
+        return {"reaction": reaction_type, "anchors_colored": unique_anchors}
 
     # ------------------------------------------------------------------
     # Main tick
@@ -510,8 +532,10 @@ class Prometheus:
         placed_children = []
         for child in expansions[:3]:
             definition = self.sensory.lookup_definition(child) or ""
-            result = self.association.place_node(child, definition=definition, source="dictionary",
-                                                   context_node=target)
+            result = self.association.place_node(
+                child, definition=definition, source="dictionary",
+                context_node=target, max_parent_children=self.SELF_STUDY_SOFT_CAP,
+            )
             placed_children.append(result.get("term") or child)
         self.archivist.store(target, source="dictionary")  # reinforce parent's last_reinforced
 
@@ -596,15 +620,9 @@ class Prometheus:
         if graph.number_of_nodes() == 0:
             return None
 
-        def categorical_out_degree(n):
-            return sum(
-                1 for _u, _v, edata in graph.out_edges(n, data=True)
-                if edata.get("relation_type") in CATEGORICAL_EDGE_TYPES
-            )
-
         def has_room(n, d):
             return (
-                categorical_out_degree(n) < hard_cap
+                self.archivist.categorical_out_degree(n) < hard_cap
                 and not d.get("is_schema")
                 and n not in (SELF_NODE, OTHER_NODE)
                 and n not in self._barren_self_study_targets
@@ -797,7 +815,16 @@ class Prometheus:
         data -- see the Core Emergence Principle note on pulse().
         """
         key = self.synthesizer.get_current_basin_key()
-        anchors = self.felt_state_anchors.get(key, [])
+        # Deduplicated (this revision): felt_state_anchors is a touch LOG,
+        # not a set -- it can contain the same node many times if it's
+        # been repeatedly re-touched (e.g. a favored self-study target).
+        # Using the raw list here meant a node appearing N times in the
+        # window got bumped/efficacy-updated N times from a SINGLE
+        # regulation event, not once -- the same class of bug found and
+        # fixed in give_parental_reaction() (§13.2), just affecting
+        # regulation instead. eligible_regulation_nodes()'s own tier
+        # filter still applies on top of this.
+        unique_anchors = self._get_unique_anchors(key)
         # Bug fix (found from production data: every node's regulatory
         # efficacy sat at exactly the same value, 0.05 below the 0.5
         # default, across the entire eligible pool -- only possible if a
@@ -811,7 +838,7 @@ class Prometheus:
         # (even when empty) means an empty anchor list correctly produces
         # zero eligible nodes, which hits the pre-existing "legitimate
         # state, nothing eligible yet" early-return below instead.
-        regulating_nodes = self.archivist.eligible_regulation_nodes(anchors)
+        regulating_nodes = self.archivist.eligible_regulation_nodes(unique_anchors)
 
         if not regulating_nodes:
             # §4.2: legitimate state (nothing eligible yet), not an error.

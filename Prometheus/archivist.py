@@ -462,6 +462,24 @@ class ArchivistModule:
             if n in self.graph and self.graph.nodes[n].get("tier", TIER_PROVISIONAL) >= TIER_WORKING
         ]
 
+    def categorical_out_degree(self, node: str) -> int:
+        """Count of categorical (is-a/part-of/associated-with) out-edges
+        from `node` -- the "how many children does this hierarchy parent
+        already have" signal. Previously only existed as a local closure
+        duplicated inside Prometheus.py's _select_self_study_target;
+        centralized here, this revision, because association.place_node()
+        now needs the identical check too -- see place_node()'s docstring
+        for the cap-bypass bug this closes (dictionary-pattern-parsed
+        placements were never capped at all, only the co-occurrence
+        fallback was, even though self-study routes through the parsed
+        path most of the time)."""
+        if node not in self.graph:
+            return 0
+        return sum(
+            1 for _u, _v, edata in self.graph.out_edges(node, data=True)
+            if edata.get("relation_type") in TRUST_BEARING_EDGE_TYPES
+        )
+
     def update_regulatory_efficacy(self, node: str, worked: bool, step: float = 0.05):
         """Called during Consolidation (§4.5) after checking whether felt-
         state intensity dropped faster than baseline decay alone would
