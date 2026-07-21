@@ -48,6 +48,28 @@ _PART_OF_PATTERNS = [
     re.compile(r"^\s*(?:a\s+|an\s+)?part\s+of\s+(.+)$", re.IGNORECASE),
 ]
 
+# Self-study word-extraction fallback (§5.1, new -- see lookup_expansion's
+# docstring for the bug this fixes). Common function words plus the
+# relational-detection trigger words themselves (§2.1b: "shouldn't",
+# "wrong", "fault", "did", "made", "caused", "used", etc.) are excluded
+# from candidacy, since those are grammatical scaffolding or the SIGNAL
+# that flagged the sentence as relational, not its substantive topic. Not
+# an exhaustive list -- a small, deterministic, hand-maintained set in the
+# same spirit as the equally small, fixed relational-keyword lists already
+# used elsewhere in sensory.py (§3.4, §2.1b), not a claim of linguistic
+# completeness.
+_EXPANSION_STOPWORDS = frozenset({
+    "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them",
+    "the", "a", "an", "is", "was", "were", "be", "been", "being", "am", "are",
+    "this", "that", "these", "those", "and", "or", "but", "not", "no",
+    "to", "of", "in", "on", "at", "for", "with", "as", "so", "too",
+    "my", "your", "his", "its", "our", "their",
+    "do", "did", "does", "done", "have", "has", "had",
+    "should", "shouldn't", "wrong", "fault", "caused", "made",
+    "used", "back", "then", "before", "remember", "when",
+    "someone", "another", "person", "friend", "sister", "brother",
+})
+
 
 def _first_noun_phrase(remainder: str) -> str:
     """Definitional remainders are often a longer clause ("a color
@@ -160,16 +182,49 @@ class SensoryModule:
         use syn.hyponyms(), with the old synonym behavior preserved
         separately in lookup_synonyms() for its own, different, use
         (canonicalization/dedup -- see that method's docstring).
+
+        Multi-word fallback (new, this revision -- bug found while
+        investigating "self-study never expands nodes connected to
+        SELF"). Any node created from real typed input (association.
+        place_node() uses the whole message as the node name, §2.2) is a
+        full sentence, and wordnet.synsets() has no entry for a full
+        sentence -- it always returned [] for these, silently marking
+        every such node barren after one self-study attempt and
+        permanently excluding it. This wasn't actually SELF-specific: it
+        affected every real user message equally, self-referential or
+        not, since the root cause is "sentence, not a WordNet lemma," not
+        anything about which relational edges the node happens to carry.
+        Now tries the whole node name first (covers genuine multi-word
+        WordNet entries like "New York"), then falls through to trying
+        each individual significant word (skipping _EXPANSION_STOPWORDS --
+        common function words and the relational-detection trigger words
+        themselves, neither of which is the sentence's actual topic),
+        stopping at the first word that yields real hyponyms.
+
         Returns an empty list rather than raising if WordNet isn't
         available, so self-study degrades gracefully offline instead of
         crashing the pulse loop."""
         if not _WORDNET_AVAILABLE:
             return []
-        children = []
-        for syn in wordnet.synsets(node):
-            for hyponym in syn.hyponyms():
-                for lemma in hyponym.lemmas():
-                    children.append(lemma.name().replace("_", " "))
+
+        def hyponyms_for(candidate: str) -> List[str]:
+            found = []
+            for syn in wordnet.synsets(candidate):
+                for hyponym in syn.hyponyms():
+                    for lemma in hyponym.lemmas():
+                        found.append(lemma.name().replace("_", " "))
+            return found
+
+        children = hyponyms_for(node)
+        if not children and " " in node:
+            for word in node.split():
+                word = word.strip(".,!?;:'\"").lower()
+                if not word or word in _EXPANSION_STOPWORDS:
+                    continue
+                children = hyponyms_for(word)
+                if children:
+                    break
+
         return list(set(children))[:5]
 
     def lookup_synonyms(self, node: str):
