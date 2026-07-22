@@ -53,6 +53,31 @@ class Prometheus:
     # background texture, not a significant event (§5.1, §9 risk 7).
     SELF_STUDY_DOPAMINE_BUMP = 0.03
 
+    # Self-study arousal/dominance touch (new, this revision). Previously
+    # self-study ONLY ever touched dopamine -- adrenaline, cortisol, and
+    # testosterone (the hormones driving the arousal and dominance PAD
+    # axes, §2.1a) never moved from autonomous activity at all. Confirmed
+    # at production scale (2700+ nodes, almost entirely self-study-driven
+    # growth): those hormones simply decayed toward the 0.5 baseline every
+    # tick with nothing ever counteracting it, so only valence showed any
+    # autonomous movement. Fixed with a single small adrenaline touch --
+    # per hormonal.py's own raw-variable mapping (get_raw_variables),
+    # adrenaline alone already feeds BOTH heart_rate (arousal) and
+    # vascular_constriction (dominance), so one bump addresses both frozen
+    # axes without a second hormone. Deliberately does NOT touch
+    # testosterone: it's a slow-layer hormone (meant to represent
+    # temperament, shifted only deliberately via shift_slow_baseline,
+    # currently just at epoch transitions), not something that should
+    # move live on every self-study tick -- same boundary already
+    # respected when designing the parental-feedback mechanism (§13.2).
+    # An order of magnitude smaller than the dopamine bump, so valence
+    # stays the clearly dominant self-study signal (curiosity/
+    # satisfaction, per §5.1's own framing) -- this just keeps arousal/
+    # dominance from going completely flat during long batch-only runs,
+    # it doesn't make self-study a real driver of felt-state exploration
+    # the way genuine engagement is.
+    SELF_STUDY_AROUSAL_BUMP = 0.005
+
     # Hormonal reaction to real input -- new, this revision. §5.1 has
     # always described self-study's dopamine bump as "scaled down
     # deliberately relative to externally-triggered deltas," but no
@@ -258,6 +283,11 @@ class Prometheus:
             self.archivist.bump_activation(node)
         if anchor:
             self.archivist.bump_activation(anchor)
+        # Co-activation (§13.3, new): node and anchor were touched in the
+        # same event -- the raw signal epistemic schema clustering
+        # depends on. A no-op if anchor is None (fewer than 2 real nodes).
+        if node and anchor:
+            self.archivist.record_co_activation([node, anchor])
 
         # §2.1b item 4a: try to name any unnamed schemas tied to the felt
         # state active right now (schema naming trigger when user/dictionary
@@ -539,6 +569,13 @@ class Prometheus:
             placed_children.append(result.get("term") or child)
         self.archivist.store(target, source="dictionary")  # reinforce parent's last_reinforced
 
+        # Co-activation (§13.3, new): target and its newly-placed children
+        # were all touched in the same self-study cycle -- record every
+        # pairwise combination among them. This is the primary source of
+        # co-activation data in practice, since self-study runs far more
+        # often than real input in typical usage.
+        self.archivist.record_co_activation([target] + placed_children)
+
         if felt_state != "Unformed":
             for child_node in placed_children:
                 self.chronos.record_felt_state_link(basin_key, child_node)
@@ -562,10 +599,18 @@ class Prometheus:
 
         # Small, scaled-down dopaminergic bump (§5.1, §9 risk 7) via the
         # same fast-layer pathway as any other event -- no bespoke
-        # self-study fatigue tap.
+        # self-study fatigue tap. Also a small adrenaline touch (new, this
+        # revision) -- see SELF_STUDY_AROUSAL_BUMP's docstring for why:
+        # without this, arousal and dominance never moved at all during
+        # autonomous-only activity, only valence did. Adrenaline alone
+        # covers both axes (heart_rate + vascular_constriction), so no
+        # separate testosterone touch is needed or appropriate.
         with self.bio.lock:
             self.bio._hormones["dopamine"] = min(
                 1.0, self.bio._hormones["dopamine"] + self.SELF_STUDY_DOPAMINE_BUMP
+            )
+            self.bio._hormones["adrenaline"] = min(
+                1.0, self.bio._hormones["adrenaline"] + self.SELF_STUDY_AROUSAL_BUMP
             )
 
     def _select_self_study_target(self, hard_cap: int = 3):
@@ -786,6 +831,22 @@ class Prometheus:
         # per the design's own "one clock, not several" principle.
         self.archivist.decay_activation()
 
+        # §13.3, new: epistemic (knowledge-cluster) schema formation, same
+        # Consolidation clock as everything else. Detection runs BEFORE
+        # decay -- same ordering already used for basin stabilization
+        # (synthesizer.consolidate_basins() checks the stabilization
+        # threshold first, decays after, in that order, within one pass).
+        # An earlier version of this had the order backwards (decay first,
+        # then detect), which meant decay_co_activation()'s multiply
+        # could shrink a just-crossed-threshold count back below it
+        # before detection ever saw it at full value -- caught in testing
+        # before shipping. Naming scan runs last, after any new clusters
+        # this same pass have been created, so they're immediately
+        # eligible.
+        new_epistemic_schemas = self.reflector.detect_epistemic_clusters()
+        self.archivist.decay_co_activation()
+        newly_named_epistemic = self.reflector.try_name_epistemic_schemas()
+
         # §4C: the single checkpoint call for this pass -- everything
         # above mutates the graph and/or hormonal state without saving
         # individually (see the "No self.save() here" comments in
@@ -801,6 +862,10 @@ class Prometheus:
             print(f"Consolidation: re-parented {reparented} node(s).")
         if new_schemas:
             print(f"Consolidation: formed {len(new_schemas)} new Schema Node(s): {new_schemas}")
+        if new_epistemic_schemas:
+            print(f"Consolidation: formed {len(new_epistemic_schemas)} new Epistemic Schema Node(s): {new_epistemic_schemas}")
+        if newly_named_epistemic:
+            print(f"Consolidation: named {newly_named_epistemic} Epistemic Schema Node(s).")
 
     # ------------------------------------------------------------------
     # §4 Regulation

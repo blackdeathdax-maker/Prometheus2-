@@ -3,8 +3,12 @@ from collections import Counter
 from datetime import datetime
 from typing import Dict, List, Optional
 
+import networkx as nx
+
 from .archivist import SELF_NODE, TIER_PROVISIONAL, TIER_WORKING
-from .edge_types import RELATIONAL_EDGE_TYPES, EDGE_COMPOSED_OF, NODE_SCHEMA
+from .edge_types import (
+    RELATIONAL_EDGE_TYPES, EDGE_COMPOSED_OF, EDGE_IS_A, NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA,
+)
 
 
 class OverrideSignal:
@@ -17,6 +21,11 @@ class OverrideSignal:
 # formation. Same tuning-placeholder category as basin stabilization
 # (§10 item 13) -- not yet numeric in the spec.
 SCHEMA_STABILIZATION_THRESHOLD = 3
+
+# §13.3, new: epistemic (knowledge-cluster) schema formation. Same
+# tuning-placeholder status as everything else in this design (§10).
+EPISTEMIC_MIN_CLUSTER_SIZE = 3
+EPISTEMIC_NAME_MIN_COVERAGE = 2  # how many cluster members a parsed is-a parent must cover before it's recognized as earning the cluster's name (§13.3.1)
 
 
 
@@ -47,6 +56,8 @@ class ReflectorModule:
         # the Debug tab's sliders tune this live. Same "not yet
         # numerically tuned" placeholder as everywhere else (§10).
         self.SCHEMA_STABILIZATION_THRESHOLD = SCHEMA_STABILIZATION_THRESHOLD
+        self.EPISTEMIC_MIN_CLUSTER_SIZE = EPISTEMIC_MIN_CLUSTER_SIZE
+        self.EPISTEMIC_NAME_MIN_COVERAGE = EPISTEMIC_NAME_MIN_COVERAGE
 
     # ------------------------------------------------------------------
     # 1. Structural self-report (pre-existing, unchanged)
@@ -195,6 +206,166 @@ class ReflectorModule:
     def schema_count(self) -> int:
         """Used by prometheus.py for the §6.2 Adolescence->Maturity gate."""
         return sum(1 for _n, d in self.archivist.graph.nodes(data=True) if d.get("is_schema"))
+
+    # ------------------------------------------------------------------
+    # §13.3 Epistemic (knowledge-cluster) Schema formation -- new,
+    # Consolidation-gated (same clock as everything else). Tier 1 only in
+    # this pass: clusters form directly from base graph nodes. The
+    # `abstraction_level` field is present from the start so recursive
+    # Tier 2+ (schemas clustering from other schemas) can be added later
+    # without a data-migration -- but only level 1 is actually exercised
+    # here, deliberately, rather than attempting the full recursive system
+    # in one unvalidated leap.
+    # ------------------------------------------------------------------
+    def detect_epistemic_clusters(self) -> List[str]:
+        """
+        Groups nodes whose co-activation has stabilized (archivist.
+        stabilized_co_activation_pairs()) into cluster candidates via
+        connected components of a temporary co-activation graph --
+        deterministic, inspectable graph theory (same standard already
+        used for cycle handling in the original §13.3 proposal), not an
+        opaque clustering library. A candidate becomes a real (unnamed)
+        Epistemic Schema Node if it has at least EPISTEMIC_MIN_CLUSTER_SIZE
+        members and doesn't already share a single dominant parent
+        (skipped in that case -- that parent already names the group,
+        creating a second, competing structure for the same thing would
+        be redundant, not useful). Returns the list of newly-created
+        schema ids.
+        """
+        pairs = self.archivist.stabilized_co_activation_pairs()
+        if not pairs:
+            return []
+
+        co_graph = nx.Graph()
+        co_graph.add_edges_from(pairs)
+
+        graph = self.archivist.graph
+        created = []
+        for component in nx.connected_components(co_graph):
+            if len(component) < self.EPISTEMIC_MIN_CLUSTER_SIZE:
+                continue
+            members = sorted(component)
+
+            if self._has_dominant_shared_parent(members):
+                continue  # already named via ordinary hierarchy -- redundant to cluster
+
+            cluster_id = self._epistemic_cluster_id(members)
+            if cluster_id in graph:
+                continue  # already formed, nothing new to do
+
+            graph.add_node(
+                cluster_id,
+                source="schema",
+                tier=TIER_WORKING,
+                last_reinforced=datetime.now(),
+                regulatory_efficacy=0.5,
+                tier0_cycles=0,
+                activation=0.0,
+                valence_coloring=0.0,
+                node_type=NODE_EPISTEMIC_SCHEMA,
+                abstraction_level=1,
+                named=False,
+                name=None,
+                member_count=len(members),
+            )
+            for member in members:
+                graph.add_edge(cluster_id, member, relation_type=EDGE_COMPOSED_OF,
+                                source="schema", placement="explicit",
+                                created_at=datetime.now().isoformat())
+            created.append(cluster_id)
+
+        return created
+
+    def _has_dominant_shared_parent(self, members: List[str], min_coverage: Optional[int] = None) -> bool:
+        """True if a single existing is-a parent already covers enough of
+        `members` that clustering them again would be redundant. Reuses
+        the same "does a parent word cover >= K members" check that also
+        underlies naming (§13.3.1) -- kept as a shared helper so the two
+        can't silently diverge into different definitions of "covers.\""""
+        min_coverage = self.EPISTEMIC_NAME_MIN_COVERAGE if min_coverage is None else min_coverage
+        graph = self.archivist.graph
+        parent_counts: Counter = Counter()
+        for member in members:
+            if member not in graph:
+                continue
+            for u, _v, edata in graph.in_edges(member, data=True):
+                if edata.get("relation_type") == EDGE_IS_A:
+                    parent_counts[u] += 1
+        return bool(parent_counts) and max(parent_counts.values()) >= min_coverage
+
+    def try_name_epistemic_schemas(self) -> int:
+        """§13.3.1's resolved naming rule, implemented: an epistemic
+        schema earns a name only when a dictionary-pattern-parsed is-a
+        assertion ties back to enough of its members -- never generated
+        by the system. Consolidation-time scan (not a live trigger) is
+        the simplest correct implementation of the same rule §2.1b item
+        4a and §6.1 already use elsewhere, just checked periodically
+        instead of on every placement. Returns the count newly named."""
+        graph = self.archivist.graph
+        named_count = 0
+        for node, data in list(graph.nodes(data=True)):
+            if data.get("node_type") != NODE_EPISTEMIC_SCHEMA or data.get("named"):
+                continue
+            members = [
+                v for _u, v, edata in graph.out_edges(node, data=True)
+                if edata.get("relation_type") == EDGE_COMPOSED_OF
+            ]
+            if not members:
+                continue
+            parent_counts: Counter = Counter()
+            for member in members:
+                if member not in graph:
+                    continue
+                for u, _v, edata in graph.in_edges(member, data=True):
+                    if edata.get("relation_type") == EDGE_IS_A:
+                        parent_counts[u] += 1
+            if not parent_counts:
+                continue
+            best_parent, coverage = parent_counts.most_common(1)[0]
+            if coverage >= self.EPISTEMIC_NAME_MIN_COVERAGE:
+                graph.nodes[node]["name"] = best_parent
+                graph.nodes[node]["named"] = True
+                named_count += 1
+        return named_count
+
+    @staticmethod
+    def _epistemic_cluster_id(members: List[str]) -> str:
+        digest = hashlib.sha1("|".join(sorted(members)).encode()).hexdigest()[:8]
+        return f"epistemic_{digest}"
+
+    def epistemic_schema_report(self, top_n: int = 5) -> Dict:
+        """
+        Diagnostic (§13.3, new): same "make it checkable" pattern as every
+        other new mechanism this session. Shows real cluster-candidate
+        progress -- how many co-activation pairs exist, how many have
+        stabilized, and how close any live candidate component is to
+        EPISTEMIC_MIN_CLUSTER_SIZE -- plus a summary of formed schemas
+        (named/unnamed). Read-only, never mutates the graph.
+        """
+        pairs = self.archivist.stabilized_co_activation_pairs()
+        co_graph = nx.Graph()
+        co_graph.add_edges_from(pairs)
+        candidates = []
+        for component in nx.connected_components(co_graph):
+            candidates.append({
+                "size": len(component),
+                "threshold": self.EPISTEMIC_MIN_CLUSTER_SIZE,
+                "remaining": max(0, self.EPISTEMIC_MIN_CLUSTER_SIZE - len(component)),
+                "members": sorted(component)[:5],
+            })
+        candidates.sort(key=lambda c: c["remaining"])
+
+        schemas = [
+            (n, d) for n, d in self.archivist.graph.nodes(data=True)
+            if d.get("node_type") == NODE_EPISTEMIC_SCHEMA
+        ]
+        return {
+            "total_co_activation_pairs": len(self.archivist.co_activation),
+            "stabilized_pairs": len(pairs),
+            "candidate_clusters": candidates[:top_n],
+            "schemas_formed": len(schemas),
+            "schemas_named": sum(1 for _n, d in schemas if d.get("named")),
+        }
 
     def schema_candidate_report(self, top_n: int = 5) -> Dict:
         """

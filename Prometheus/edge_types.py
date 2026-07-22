@@ -59,8 +59,9 @@ TRUST_BEARING_EDGE_TYPES = CATEGORICAL_EDGE_TYPES
 # ---------------------------------------------------------------------
 NODE_STANDARD = "standard"
 NODE_BASIN = "basin"
-NODE_SCHEMA = "schema"
+NODE_SCHEMA = "schema"  # somatic/emotional schema (§2.1b)
 NODE_SELF = "self"
+NODE_EPISTEMIC_SCHEMA = "epistemic_schema"  # §13.3, new -- knowledge-cluster schema, distinct kind of pattern from NODE_SCHEMA
 
 # ---------------------------------------------------------------------
 # Graph tab visual encoding (§4B, §10 item 21)
@@ -98,11 +99,14 @@ NODE_SHAPE: Dict[str, str] = {
     NODE_BASIN: "diamond",
     NODE_SCHEMA: "hexagon",
     NODE_SELF: "star",
+    NODE_EPISTEMIC_SCHEMA: "hexagon",  # same shape family as somatic schemas (both are "recognized recurring patterns"), distinguished by color instead
 }
 TIER_OPACITY = {0: 0.35, 1: 0.65, 2: 1.0}  # Provisional / Working / Trusted
 SCHEMA_UNNAMED_COLOR = "#888888"
 SCHEMA_NAMED_COLOR = "#2e8b57"
 SELF_COLOR = "#d4af37"
+EPISTEMIC_SCHEMA_UNNAMED_COLOR = "#5a6b7a"  # slate, distinct from somatic's gray
+EPISTEMIC_SCHEMA_NAMED_COLOR = "#1a8a8a"    # teal, distinct from somatic's green
 
 
 def basin_color(valence: float) -> str:
