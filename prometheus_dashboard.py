@@ -26,7 +26,8 @@ from pyvis.network import Network
 from Prometheus.edge_types import (
     EDGE_STYLE, DEFAULT_EDGE_STYLE, NODE_SHAPE, TIER_OPACITY,
     SCHEMA_UNNAMED_COLOR, SCHEMA_NAMED_COLOR, SELF_COLOR,
-    NODE_STANDARD, NODE_BASIN, NODE_SCHEMA, NODE_SELF,
+    EPISTEMIC_SCHEMA_UNNAMED_COLOR, EPISTEMIC_SCHEMA_NAMED_COLOR,
+    NODE_STANDARD, NODE_BASIN, NODE_SCHEMA, NODE_SELF, NODE_EPISTEMIC_SCHEMA,
     basin_color,
 )
 
@@ -65,6 +66,10 @@ def _node_visual(node: str, data: dict) -> dict:
 
     if node_type == NODE_SCHEMA:
         color = SCHEMA_NAMED_COLOR if data.get("named") else SCHEMA_UNNAMED_COLOR
+        return {"shape": shape, "color": color}
+
+    if node_type == NODE_EPISTEMIC_SCHEMA:
+        color = EPISTEMIC_SCHEMA_NAMED_COLOR if data.get("named") else EPISTEMIC_SCHEMA_UNNAMED_COLOR
         return {"shape": shape, "color": color}
 
     if node_type == NODE_BASIN:

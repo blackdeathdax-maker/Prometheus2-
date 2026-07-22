@@ -267,6 +267,64 @@ if st.session_state.prom is not None:
                         "repeated 3+ times."
                     )
 
+            st.subheader("Epistemic Schemas (§13.3, new -- Tier 1)")
+            st.caption(
+                "Knowledge-cluster schemas, distinct from the emotional "
+                "schemas above -- formed from nodes that get touched "
+                "together repeatedly (self-study cycles, real input), not "
+                "from relational edges or felt state. Unnamed until a real "
+                "dictionary assertion ties back to enough members (§13.3.1) "
+                "-- never autonomously generated, and no manual naming "
+                "control here by design (unlike somatic schemas above, "
+                "naming an epistemic cluster is about hierarchy, not "
+                "felt-state co-occurrence, so a free-text override wouldn't "
+                "fit the same earned-naming semantics)."
+            )
+            epistemic_nodes = [
+                (n, d) for n, d in prom.archivist.graph.nodes(data=True)
+                if d.get("node_type") == "epistemic_schema"
+            ]
+            if not epistemic_nodes:
+                st.caption("No stable Epistemic Schema Nodes formed yet.")
+            else:
+                for n, d in epistemic_nodes:
+                    label = d.get("name") or f"(unnamed: {n})"
+                    st.write(
+                        f"**{label}** – tier {d.get('abstraction_level', 1)}, "
+                        f"{d.get('member_count', '?')} member(s)"
+                    )
+
+            with st.expander("Epistemic cluster progress (diagnostic)"):
+                st.caption(
+                    "Read-only view into co-activation tracking and cluster "
+                    "candidates, same 'make it checkable' pattern as the "
+                    "somatic schema diagnostic above."
+                )
+                epi_report = prom.reflector.epistemic_schema_report()
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Tracked co-activation pairs", epi_report["total_co_activation_pairs"])
+                with col2:
+                    st.metric("Stabilized pairs", epi_report["stabilized_pairs"])
+                st.metric("Schemas formed / named", f"{epi_report['schemas_formed']} / {epi_report['schemas_named']}")
+                if epi_report["candidate_clusters"]:
+                    st.write("Closest candidate clusters to stabilizing:")
+                    for c in epi_report["candidate_clusters"]:
+                        members_preview = ", ".join(c["members"])
+                        st.write(
+                            f"- {c['size']}/{c['threshold']} members "
+                            f"({c['remaining']} more needed): {members_preview}"
+                        )
+                else:
+                    st.caption(
+                        "No candidate clusters yet -- co-activation builds "
+                        "up from nodes being touched together repeatedly, "
+                        "mostly through self-study cycles. Give it more "
+                        "pulses, or check whether candidates already have "
+                        "a dominant shared dictionary parent (in which case "
+                        "clustering is correctly skipped as redundant)."
+                    )
+
             with st.expander("Activation / Working Memory (§11 pull-forward, diagnostic)"):
                 st.caption(
                     "Real activation numbers, so 'is focus actually working' is "
@@ -452,6 +510,12 @@ if st.session_state.prom is not None:
                     "Dopamine bump per self-study expansion", 0.0, 0.3,
                     value=prom.SELF_STUDY_DOPAMINE_BUMP, step=0.01,
                 )
+                prom.SELF_STUDY_AROUSAL_BUMP = st.slider(
+                    "Adrenaline bump per self-study expansion (new -- "
+                    "previously arousal/dominance never moved from "
+                    "autonomous activity at all)", 0.0, 0.1,
+                    value=prom.SELF_STUDY_AROUSAL_BUMP, step=0.001,
+                )
 
             with st.expander("Hormonal Reaction to Input (new, this revision)"):
                 st.caption(
@@ -541,6 +605,28 @@ if st.session_state.prom is not None:
                 prom.WORKING_MEMORY_DEFAULT_SIZE = st.slider(
                     "Graph tab default focus size (top-K)", 10, 200,
                     value=prom.WORKING_MEMORY_DEFAULT_SIZE, step=5,
+                )
+
+            with st.expander("Epistemic Schema Formation (§13.3, new)"):
+                prom.archivist.CO_ACTIVATION_STABILIZATION_THRESHOLD = st.slider(
+                    "Co-activation stabilization threshold (pair touch count)", 1, 20,
+                    value=prom.archivist.CO_ACTIVATION_STABILIZATION_THRESHOLD, step=1,
+                )
+                prom.archivist.CO_ACTIVATION_DECAY_RATE = st.slider(
+                    "Co-activation decay rate (retained per Consolidation)", 0.0, 1.0,
+                    value=prom.archivist.CO_ACTIVATION_DECAY_RATE, step=0.05,
+                )
+                prom.archivist.CO_ACTIVATION_PRUNE_FLOOR = st.slider(
+                    "Co-activation prune floor (below this, pair is dropped)", 0.0, 5.0,
+                    value=prom.archivist.CO_ACTIVATION_PRUNE_FLOOR, step=0.1,
+                )
+                prom.reflector.EPISTEMIC_MIN_CLUSTER_SIZE = st.slider(
+                    "Minimum cluster size", 2, 15,
+                    value=prom.reflector.EPISTEMIC_MIN_CLUSTER_SIZE, step=1,
+                )
+                prom.reflector.EPISTEMIC_NAME_MIN_COVERAGE = st.slider(
+                    "Minimum member coverage for an earned name", 1, 10,
+                    value=prom.reflector.EPISTEMIC_NAME_MIN_COVERAGE, step=1,
                 )
 
             with st.expander("Trust Tiers (§3)"):
