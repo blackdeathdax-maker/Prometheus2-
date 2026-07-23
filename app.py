@@ -608,6 +608,12 @@ if st.session_state.prom is not None:
                 )
 
             with st.expander("Epistemic Schema Formation (§13.3, new)"):
+                prom.CO_ACTIVATION_RECENCY_WINDOW = st.slider(
+                    "Co-activation recency window (recent distinct anchors "
+                    "paired per touch -- new, fixes pairs only ever getting "
+                    "one chance to co-occur)", 0, 10,
+                    value=prom.CO_ACTIVATION_RECENCY_WINDOW, step=1,
+                )
                 prom.archivist.CO_ACTIVATION_STABILIZATION_THRESHOLD = st.slider(
                     "Co-activation stabilization threshold (pair touch count)", 1, 20,
                     value=prom.archivist.CO_ACTIVATION_STABILIZATION_THRESHOLD, step=1,
