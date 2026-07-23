@@ -192,6 +192,28 @@ class Prometheus:
         self.felt_state_anchors = {}
         self.ANCHOR_WINDOW_SIZE = 20  # same tuning-placeholder category as everything else (§10)
 
+        # Co-activation broadening (§13.3, new). Diagnosed from production
+        # data (18 tracked pairs / 0 stabilized after 3833 pulses, 3355
+        # nodes): the original co-activation sources (a self-study cycle's
+        # target+children, an ingestion's node+anchor) each only ever fire
+        # ONCE per target's effective lifetime, because self-study's
+        # degree cap excludes a target from future selection almost
+        # immediately after it's touched -- so most pairs got exactly one
+        # chance to accumulate, never a second or third, and could never
+        # cross CO_ACTIVATION_STABILIZATION_THRESHOLD (3) regardless of
+        # how long the system ran. Fixed in _record_anchor(): every time
+        # any node gets anchored to a felt state, it's ALSO paired with
+        # the most recent few distinct anchors already in that felt
+        # state's window -- since felt states get genuinely revisited
+        # over a run (§2.1a's whole premise), this gives pairs many more
+        # natural chances to recur, not just one. Deliberately bounded to
+        # a SMALL recent window, not the full ANCHOR_WINDOW_SIZE history:
+        # pairing a new touch with all 20 prior anchors would make
+        # co-activation nearly synonymous with "ever anchored to the same
+        # felt state," diluting a signal meant to capture genuine,
+        # temporally-close recurrence into something closer to noise.
+        self.CO_ACTIVATION_RECENCY_WINDOW = 3
+
         # Pending regulation attempts awaiting efficacy evaluation at the
         # next Consolidation pass (§4.5: "evaluated during Consolidation
         # only... over the ticks following a regulation attempt").
@@ -234,9 +256,31 @@ class Prometheus:
         for the unbounded-growth bug -- see the field's own docstring at
         __init__). Every write to felt_state_anchors goes through here now,
         so there's exactly one place that could reintroduce unbounded
-        growth, not three scattered call sites."""
+        growth, not three scattered call sites.
+
+        Co-activation broadening (§13.3, new -- see CO_ACTIVATION_
+        RECENCY_WINDOW's docstring at __init__ for the full diagnosis).
+        Before appending, pairs the new node with the most recent
+        CO_ACTIVATION_RECENCY_WINDOW *distinct* anchors already recorded
+        for this felt state. Distinct, not just "last N raw entries" --
+        the deque can (and does) contain repeats of the same node, and
+        pairing against repeats of one node wastes the bounded window on
+        redundant pairs instead of genuinely different recent context."""
         if basin_key not in self.felt_state_anchors:
             self.felt_state_anchors[basin_key] = deque(maxlen=self.ANCHOR_WINDOW_SIZE)
+
+        existing = self.felt_state_anchors[basin_key]
+        if existing:
+            recent_distinct = []
+            seen = set()
+            for n in reversed(existing):
+                if n not in seen:
+                    seen.add(n)
+                    recent_distinct.append(n)
+                if len(recent_distinct) >= self.CO_ACTIVATION_RECENCY_WINDOW:
+                    break
+            self.archivist.record_co_activation(recent_distinct + [node])
+
         self.felt_state_anchors[basin_key].append(node)
 
     def _get_unique_anchors(self, basin_key) -> List[str]:
