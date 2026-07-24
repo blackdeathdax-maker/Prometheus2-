@@ -138,6 +138,22 @@ class Prometheus:
     SELF_STUDY_MAX_ATTEMPTS = 3
     SELF_STUDY_SOFT_CAP = 6
 
+    # Bias-modulated self-study targeting (§13.1, new -- designed but
+    # never built until this revision; executive.py's EXPLORE/STABILIZE/
+    # NEUTRAL bias signal was computed every tick and logged, but nothing
+    # ever consumed it, §10 item 23). Two independent effects, both
+    # expressing the same "explore = novelty, stabilize = depth" idea:
+    # (a) which tier-pool self-study draws from (below), and (b)
+    # _weighted_choice_by_activation's weighting direction within that
+    # pool (inverted under EXPLORE -- see that method's docstring).
+    # SELF_STUDY_PROVISIONAL_PROB_NEUTRAL preserves the old hardcoded 0.6
+    # default exactly, so NEUTRAL bias reproduces prior behavior bit for
+    # bit. Same "not yet numerically tuned" placeholder status as
+    # everything else (§10).
+    SELF_STUDY_PROVISIONAL_PROB_EXPLORE = 0.8
+    SELF_STUDY_PROVISIONAL_PROB_STABILIZE = 0.3
+    SELF_STUDY_PROVISIONAL_PROB_NEUTRAL = 0.6
+
     # Activation / working-memory rendering default (§11 pull-forward,
     # this revision). How many top-activation nodes the Graph tab renders
     # by default, before a "show full graph" opt-in override.
@@ -731,17 +747,26 @@ class Prometheus:
             if d.get("tier", 0) < TIER_WORKING and d.get("source") != "self_generated" and has_room(n, d)
         ]
 
+        # Bias-modulated pool selection (§13.1, new). NEUTRAL reproduces
+        # the old hardcoded 0.6 exactly -- this is a strict extension, not
+        # a behavior change, for anyone who hasn't touched the bias signal.
+        bias = self.executive.current_bias
+        provisional_prob = {
+            "BIAS_EXPLORE": self.SELF_STUDY_PROVISIONAL_PROB_EXPLORE,
+            "BIAS_STABILIZE": self.SELF_STUDY_PROVISIONAL_PROB_STABILIZE,
+        }.get(bias, self.SELF_STUDY_PROVISIONAL_PROB_NEUTRAL)
+
         if working_candidates and provisional_candidates:
-            # Weighted toward provisional: established hubs already got
-            # their initial attention, fresh nodes need it more. Not a
-            # tuned ratio (§10) -- worth a slider if this needs finer
-            # control later.
-            pool = provisional_candidates if random.random() < 0.6 else working_candidates
-            return self._weighted_choice_by_activation(pool)
+            # Weighted toward provisional under NEUTRAL/default: established
+            # hubs already got their initial attention, fresh nodes need it
+            # more. Under EXPLORE/STABILIZE, the ratio shifts instead per
+            # provisional_prob above. Not a tuned ratio (§10) either way.
+            pool = provisional_candidates if random.random() < provisional_prob else working_candidates
+            return self._weighted_choice_by_activation(pool, bias=bias)
         if provisional_candidates:
-            return self._weighted_choice_by_activation(provisional_candidates)
+            return self._weighted_choice_by_activation(provisional_candidates, bias=bias)
         if working_candidates:
-            return self._weighted_choice_by_activation(working_candidates)
+            return self._weighted_choice_by_activation(working_candidates, bias=bias)
 
         # (c) fallback: whatever node is currently anchoring the felt
         # state, if any -- but only if it also still has room. Previously
@@ -772,19 +797,36 @@ class Prometheus:
 
         return None
 
-    def _weighted_choice_by_activation(self, pool: List[str]) -> Optional[str]:
-        """Activation-weighted random choice (§11 pull-forward, this
-        revision) -- replaces uniform random.choice() for self-study
-        target selection so recently-touched nodes are preferentially
-        re-expanded, giving self-study something closer to genuine
-        attention/focus. An epsilon floor (0.1) on every weight keeps
-        untouched nodes selectable at nonzero probability -- this stays
-        exploration-with-a-bias, not pure exploitation of whatever's
-        already active, which would risk narrowing the graph's growth to
-        an ever-smaller hot set over time."""
+    def _weighted_choice_by_activation(self, pool: List[str], bias: str = "BIAS_NEUTRAL") -> Optional[str]:
+        """Activation-weighted random choice (§11 pull-forward) --
+        replaces uniform random.choice() for self-study target selection
+        so recently-touched nodes are preferentially re-expanded, giving
+        self-study something closer to genuine attention/focus. An
+        epsilon floor (0.1) on every weight keeps untouched nodes
+        selectable at nonzero probability -- this stays exploration-with-
+        a-bias, not pure exploitation of whatever's already active, which
+        would risk narrowing the graph's growth to an ever-smaller hot
+        set over time.
+
+        `bias` (new, this revision -- §13.1): under BIAS_EXPLORE, the
+        weighting is inverted -- low-activation (novel, rarely-touched)
+        nodes are preferred instead, using ACTIVATION_CAP minus each
+        node's activation as the weight, same epsilon floor for the
+        opposite reason (keeps a saturated node selectable at nonzero
+        probability rather than fully excluded). BIAS_STABILIZE and
+        BIAS_NEUTRAL both keep the original high-activation-preferring
+        weighting -- NEUTRAL reproduces prior behavior exactly; STABILIZE
+        reads as "deepen what's already active," which is what the
+        un-inverted weighting already does."""
         if not pool:
             return None
-        weights = [self.archivist.graph.nodes[n].get("activation", 0.0) + 0.1 for n in pool]
+        if bias == "BIAS_EXPLORE":
+            cap = self.archivist.ACTIVATION_CAP
+            weights = [
+                (cap - self.archivist.graph.nodes[n].get("activation", 0.0)) + 0.1 for n in pool
+            ]
+        else:
+            weights = [self.archivist.graph.nodes[n].get("activation", 0.0) + 0.1 for n in pool]
         return random.choices(pool, weights=weights, k=1)[0]
 
     # ------------------------------------------------------------------
