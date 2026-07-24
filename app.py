@@ -160,6 +160,15 @@ if st.session_state.prom is not None:
             st.metric("Felt State", felt_state)
             st.metric("Epoch", prom.bio.epoch.value)
             st.metric("Operating Mode", prom.state)
+            st.metric(
+                "Bias", prom.executive.current_bias,
+                help=(
+                    "§13.1: now drives self-study targeting, not just logged. "
+                    "EXPLORE prefers fresher, low-activation content; "
+                    "STABILIZE prefers established, high-activation content; "
+                    "NEUTRAL matches the original default weighting."
+                ),
+            )
 
             # Fatigue shown as an abstracted level, not a raw number (§4B).
             if prom.fatigue < Prometheus.T1:
@@ -515,6 +524,29 @@ if st.session_state.prom is not None:
                     "previously arousal/dominance never moved from "
                     "autonomous activity at all)", 0.0, 0.1,
                     value=prom.SELF_STUDY_AROUSAL_BUMP, step=0.001,
+                )
+
+            with st.expander("Bias-Modulated Self-Study Targeting (§13.1, new)"):
+                st.caption(
+                    "Previously, executive.py's EXPLORE/STABILIZE/NEUTRAL "
+                    "bias signal was computed every tick and only ever "
+                    "logged -- self-study picked targets the same way "
+                    "regardless of bias. Now EXPLORE favors fresher, "
+                    "low-activation content; STABILIZE favors established, "
+                    "high-activation content; NEUTRAL reproduces the "
+                    "original default exactly."
+                )
+                prom.SELF_STUDY_PROVISIONAL_PROB_EXPLORE = st.slider(
+                    "P(provisional pool) under EXPLORE", 0.0, 1.0,
+                    value=prom.SELF_STUDY_PROVISIONAL_PROB_EXPLORE, step=0.05,
+                )
+                prom.SELF_STUDY_PROVISIONAL_PROB_STABILIZE = st.slider(
+                    "P(provisional pool) under STABILIZE", 0.0, 1.0,
+                    value=prom.SELF_STUDY_PROVISIONAL_PROB_STABILIZE, step=0.05,
+                )
+                prom.SELF_STUDY_PROVISIONAL_PROB_NEUTRAL = st.slider(
+                    "P(provisional pool) under NEUTRAL (original default: 0.6)", 0.0, 1.0,
+                    value=prom.SELF_STUDY_PROVISIONAL_PROB_NEUTRAL, step=0.05,
                 )
 
             with st.expander("Hormonal Reaction to Input (new, this revision)"):
