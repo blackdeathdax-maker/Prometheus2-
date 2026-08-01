@@ -334,6 +334,45 @@ if st.session_state.prom is not None:
                         "clustering is correctly skipped as redundant)."
                     )
 
+            st.subheader("Directed Working Memory (§14, new)")
+            st.caption(
+                "What's actually 'in mind' right now -- SELF + current basin "
+                "+ up to 7 schema-cluster slots, narrowed by emotional "
+                "intensity and populated by epoch-weighted admission (real "
+                "input vs. self-study content). Distinct from the simpler "
+                "top-K activation panel below (§11) -- this is the richer "
+                "model that also gates self-study targeting in Childhood."
+            )
+            wm = prom.get_current_working_memory()
+            wm_col1, wm_col2, wm_col3 = st.columns(3)
+            with wm_col1:
+                st.metric("Epoch", prom.bio.epoch.value)
+            with wm_col2:
+                st.metric("Schema slot capacity", f"{wm['capacity']} / {prom.working_memory.MAX_SCHEMA_SLOTS}")
+            with wm_col3:
+                st.metric("Slots filled", len(wm["slots"]))
+            st.write(f"**SELF** (permanent) + **basin** (privileged) + current slots:")
+            if wm["slots"]:
+                for slot in wm["slots"]:
+                    data = prom.archivist.graph.nodes.get(slot, {})
+                    node_type = data.get("node_type", "standard")
+                    label = data.get("name") or slot
+                    user_linked = " (user-linked)" if prom.working_memory.is_user_linked(slot) else ""
+                    st.write(f"- `{label}` ({node_type}){user_linked}")
+            else:
+                st.caption("No schema slots filled yet.")
+            with st.expander("Why this capacity right now?"):
+                arousal, valence, dominance = prom.synthesizer.get_current_basin_key()
+                st.caption(
+                    f"Current basin: arousal={arousal:.2f}, valence={valence:.2f}, "
+                    f"dominance={dominance:.2f}. Below "
+                    f"{prom.working_memory.LOW_AROUSAL_THRESHOLD:.2f} arousal, full "
+                    f"baseline capacity (7) applies regardless of valence. Above "
+                    f"that, negative valence narrows hard toward a floor of "
+                    f"{prom.working_memory.HIGH_NEGATIVE_SLOT_FLOOR}; positive "
+                    f"valence narrows only mildly."
+                )
+
             with st.expander("Activation / Working Memory (§11 pull-forward, diagnostic)"):
                 st.caption(
                     "Real activation numbers, so 'is focus actually working' is "
@@ -665,6 +704,61 @@ if st.session_state.prom is not None:
                 prom.reflector.EPISTEMIC_NAME_MIN_COVERAGE = st.slider(
                     "Minimum member coverage for an earned name", 1, 10,
                     value=prom.reflector.EPISTEMIC_NAME_MIN_COVERAGE, step=1,
+                )
+
+            with st.expander("Directed Working Memory (§14, new)"):
+                st.caption(
+                    "SELF + basin + up to 7 schema-cluster slots, narrowed "
+                    "by emotional intensity, gated by developmental epoch. "
+                    "Now drives self-study targeting directly (hard-gated "
+                    "in Childhood, boosted elsewhere) -- not just logged."
+                )
+                wm_mod = prom.working_memory
+                wm_mod.MAX_SCHEMA_SLOTS = st.slider(
+                    "Hard ceiling on schema slots", 3, 12,
+                    value=wm_mod.MAX_SCHEMA_SLOTS, step=1,
+                )
+                wm_mod.MIN_SCHEMA_SLOTS = st.slider(
+                    "Soft lower bound (never fewer than this)", 0, 3,
+                    value=wm_mod.MIN_SCHEMA_SLOTS, step=1,
+                )
+                wm_mod.HIGH_NEGATIVE_SLOT_FLOOR = st.slider(
+                    "High-negative/high-arousal narrowing floor", 1, 5,
+                    value=wm_mod.HIGH_NEGATIVE_SLOT_FLOOR, step=1,
+                )
+                wm_mod.LOW_AROUSAL_THRESHOLD = st.slider(
+                    "Low-arousal threshold (below this: full baseline capacity)", 0.0, 1.0,
+                    value=wm_mod.LOW_AROUSAL_THRESHOLD, step=0.05,
+                )
+                wm_mod.POSITIVE_NARROWING_MAX = st.slider(
+                    "Positive-valence narrowing (max slots removed)", 0, 5,
+                    value=wm_mod.POSITIVE_NARROWING_MAX, step=1,
+                )
+                st.caption("Epoch-weighted admission (§14.2) -- probability a slot favors user-linked content:")
+                wm_mod.CHILDHOOD_USER_PRIORITY = st.slider(
+                    "Childhood user priority", 0.0, 1.0,
+                    value=wm_mod.CHILDHOOD_USER_PRIORITY, step=0.05,
+                )
+                wm_mod.ADOLESCENCE_USER_PRIORITY = st.slider(
+                    "Adolescence user priority", 0.0, 1.0,
+                    value=wm_mod.ADOLESCENCE_USER_PRIORITY, step=0.05,
+                )
+                wm_mod.MATURITY_USER_PRIORITY = st.slider(
+                    "Maturity user priority", 0.0, 1.0,
+                    value=wm_mod.MATURITY_USER_PRIORITY, step=0.05,
+                )
+                wm_mod.MATURITY_RESERVED_SLOTS = st.slider(
+                    "Maturity reserved user-linked slots (never fully displaced)", 0, 3,
+                    value=wm_mod.MATURITY_RESERVED_SLOTS, step=1,
+                )
+                wm_mod.CALM_PRIORITY_SOFTENING_MAX = st.slider(
+                    "Calm-state admission softening (§14.3 'exploratory expansion' "
+                    "-- loosens restriction, does NOT raise the slot ceiling)", 0.0, 1.0,
+                    value=wm_mod.CALM_PRIORITY_SOFTENING_MAX, step=0.05,
+                )
+                wm_mod.BASIN_COOCCURRENCE_BONUS = st.slider(
+                    "Basin co-occurrence ranking bonus (§14.4)", 0.0, 20.0,
+                    value=wm_mod.BASIN_COOCCURRENCE_BONUS, step=0.5,
                 )
 
             with st.expander("Trust Tiers (§3)"):
