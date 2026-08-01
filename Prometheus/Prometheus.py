@@ -1,7 +1,5 @@
 import os
 import random
-from collections import deque
-from typing import List, Optional
 
 from .hormonal import BioSystem, Epoch
 from .archivist import ArchivistModule, TIER_WORKING, TIER_TRUSTED, SELF_NODE, OTHER_NODE
@@ -9,7 +7,6 @@ from .executive import ExecutiveModule
 from .synthesizer import SynthesizerModule
 from .reflector import ReflectorModule
 from .chronos import ChronosModule
-from .working_memory import WorkingMemoryModule
 from .sensory import SensoryModule
 from .association import AssociationEngine
 from .stimulus import SyntheticStimulusEngine
@@ -54,116 +51,6 @@ class Prometheus:
     # background texture, not a significant event (§5.1, §9 risk 7).
     SELF_STUDY_DOPAMINE_BUMP = 0.03
 
-    # Self-study arousal/dominance touch (new, this revision). Previously
-    # self-study ONLY ever touched dopamine -- adrenaline, cortisol, and
-    # testosterone (the hormones driving the arousal and dominance PAD
-    # axes, §2.1a) never moved from autonomous activity at all. Confirmed
-    # at production scale (2700+ nodes, almost entirely self-study-driven
-    # growth): those hormones simply decayed toward the 0.5 baseline every
-    # tick with nothing ever counteracting it, so only valence showed any
-    # autonomous movement. Fixed with a single small adrenaline touch --
-    # per hormonal.py's own raw-variable mapping (get_raw_variables),
-    # adrenaline alone already feeds BOTH heart_rate (arousal) and
-    # vascular_constriction (dominance), so one bump addresses both frozen
-    # axes without a second hormone. Deliberately does NOT touch
-    # testosterone: it's a slow-layer hormone (meant to represent
-    # temperament, shifted only deliberately via shift_slow_baseline,
-    # currently just at epoch transitions), not something that should
-    # move live on every self-study tick -- same boundary already
-    # respected when designing the parental-feedback mechanism (§13.2).
-    # An order of magnitude smaller than the dopamine bump, so valence
-    # stays the clearly dominant self-study signal (curiosity/
-    # satisfaction, per §5.1's own framing) -- this just keeps arousal/
-    # dominance from going completely flat during long batch-only runs,
-    # it doesn't make self-study a real driver of felt-state exploration
-    # the way genuine engagement is.
-    SELF_STUDY_AROUSAL_BUMP = 0.005
-
-    # Hormonal reaction to real input -- new, this revision. §5.1 has
-    # always described self-study's dopamine bump as "scaled down
-    # deliberately relative to externally-triggered deltas," but no
-    # externally-triggered delta mechanism existed anywhere in the code:
-    # _ingest() ran sensory/association/chronos logic and never touched
-    # bio._hormones at all. Ordinary conversation produced zero hormonal
-    # response -- the PAD landscape had nothing to disturb it except
-    # decay-toward-baseline, self-study's faint trickle, and manual
-    # Stimulus triggers, which is almost certainly why felt-state movement
-    # read as flat. Fixed via _react_to_input() (§ Core Emergence
-    # Principle note there): deterministic, rule-based reaction keyed off
-    # signals sensory.py already computes (message length as an intensity
-    # proxy, detected relational/negation edges as emotional-salience
-    # signals) -- no new NLP/sentiment inference, consistent with the
-    # engine's no-black-box constraint. Deliberately larger than
-    # self-study's bump, restoring the size relationship §5.1 always
-    # assumed but which the code never actually implemented. Same
-    # "not yet numerically tuned" placeholder status as everything else
-    # (§10) -- these are first-pass values, not claimed-final.
-    ENGAGEMENT_DOPAMINE_BUMP = 0.08
-    ENGAGEMENT_AROUSAL_SCALE = 0.05       # scaled by message length, capped
-    ENGAGEMENT_LENGTH_NORMALIZER = 100.0  # chars; length_factor = min(len/this, 1.0)
-    RELATIONAL_CORTISOL_BUMP = 0.05       # violates / responsible-for: stress/guilt-adjacent
-    RELATIONAL_AROUSAL_BUMP = 0.04        # concerns-other: social salience
-    TEMPORAL_CONTRAST_DOPAMINE_DELTA = 0.03  # temporal-contrast: bittersweet/nostalgia-adjacent
-    NEGATION_CORTISOL_BUMP = 0.05         # being corrected is mildly stressful
-
-    # Parental emotional feedback (§13.2, new) -- "mirror neuron" style
-    # implicit guidance. The reaction itself is JUST a small, deterministic
-    # hormone nudge (same fast-layer-only pattern as ENGAGEMENT_* above --
-    # slow-layer/temperament drift from repeated reactions is a plausible
-    # future extension, deliberately not built here, to keep this change
-    # the same size/shape as the proven _react_to_input pattern rather
-    # than opening a second new mechanism at once). What makes this
-    # *learning* rather than just mood noise is VALENCE_COLORING_STEP,
-    # applied separately in give_parental_reaction() to whichever node(s)
-    # are the CURRENT felt-state anchor -- see archivist.nudge_valence_
-    # coloring()'s docstring. No word or category ever gets a hand-
-    # assigned valence anywhere in this mechanism; coloring only
-    # accumulates through repeated real co-occurrence.
-    PARENTAL_APPROVAL_DOPAMINE = 0.06
-    PARENTAL_DISAPPROVAL_CORTISOL = 0.06
-    PARENTAL_WARMTH_DOPAMINE = 0.05
-    PARENTAL_WARMTH_CORTISOL_RELIEF = 0.03   # warmth also mildly *reduces* cortisol (safety)
-    PARENTAL_CONCERN_AROUSAL = 0.05
-    PARENTAL_CONCERN_CORTISOL = 0.03
-    VALENCE_COLORING_STEP = 0.15
-    VALENCE_COLORING_CAP = 1.0
-
-    # Self-study saturation fix (this revision). Retry a few different
-    # candidates within the same tick before giving up entirely, rather
-    # than wasting the whole tick on one dead-end pick. The soft cap is an
-    # escape valve: once the strict out_degree<3 pool (see
-    # _select_self_study_target) is fully exhausted -- every remaining
-    # non-barren node already at the cap -- allow a bounded amount of
-    # further growth rather than permanently halting, without reopening
-    # unlimited runaway-hub growth the strict cap exists to prevent.
-    SELF_STUDY_MAX_ATTEMPTS = 3
-    SELF_STUDY_SOFT_CAP = 6
-
-    # Bias-modulated self-study targeting (§13.1, new -- designed but
-    # never built until this revision; executive.py's EXPLORE/STABILIZE/
-    # NEUTRAL bias signal was computed every tick and logged, but nothing
-    # ever consumed it, §10 item 23). Two independent effects, both
-    # expressing the same "explore = novelty, stabilize = depth" idea:
-    # (a) which tier-pool self-study draws from (below), and (b)
-    # _weighted_choice_by_activation's weighting direction within that
-    # pool (inverted under EXPLORE -- see that method's docstring).
-    # SELF_STUDY_PROVISIONAL_PROB_NEUTRAL preserves the old hardcoded 0.6
-    # default exactly, so NEUTRAL bias reproduces prior behavior bit for
-    # bit. Same "not yet numerically tuned" placeholder status as
-    # everything else (§10).
-    SELF_STUDY_PROVISIONAL_PROB_EXPLORE = 0.8
-    SELF_STUDY_PROVISIONAL_PROB_STABILIZE = 0.3
-    SELF_STUDY_PROVISIONAL_PROB_NEUTRAL = 0.6
-
-    # Activation / working-memory rendering default (§11 pull-forward,
-    # this revision). How many top-activation nodes the Graph tab renders
-    # by default, before a "show full graph" opt-in override.
-    WORKING_MEMORY_DEFAULT_SIZE = 40
-    # Self-study's own activation touch, deliberately smaller than
-    # archivist.ACTIVATION_BOOST (the default used for real input) --
-    # same gentler-than-external-input pattern as SELF_STUDY_DOPAMINE_BUMP.
-    ACTIVATION_BOOST_SELF_STUDY = 0.4
-
     # §6.1 / §6.2 gate parameters. Same "not yet numerically tuned"
     # category as everything else in §10 -- placeholders, documented.
     NAMING_WINDOW = 20
@@ -181,12 +68,6 @@ class Prometheus:
         self.sensory = SensoryModule()
         self.association = AssociationEngine(self.archivist, self.sensory)
         self.stimulus = SyntheticStimulusEngine(self.bio, self.archivist, self.reflector)
-        self.working_memory = WorkingMemoryModule(self.archivist, self.synthesizer)
-
-        # Barren self-study targets that fell out of dead-end detection's
-        # proxy check (§14.6 item 2) need the same tracking self-study's
-        # own barren set already uses -- reuse it directly rather than a
-        # second structure, see _self_study()'s Childhood-gating block.
 
         self.pulse_count = 0
         self.fatigue = 0.0
@@ -194,48 +75,8 @@ class Prometheus:
 
         # Per-basin anchor nodes accumulated as input is ingested under a
         # given felt state (§4.2's "stable felt-state -> node anchor
-        # established in Childhood"). {basin_key: deque(maxlen=ANCHOR_WINDOW_SIZE)}
-        #
-        # Bug fix (this revision): previously a plain, unbounded list,
-        # appended to on every qualifying tick by both _ingest() and
-        # _self_study() with no cap and no dedup. Over thousands of
-        # pulses in a popular felt state, this list could grow into the
-        # hundreds -- and since app.py's Graph tab and _apply_regulation
-        # both pass the *entire* list as always_include /
-        # eligible-candidate scoping, it eventually swamped both the
-        # top-K activation filter (Graph tab rendering never actually
-        # stayed focused at scale) and regulation's tier-restricted
-        # candidate pool (drifting back toward "most of the graph," the
-        # same class of problem the original anchor-scoping fix addressed
-        # earlier this session). Every other rolling-history structure in
-        # this design (chronos's log, basin dwell-time decay) is
-        # deliberately bounded, not unbounded -- this one was an
-        # oversight that never got the same treatment. Fixed with a
-        # bounded deque per basin via _record_anchor().
+        # established in Childhood"). {basin_key: [node, ...]}
         self.felt_state_anchors = {}
-        self.ANCHOR_WINDOW_SIZE = 20  # same tuning-placeholder category as everything else (§10)
-
-        # Co-activation broadening (§13.3, new). Diagnosed from production
-        # data (18 tracked pairs / 0 stabilized after 3833 pulses, 3355
-        # nodes): the original co-activation sources (a self-study cycle's
-        # target+children, an ingestion's node+anchor) each only ever fire
-        # ONCE per target's effective lifetime, because self-study's
-        # degree cap excludes a target from future selection almost
-        # immediately after it's touched -- so most pairs got exactly one
-        # chance to accumulate, never a second or third, and could never
-        # cross CO_ACTIVATION_STABILIZATION_THRESHOLD (3) regardless of
-        # how long the system ran. Fixed in _record_anchor(): every time
-        # any node gets anchored to a felt state, it's ALSO paired with
-        # the most recent few distinct anchors already in that felt
-        # state's window -- since felt states get genuinely revisited
-        # over a run (§2.1a's whole premise), this gives pairs many more
-        # natural chances to recur, not just one. Deliberately bounded to
-        # a SMALL recent window, not the full ANCHOR_WINDOW_SIZE history:
-        # pairing a new touch with all 20 prior anchors would make
-        # co-activation nearly synonymous with "ever anchored to the same
-        # felt state," diluting a signal meant to capture genuine,
-        # temporally-close recurrence into something closer to noise.
-        self.CO_ACTIVATION_RECENCY_WINDOW = 3
 
         # Pending regulation attempts awaiting efficacy evaluation at the
         # next Consolidation pass (§4.5: "evaluated during Consolidation
@@ -251,21 +92,6 @@ class Prometheus:
         # tick; when empty, self-study fires instead (§5.1).
         self._input_queue = []
 
-        # Self-study saturation fix (this revision, found from production
-        # data: node growth stalled ~104 nodes despite thousands of
-        # Learning-state pulses, throughput ~0.1 edges/pulse). Root cause:
-        # has_room()'s out_degree<3 cap is deliberate (prevents runaway
-        # hub growth, see _select_self_study_target's docstring), but
-        # self-study had no memory of which capped-out-of-room OR
-        # zero-hyponym ("barren") nodes it had already tried. Once the
-        # few productive, many-hyponym hub words hit the degree cap, a
-        # growing fraction of random picks landed on WordNet leaf terms
-        # (e.g. "brougham", "trolley coach" -- real hyponyms of "bus", but
-        # themselves childless) that silently produce nothing, forever,
-        # since the same dead ends kept getting re-picked. Tracked here so
-        # a verified-empty target is never re-selected again.
-        self._barren_self_study_targets = set()
-
         print("Prometheus Core Initialized with Fatigue Cycling")
 
     # ------------------------------------------------------------------
@@ -274,68 +100,9 @@ class Prometheus:
     def queue_input(self, text: str, source: str = "user"):
         self._input_queue.append((text, source))
 
-    def _record_anchor(self, basin_key, node: str):
-        """Bounded write path for felt_state_anchors (this revision's fix
-        for the unbounded-growth bug -- see the field's own docstring at
-        __init__). Every write to felt_state_anchors goes through here now,
-        so there's exactly one place that could reintroduce unbounded
-        growth, not three scattered call sites.
-
-        Co-activation broadening (§13.3, new -- see CO_ACTIVATION_
-        RECENCY_WINDOW's docstring at __init__ for the full diagnosis).
-        Before appending, pairs the new node with the most recent
-        CO_ACTIVATION_RECENCY_WINDOW *distinct* anchors already recorded
-        for this felt state. Distinct, not just "last N raw entries" --
-        the deque can (and does) contain repeats of the same node, and
-        pairing against repeats of one node wastes the bounded window on
-        redundant pairs instead of genuinely different recent context."""
-        if basin_key not in self.felt_state_anchors:
-            self.felt_state_anchors[basin_key] = deque(maxlen=self.ANCHOR_WINDOW_SIZE)
-
-        existing = self.felt_state_anchors[basin_key]
-        if existing:
-            recent_distinct = []
-            seen = set()
-            for n in reversed(existing):
-                if n not in seen:
-                    seen.add(n)
-                    recent_distinct.append(n)
-                if len(recent_distinct) >= self.CO_ACTIVATION_RECENCY_WINDOW:
-                    break
-            self.archivist.record_co_activation(recent_distinct + [node])
-
-        self.felt_state_anchors[basin_key].append(node)
-
-    def _get_unique_anchors(self, basin_key) -> List[str]:
-        """Bug fix, this revision (found from production data): the
-        anchor deque is a touch LOG, not a set -- it can and does contain
-        the same node multiple times (self-study re-touches its target
-        every cycle it's re-selected). Every consumer that applies a
-        per-node side effect to "the current anchors" -- regulation's
-        activation bump and regulatory-efficacy update, parental
-        feedback's valence-coloring nudge -- was previously iterating the
-        raw list directly, so a node appearing N times in the window got
-        that side effect applied N times within a SINGLE event. Concrete
-        symptom: a single Parental Feedback click reported "20 node(s)
-        colored" but the Reflection tab showed only 3 nodes with any
-        coloring at all, two of them already pinned at the cap -- because
-        those 2-3 nodes each appeared many times in the 20-entry window,
-        each repeat re-applying the same nudge in one click, while the
-        toast counted raw entries, not distinct nodes. Undermines the
-        entire "accumulates only through genuinely repeated, SEPARATE
-        co-occurrence events over time" property this mechanism depends
-        on (§13.2). Order-preserving dedup (most-recent-first callers
-        don't currently rely on order here, but preserving it is free and
-        avoids surprising anyone who later does)."""
-        return list(dict.fromkeys(self.felt_state_anchors.get(basin_key, [])))
-
     def _ingest(self, text: str, source: str):
         """Runs one piece of text through sensory + association + chronos
-        linking. Despite this docstring previously claiming to be "shared
-        by both externally-queued input and self-study," it never
-        actually was -- _self_study() has always called
-        association.place_node() directly, bypassing this method
-        entirely. Corrected here rather than left misleading."""
+        linking. Shared by both externally-queued input and self-study."""
         self.sensory.ingest(text)
         basin_key = self.synthesizer.get_current_basin_key()
         felt_state = self.synthesizer.get_current_felt_state()
@@ -346,15 +113,20 @@ class Prometheus:
 
         result = self.association.place_node(text, definition="", source=source, context_node=anchor)
         node = result.get("term")
+
+        # Bug fix ("working memory wanders from user prompts"): mark this
+        # node -- and whatever it got placed under -- as conversationally
+        # active *now*. association.py's co-occurrence fallback
+        # (_most_active_node) reads only this field, not last_reinforced,
+        # specifically so self-study's constant background reinforcement
+        # (which legitimately bumps last_reinforced for trust/decay
+        # purposes, §5.1) can never make an unrelated node look like "what
+        # the user was just talking about." Self-study never calls
+        # touch_conversational -- this is the only call site.
         if node:
-            self.archivist.bump_activation(node)
-        if anchor:
-            self.archivist.bump_activation(anchor)
-        # Co-activation (§13.3, new): node and anchor were touched in the
-        # same event -- the raw signal epistemic schema clustering
-        # depends on. A no-op if anchor is None (fewer than 2 real nodes).
-        if node and anchor:
-            self.archivist.record_co_activation([node, anchor])
+            self.archivist.touch_conversational(node)
+            if result.get("parent"):
+                self.archivist.touch_conversational(result["parent"])
 
         # §2.1b item 4a: try to name any unnamed schemas tied to the felt
         # state active right now (schema naming trigger when user/dictionary
@@ -364,144 +136,20 @@ class Prometheus:
 
         relations = self.sensory.detect_relational(text)
         if relations:
-            self.association.link_relational(node, relations, source=source, felt_state=felt_state)
+            self.association.link_relational(node, relations, source=source)
 
         if felt_state != "Unformed" and node:
             self.chronos.record_felt_state_link(basin_key, node)
-            self._record_anchor(basin_key, node)
+            self.felt_state_anchors.setdefault(basin_key, []).append(node)
 
         # Explicit negation/correction (§3.4 mechanism 1): flag whatever
         # node was most recently active for gradual demotion at the next
         # Consolidation pass.
         text_lower = text.lower()
-        negation_flagged = ("no, " in text_lower or "actually" in text_lower or "that's wrong" in text_lower)
-        if negation_flagged and anchor:
+        if ("no, " in text_lower or "actually" in text_lower or "that's wrong" in text_lower) and anchor:
             self.archivist.flag_negation(anchor)
 
-        # Hormonal reaction to real input (new, this revision) -- only for
-        # genuine externally-triggered input, not dictionary-sourced
-        # self-study expansion text, which self-study's own (deliberately
-        # smaller) dopamine bump already covers separately.
-        if source == "user":
-            self._react_to_input(text, relations, negation_flagged)
-
         return node
-
-    def _react_to_input(self, text: str, relations: List[str], negation_flagged: bool):
-        """Deterministic, rule-based hormonal reaction to real
-        conversational input (§ Core Emergence Principle: this must stay
-        rule-based, no sentiment-analysis/NLP model -- the same
-        constraint that already governs sensory.py's negation/relational
-        detection). Fixes the root cause behind "minimal emotional
-        movement": previously nothing in _ingest() touched bio._hormones
-        at all, so ordinary conversation produced zero somatic reaction --
-        only self-study's faint trickle and manual Stimulus events ever
-        moved the PAD landscape away from its decay-toward-baseline
-        equilibrium.
-
-        Signals used, all already computed elsewhere (no new inference):
-          - message length, as a coarse intensity/engagement proxy (longer
-            messages read as more arousing/engaging, not "understood" in
-            any semantic sense -- just a deterministic magnitude signal).
-          - detected relational edges (§2.1b, via sensory.detect_relational,
-            already called by the caller): violates/responsible-for read
-            as stress/guilt-adjacent (cortisol up); concerns-other reads
-            as socially salient (mild arousal up); temporal-contrast reads
-            as bittersweet/nostalgia-adjacent (small dopamine shift).
-          - explicit negation/correction (§3.4): being corrected is mildly
-            stressful (cortisol up).
-        Every delta is small and clamped -- this is meant to restore
-        *some* reactivity, not replace Stimulus's deliberate, larger
-        manual events."""
-        length_factor = min(len(text) / self.ENGAGEMENT_LENGTH_NORMALIZER, 1.0)
-
-        with self.bio.lock:
-            h = self.bio._hormones
-            h["dopamine"] = min(1.0, h["dopamine"] + self.ENGAGEMENT_DOPAMINE_BUMP)
-            h["adrenaline"] = min(1.0, h["adrenaline"] + self.ENGAGEMENT_AROUSAL_SCALE * length_factor)
-
-            if "violates" in relations or "responsible-for" in relations:
-                h["cortisol"] = min(1.0, h["cortisol"] + self.RELATIONAL_CORTISOL_BUMP)
-            if "concerns-other" in relations:
-                h["adrenaline"] = min(1.0, h["adrenaline"] + self.RELATIONAL_AROUSAL_BUMP)
-            if "temporal-contrast" in relations:
-                h["dopamine"] = min(1.0, h["dopamine"] + self.TEMPORAL_CONTRAST_DOPAMINE_DELTA)
-            if negation_flagged:
-                h["cortisol"] = min(1.0, h["cortisol"] + self.NEGATION_CORTISOL_BUMP)
-
-    # Fixed, small, closed vocabulary of reaction types -- deliberately
-    # not free-text sentiment interpretation (that would need its own
-    # deterministic keyword layer, same as sensory.py's existing
-    # negation/relational detectors, and is a natural but separate
-    # future extension, not built here). This is a UI-level vocabulary
-    # (which button was clicked), not a knowledge-graph vocabulary -- it
-    # never names or asserts anything about a concept, only nudges
-    # somatic state and (separately) an existing node's coloring.
-    _PARENTAL_REACTION_TYPES = ("approval", "disapproval", "warmth", "concern")
-
-    def give_parental_reaction(self, reaction_type: str):
-        """
-        §13.2, new: implicit parental emotional guidance, "mirror neuron"
-        style. Two independent effects, deliberately kept separate:
-
-        1. A small, deterministic, fast-layer-only hormone nudge -- same
-           shape and magnitude class as _react_to_input(), fires live
-           (not queued/Consolidation-gated), matching how every other
-           somatic reaction in this design works (Stimulus's manual
-           trigger, self-study's dopamine bump, _react_to_input).
-
-        2. A valence_coloring nudge (archivist.nudge_valence_coloring) on
-           whichever node(s) are the CURRENT felt-state anchor -- i.e.
-           whatever the system was just "thinking about" when the
-           reaction arrived. This is the actual learning mechanism: no
-           word or category is ever assigned a valence directly here or
-           anywhere else in this design. A node's coloring only moves
-           because it happened to be active at the same moment a reaction
-           occurred, repeated over many interactions -- genuine earned
-           association, consistent with every other "no predetermined
-           categories" constraint in this spec (§2.1a, §2.1b, §13.3.1).
-
-        This method does NOT create, name, or otherwise touch the
-        knowledge graph's structure -- only existing nodes' coloring, and
-        only if something is currently anchored. If nothing is anchored
-        yet (e.g. very early in Childhood, before any basin has
-        stabilized), effect (1) still fires but effect (2) is a no-op --
-        a legitimate, non-error state, same as regulation's "nothing
-        eligible yet" case (§4.2).
-        """
-        if reaction_type not in self._PARENTAL_REACTION_TYPES:
-            raise ValueError(f"Unknown parental reaction type: {reaction_type!r}")
-
-        with self.bio.lock:
-            h = self.bio._hormones
-            if reaction_type == "approval":
-                h["dopamine"] = min(1.0, h["dopamine"] + self.PARENTAL_APPROVAL_DOPAMINE)
-            elif reaction_type == "disapproval":
-                h["cortisol"] = min(1.0, h["cortisol"] + self.PARENTAL_DISAPPROVAL_CORTISOL)
-            elif reaction_type == "warmth":
-                h["dopamine"] = min(1.0, h["dopamine"] + self.PARENTAL_WARMTH_DOPAMINE)
-                h["cortisol"] = max(0.0, h["cortisol"] - self.PARENTAL_WARMTH_CORTISOL_RELIEF)
-            elif reaction_type == "concern":
-                h["adrenaline"] = min(1.0, h["adrenaline"] + self.PARENTAL_CONCERN_AROUSAL)
-                h["cortisol"] = min(1.0, h["cortisol"] + self.PARENTAL_CONCERN_CORTISOL)
-
-        coloring_delta = {
-            "approval": self.VALENCE_COLORING_STEP,
-            "disapproval": -self.VALENCE_COLORING_STEP,
-            "warmth": self.VALENCE_COLORING_STEP * 0.7,
-            "concern": -self.VALENCE_COLORING_STEP * 0.5,
-        }[reaction_type]
-
-        key = self.synthesizer.get_current_basin_key()
-        unique_anchors = self._get_unique_anchors(key)
-        for n in unique_anchors:
-            self.archivist.nudge_valence_coloring(n, coloring_delta, cap=self.VALENCE_COLORING_CAP)
-            # A reaction landing on a node is itself a form of touch --
-            # feeds the same activation/working-memory signal as any
-            # other interaction with it (§11 pull-forward).
-            self.archivist.bump_activation(n)
-
-        return {"reaction": reaction_type, "anchors_colored": unique_anchors}
 
     # ------------------------------------------------------------------
     # Main tick
@@ -549,7 +197,7 @@ class Prometheus:
             avd=self.synthesizer.get_current_basin_key(),
         )
 
-        self._update_fatigue()
+        self._update_fatigue(somatic)
         self._cycle_state()
         self.maybe_advance_epoch()
 
@@ -577,110 +225,40 @@ class Prometheus:
         directly drain a fatigue counter -- it triggers a small hormonal
         reaction (dopamine bump) through the normal fast-layer pathway,
         and fatigue rises as a *consequence* of that, same as everything
-        else (§5.1).
+        else (§5.1)."""
+        target = self._select_self_study_target()
+        if target is None:
+            return
 
-        Saturation fix (this revision): previously picked exactly one
-        target and gave up silently if it had no WordNet hyponyms, with
-        no memory of the attempt -- so once the graph's few productive,
-        many-hyponym hub words hit the degree cap, an increasing fraction
-        of ticks landed on WordNet leaf terms (real hyponyms with no
-        hyponyms of their own) and produced nothing, forever, because the
-        same dead ends kept getting re-picked. Now retries up to
-        SELF_STUDY_MAX_ATTEMPTS different candidates per tick and
-        memoizes any confirmed-barren target in
-        self._barren_self_study_targets, permanently excluding it from
-        future selection (see _select_self_study_target's has_room)."""
-        target = None
-        expansions = []
-        for _ in range(self.SELF_STUDY_MAX_ATTEMPTS):
-            target = self._select_self_study_target()
-            if target is None:
-                return
-            expansions = self.sensory.lookup_expansion(target)
-            if expansions:
-                break
-            # Verified dead end -- memoize so this specific node is never
-            # wastefully re-picked again, freeing the random-selection
-            # pool toward nodes that can actually still produce children.
-            self._barren_self_study_targets.add(target)
-            target = None
+        expansions = self.sensory.lookup_expansion(target)
+        if not expansions:
+            return
 
-        if target is None or not expansions:
-            return  # every attempt this tick hit a confirmed dead end
-
-        # Anchor fix (this revision, found from production data after the
-        # regulation-eligibility fix): felt_state_anchors was previously
-        # only ever populated inside _ingest(), which only runs for
-        # explicitly queued user/dictionary input -- despite _ingest's own
-        # docstring claiming to be "shared by both externally-queued input
-        # and self-study" (it never actually was). Under typical usage,
-        # the overwhelming majority of Learning ticks are self-study, not
-        # queued input (Run Batch queues nothing), so felt_state_anchors
-        # stayed effectively empty. Once regulation was correctly scoped
-        # to anchored nodes only (previous fix), this meant it almost
-        # always found zero eligible candidates instead of the whole
-        # graph -- regulatory efficacy sitting at the untouched 0.5
-        # default for every node, never exercised at all, which is worse
-        # than the original bug in practice even though more "correct."
-        # Fixed by recording the same felt-state -> node anchor link
-        # _ingest() does, for self-study's own placements.
-        basin_key = self.synthesizer.get_current_basin_key()
-        felt_state = self.synthesizer.get_current_felt_state()
-        placed_children = []
+        # Bug fix: both calls below previously used source="dictionary".
+        # §2.2 requires self-generated content to be tagged
+        # "self_generated" specifically so it (a) starts at the lower
+        # self_generated trust weight rather than dictionary's, and (b) is
+        # excluded from the diversity signal at trust-scoring time
+        # (archivist._trust_score only excludes source=="self_generated")
+        # -- this is the enforcement §9 risk 5 says was still missing.
+        # Content is still dictionary-*sourced* (via WordNet), which is
+        # fine and expected (§2.2: "dictionary-sourced by content, but
+        # tagged distinctly") -- only the trust/provenance tag changes.
         for child in expansions[:3]:
             definition = self.sensory.lookup_definition(child) or ""
-            result = self.association.place_node(
-                child, definition=definition, source="dictionary",
-                context_node=target, max_parent_children=self.SELF_STUDY_SOFT_CAP,
-            )
-            placed_children.append(result.get("term") or child)
-        self.archivist.store(target, source="dictionary")  # reinforce parent's last_reinforced
-
-        # Co-activation (§13.3, new): target and its newly-placed children
-        # were all touched in the same self-study cycle -- record every
-        # pairwise combination among them. This is the primary source of
-        # co-activation data in practice, since self-study runs far more
-        # often than real input in typical usage.
-        self.archivist.record_co_activation([target] + placed_children)
-
-        if felt_state != "Unformed":
-            for child_node in placed_children:
-                self.chronos.record_felt_state_link(basin_key, child_node)
-                self._record_anchor(basin_key, child_node)
-            # `target` recurs across multiple self-study ticks (until it
-            # hits the degree cap), unlike each tick's freshly-created
-            # children -- anchoring it too gives §6.1's naming-reliability
-            # check and §4.2's regulation candidate pool a genuinely
-            # consistent, repeatedly-reinforced node to work with, not
-            # just a growing list of one-off terms.
-            self.chronos.record_felt_state_link(basin_key, target)
-            self._record_anchor(basin_key, target)
-
-        # Activation touch (§11 pull-forward, this revision) -- smaller
-        # than real input's default bump (archivist.ACTIVATION_BOOST),
-        # same "gentler than externally-triggered" pattern already used
-        # for the hormonal bump just below.
-        self.archivist.bump_activation(target, self.ACTIVATION_BOOST_SELF_STUDY)
-        for child_node in placed_children:
-            self.archivist.bump_activation(child_node, self.ACTIVATION_BOOST_SELF_STUDY)
+            self.association.place_node(child, definition=definition, source="self_generated",
+                                         context_node=target)
+        self.archivist.store(target, source="self_generated")  # reinforce parent's last_reinforced
 
         # Small, scaled-down dopaminergic bump (§5.1, §9 risk 7) via the
         # same fast-layer pathway as any other event -- no bespoke
-        # self-study fatigue tap. Also a small adrenaline touch (new, this
-        # revision) -- see SELF_STUDY_AROUSAL_BUMP's docstring for why:
-        # without this, arousal and dominance never moved at all during
-        # autonomous-only activity, only valence did. Adrenaline alone
-        # covers both axes (heart_rate + vascular_constriction), so no
-        # separate testosterone touch is needed or appropriate.
+        # self-study fatigue tap.
         with self.bio.lock:
             self.bio._hormones["dopamine"] = min(
                 1.0, self.bio._hormones["dopamine"] + self.SELF_STUDY_DOPAMINE_BUMP
             )
-            self.bio._hormones["adrenaline"] = min(
-                1.0, self.bio._hormones["adrenaline"] + self.SELF_STUDY_AROUSAL_BUMP
-            )
 
-    def _select_self_study_target(self, hard_cap: int = 3):
+    def _select_self_study_target(self):
         """(a) active/trusted nodes with few children, or (b) emotionally
         salient nodes weighted by *current* felt state (§5.1) -- historical
         emotional weighting stays inside Consolidation, not here.
@@ -702,63 +280,16 @@ class Prometheus:
         node could never be selected for self-study in the first place.
         This is why user input sat in a disconnected, unexpanded chain
         while dictionary hubs absorbed all self-study attention.
-
-        Third fix, this revision: "room" is now counted on categorical
-        out-edges only (is-a/part-of/associated-with), not relational
-        (responsible-for/violates/etc.) or composed-of edges -- a node
-        shouldn't be treated as "full" for hierarchy-branching purposes
-        because it happens to carry unrelated relational/schema edges.
-        Also excludes any node memoized in self._barren_self_study_targets
-        (confirmed zero WordNet hyponyms, §5.1 saturation fix) so dead
-        ends stop consuming picks from the random-selection pool.
-
-        Fourth fix, this revision (§11 pull-forward, in response to "learn
-        from a focused group" -- previously self-study picked uniformly at
-        random within each eligible pool, which is closer to weighted-
-        random than genuine attention/focus, per §11's own critique of
-        itself). Selection within working_candidates/provisional_candidates
-        is now weighted by each node's activation score (§ archivist.py's
-        new activation layer) via _weighted_choice_by_activation() --
-        nodes touched recently (real input, prior self-study, regulation
-        use) are preferentially re-expanded, while an epsilon floor keeps
-        untouched nodes from being permanently excluded (still
-        exploration, not pure exploitation).
-
-        `hard_cap` lets the (e) escape-valve fallback below retry with a
-        looser ceiling once the strict cap has genuinely exhausted every
-        productive node, rather than permanently halting growth.
-
-        §14, new: working-memory-aware targeting. In Childhood, self-study
-        candidates are hard-restricted to whatever's currently reachable
-        from working memory (SELF/basin/schema slots, §14.1) -- the direct
-        mechanism behind "stored-schema expansion heavily suppressed,
-        permitted only on clear dead-ends" (§14.2), and the fix for
-        self-study drifting arbitrarily far from what the user actually
-        taught (colors in, Hundred Years' War never comes up, because the
-        small working-memory buffer stays close to real input this early).
-        The dead-end check is is_dead_end()'s documented PROXY (§14.6 item
-        2 -- genuinely unresolved as a full mechanism, not just untuned;
-        see that method's docstring), not the fully-resolved design. In
-        Adolescence/Maturity, working-memory contents are boosted in the
-        weighted choice instead of hard-gating -- matching §14.2's
-        "transitional"/"no longer monopolizing" framing.
         """
         graph = self.archivist.graph
         if graph.number_of_nodes() == 0:
             return None
 
-        epoch_value = self.bio.epoch.value
-        key = self.synthesizer.get_current_basin_key()
-        basin_anchors = self._get_unique_anchors(key)
-        wm = self.working_memory.get_working_memory(epoch_value, basin_anchors)
-        in_scope_nodes = self.working_memory.reachable_nodes(wm)
-
         def has_room(n, d):
             return (
-                self.archivist.categorical_out_degree(n) < hard_cap
+                graph.out_degree(n) < 3
                 and not d.get("is_schema")
                 and n not in (SELF_NODE, OTHER_NODE)
-                and n not in self._barren_self_study_targets
             )
 
         working_candidates = [
@@ -775,53 +306,25 @@ class Prometheus:
             if d.get("tier", 0) < TIER_WORKING and d.get("source") != "self_generated" and has_room(n, d)
         ]
 
-        # §14: Childhood hard-gate, unless the dead-end proxy fires.
-        if epoch_value == "Childhood":
-            dead_end = self.working_memory.is_dead_end(
-                wm, lambda n: has_room(n, graph.nodes.get(n, {})), self._barren_self_study_targets,
-            )
-            if not dead_end:
-                working_candidates = [n for n in working_candidates if n in in_scope_nodes]
-                provisional_candidates = [n for n in provisional_candidates if n in in_scope_nodes]
-
-        # Bias-modulated pool selection (§13.1, new). NEUTRAL reproduces
-        # the old hardcoded 0.6 exactly -- this is a strict extension, not
-        # a behavior change, for anyone who hasn't touched the bias signal.
-        bias = self.executive.current_bias
-        provisional_prob = {
-            "BIAS_EXPLORE": self.SELF_STUDY_PROVISIONAL_PROB_EXPLORE,
-            "BIAS_STABILIZE": self.SELF_STUDY_PROVISIONAL_PROB_STABILIZE,
-        }.get(bias, self.SELF_STUDY_PROVISIONAL_PROB_NEUTRAL)
-
-        # §14: outside Childhood, working-memory contents are boosted in
-        # the weighted choice rather than hard-gated -- "transitional"/
-        # "no longer monopolizing" per §14.2. Childhood already hard-gated
-        # the pools themselves above, so no additional boost is needed
-        # there (and would be redundant, since everything left in-pool is
-        # already in scope).
-        boost_set = in_scope_nodes if epoch_value != "Childhood" else None
-
         if working_candidates and provisional_candidates:
-            # Weighted toward provisional under NEUTRAL/default: established
-            # hubs already got their initial attention, fresh nodes need it
-            # more. Under EXPLORE/STABILIZE, the ratio shifts instead per
-            # provisional_prob above. Not a tuned ratio (§10) either way.
-            pool = provisional_candidates if random.random() < provisional_prob else working_candidates
-            return self._weighted_choice_by_activation(pool, bias=bias, boost_set=boost_set)
+            # Weighted toward provisional: established hubs already got
+            # their initial attention, fresh nodes need it more. Not a
+            # tuned ratio (§10) -- worth a slider if this needs finer
+            # control later.
+            pool = provisional_candidates if random.random() < 0.6 else working_candidates
+            return random.choice(pool)
         if provisional_candidates:
-            return self._weighted_choice_by_activation(provisional_candidates, bias=bias, boost_set=boost_set)
+            return random.choice(provisional_candidates)
         if working_candidates:
-            return self._weighted_choice_by_activation(working_candidates, bias=bias, boost_set=boost_set)
+            return random.choice(working_candidates)
 
         # (c) fallback: whatever node is currently anchoring the felt
         # state, if any -- but only if it also still has room. Previously
         # uncapped, which was the main source of runaway single-node growth.
-        # Uses the RAW deque here (not basin_anchors, which is deduped and
-        # doesn't preserve most-recent-last order) so `[-1]` still means
-        # "most recently touched," matching original behavior exactly.
-        raw_anchors = self.felt_state_anchors.get(key, [])
-        if raw_anchors:
-            anchor = raw_anchors[-1]
+        key = self.synthesizer.get_current_basin_key()
+        anchors = self.felt_state_anchors.get(key, [])
+        if anchors:
+            anchor = anchors[-1]
             if anchor in graph and has_room(anchor, graph.nodes[anchor]):
                 return anchor
 
@@ -830,81 +333,13 @@ class Prometheus:
         low_degree_any = [n for n, d in graph.nodes(data=True) if has_room(n, d)]
         if low_degree_any:
             return random.choice(low_degree_any)
-
-        # (e) escape valve (this revision): (a)-(d) all failed, meaning
-        # every non-barren node in the graph is already at hard_cap
-        # categorical children. Rather than permanently halting growth
-        # (the actual production symptom this fix addresses), retry once
-        # with a softer ceiling -- still bounded, so this doesn't reopen
-        # the unlimited-runaway-hub risk the strict cap exists to prevent,
-        # it just means "everything productive is capped" isn't a
-        # permanent dead end for the whole system.
-        if hard_cap < self.SELF_STUDY_SOFT_CAP:
-            return self._select_self_study_target(hard_cap=self.SELF_STUDY_SOFT_CAP)
-
         return None
-
-    def _weighted_choice_by_activation(self, pool: List[str], bias: str = "BIAS_NEUTRAL",
-                                        boost_set: Optional[set] = None) -> Optional[str]:
-        """Activation-weighted random choice (§11 pull-forward) --
-        replaces uniform random.choice() for self-study target selection
-        so recently-touched nodes are preferentially re-expanded, giving
-        self-study something closer to genuine attention/focus. An
-        epsilon floor (0.1) on every weight keeps untouched nodes
-        selectable at nonzero probability -- this stays exploration-with-
-        a-bias, not pure exploitation of whatever's already active, which
-        would risk narrowing the graph's growth to an ever-smaller hot
-        set over time.
-
-        `bias` (§13.1): under BIAS_EXPLORE, the weighting is inverted --
-        low-activation (novel, rarely-touched) nodes are preferred
-        instead, using ACTIVATION_CAP minus each node's activation as the
-        weight, same epsilon floor for the opposite reason (keeps a
-        saturated node selectable at nonzero probability rather than
-        fully excluded). BIAS_STABILIZE and BIAS_NEUTRAL both keep the
-        original high-activation-preferring weighting -- NEUTRAL
-        reproduces prior behavior exactly; STABILIZE reads as "deepen
-        what's already active," which is what the un-inverted weighting
-        already does.
-
-        `boost_set` (new, this revision -- §14): a multiplicative bonus
-        for nodes reachable from current working memory, used outside
-        Childhood (which hard-gates the candidate pools instead, so
-        nothing needs boosting there -- see _select_self_study_target).
-        Multiplicative rather than additive so it composes with whatever
-        the bias weighting already computed instead of overriding it --
-        a boosted node under BIAS_EXPLORE still respects the inverted
-        preference, just scaled up within it."""
-        if not pool:
-            return None
-        if bias == "BIAS_EXPLORE":
-            cap = self.archivist.ACTIVATION_CAP
-            weights = [
-                (cap - self.archivist.graph.nodes[n].get("activation", 0.0)) + 0.1 for n in pool
-            ]
-        else:
-            weights = [self.archivist.graph.nodes[n].get("activation", 0.0) + 0.1 for n in pool]
-        if boost_set:
-            weights = [w * 3.0 if n in boost_set else w for n, w in zip(pool, weights)]
-        return random.choices(pool, weights=weights, k=1)[0]
 
     # ------------------------------------------------------------------
     # Fatigue / state cycling
     # ------------------------------------------------------------------
-    def _update_fatigue(self):
-        """Fatigue growth (§5) previously read somatic.urgency directly --
-        the raw SomaticReadout returned by bio.step(), i.e. hidden-layer
-        output that bypasses synthesizer.py entirely. Every other
-        decision point in this file (regulation §4.1, executive bias) was
-        already careful to route only through
-        synthesizer.get_current_intensity(); fatigue was the one
-        exception, in real violation of the Core Emergence Principle
-        despite this file's own docstring/comments elsewhere insisting on
-        it. Fixed to use the same synthesized intensity signal (arousal
-        component of the current basin key, §2.1a) as everything else --
-        no raw hidden-layer read anywhere in this method now."""
-        intensity = self.synthesizer.get_current_intensity()
-        self.fatigue = min(1.0, self.fatigue + intensity * self.FATIGUE_GROWTH_RATE)
+    def _update_fatigue(self, somatic):
+        self.fatigue = min(1.0, self.fatigue + somatic.urgency * self.FATIGUE_GROWTH_RATE)
 
     def _cycle_state(self):
         """Hysteresis-banded state cycling (§5 stability requirement)."""
@@ -943,16 +378,6 @@ class Prometheus:
                 print(f"Pruning: removed {pruned} stale Tier-0 node(s).")
             self.fatigue *= self.FATIGUE_RECOVERY_PRUNING  # Recovery (§5: "fatigue must have its own recovery curve")
 
-    def get_current_working_memory(self) -> dict:
-        """§14 convenience wrapper -- supplies the current epoch and basin
-        anchors automatically, so app.py's diagnostic panel (and any
-        other caller) doesn't need to reconstruct them each time. Safe to
-        call every Reflection-tab render; get_working_memory() itself is
-        a cheap on-demand computation, not maintained incremental state."""
-        key = self.synthesizer.get_current_basin_key()
-        basin_anchors = self._get_unique_anchors(key)
-        return self.working_memory.get_working_memory(self.bio.epoch.value, basin_anchors)
-
     def _run_consolidation(self):
         """
         Everything the spec pins to the Consolidation clock, in one place
@@ -961,46 +386,10 @@ class Prometheus:
         principle (see conversation summary).
         """
         self.synthesizer.consolidate_basins()
-
-        # Bug fix, this revision: stabilized_basins was previously only
-        # ever a string mapping inside synthesizer.py -- no corresponding
-        # node ever existed in archivist.graph. Every schema's "linked
-        # back to its component basin" edge (reflector.detect_schemas)
-        # was silently falling back to SELF_NODE instead, since the basin
-        # string was never actually `in graph`. Sync real basin nodes here,
-        # before run_consolidation_pass (so they're correctly exempted
-        # from trust-tier evaluation, §6A) and before detect_schemas (so
-        # any schema formed this same pass has a real node to link to).
-        for basin_key, basin_id in self.synthesizer.stabilized_basins.items():
-            self.archivist.ensure_basin_node(
-                basin_id, pad_coordinates=basin_key,
-                dwell_density=self.synthesizer.basin_grid.get(basin_key, 0.0),
-            )
-
         trust_summary = self.archivist.run_consolidation_pass()
         reparented = self.association.run_reparenting_pass()
         new_schemas = self.reflector.detect_schemas()
         self._evaluate_pending_regulation()
-        # Activation decay (§11 pull-forward, this revision) -- same
-        # Consolidation clock as basin/trust/schema/efficacy evaluation,
-        # per the design's own "one clock, not several" principle.
-        self.archivist.decay_activation()
-
-        # §13.3, new: epistemic (knowledge-cluster) schema formation, same
-        # Consolidation clock as everything else. Detection runs BEFORE
-        # decay -- same ordering already used for basin stabilization
-        # (synthesizer.consolidate_basins() checks the stabilization
-        # threshold first, decays after, in that order, within one pass).
-        # An earlier version of this had the order backwards (decay first,
-        # then detect), which meant decay_co_activation()'s multiply
-        # could shrink a just-crossed-threshold count back below it
-        # before detection ever saw it at full value -- caught in testing
-        # before shipping. Naming scan runs last, after any new clusters
-        # this same pass have been created, so they're immediately
-        # eligible.
-        new_epistemic_schemas = self.reflector.detect_epistemic_clusters()
-        self.archivist.decay_co_activation()
-        newly_named_epistemic = self.reflector.try_name_epistemic_schemas()
 
         # §4C: the single checkpoint call for this pass -- everything
         # above mutates the graph and/or hormonal state without saving
@@ -1017,10 +406,6 @@ class Prometheus:
             print(f"Consolidation: re-parented {reparented} node(s).")
         if new_schemas:
             print(f"Consolidation: formed {len(new_schemas)} new Schema Node(s): {new_schemas}")
-        if new_epistemic_schemas:
-            print(f"Consolidation: formed {len(new_epistemic_schemas)} new Epistemic Schema Node(s): {new_epistemic_schemas}")
-        if newly_named_epistemic:
-            print(f"Consolidation: named {newly_named_epistemic} Epistemic Schema Node(s).")
 
     # ------------------------------------------------------------------
     # §4 Regulation
@@ -1035,41 +420,12 @@ class Prometheus:
         data -- see the Core Emergence Principle note on pulse().
         """
         key = self.synthesizer.get_current_basin_key()
-        # Deduplicated (this revision): felt_state_anchors is a touch LOG,
-        # not a set -- it can contain the same node many times if it's
-        # been repeatedly re-touched (e.g. a favored self-study target).
-        # Using the raw list here meant a node appearing N times in the
-        # window got bumped/efficacy-updated N times from a SINGLE
-        # regulation event, not once -- the same class of bug found and
-        # fixed in give_parental_reaction() (§13.2), just affecting
-        # regulation instead. eligible_regulation_nodes()'s own tier
-        # filter still applies on top of this.
-        unique_anchors = self._get_unique_anchors(key)
-        # Bug fix (found from production data: every node's regulatory
-        # efficacy sat at exactly the same value, 0.05 below the 0.5
-        # default, across the entire eligible pool -- only possible if a
-        # single event nudged literally everyone at once). `anchors or
-        # None` treated an empty anchor list the same as "no restriction
-        # requested," so whenever no felt-state anchor had been recorded
-        # yet (common, especially before Childhood naming has happened
-        # for a given basin), eligible_regulation_nodes(None) fell back to
-        # *every* Working/Trusted-tier node in the graph -- not the
-        # felt-state-scoped set §4.2 specifies. Passing `anchors` directly
-        # (even when empty) means an empty anchor list correctly produces
-        # zero eligible nodes, which hits the pre-existing "legitimate
-        # state, nothing eligible yet" early-return below instead.
-        regulating_nodes = self.archivist.eligible_regulation_nodes(unique_anchors)
+        anchors = self.felt_state_anchors.get(key, [])
+        regulating_nodes = self.archivist.eligible_regulation_nodes(anchors or None)
 
         if not regulating_nodes:
             # §4.2: legitimate state (nothing eligible yet), not an error.
             return
-
-        # Activation touch (§11 pull-forward, this revision): a node
-        # actually used for regulation is clearly currently relevant --
-        # feeds back into self-study's activation-weighted targeting and
-        # the Graph tab's focused rendering.
-        for n in regulating_nodes:
-            self.archivist.bump_activation(n)
 
         avg_efficacy = sum(
             self.archivist.graph.nodes[n].get("regulatory_efficacy", 0.5) for n in regulating_nodes

@@ -3,7 +3,6 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 from .archivist import SELF_NODE, TIER_PROVISIONAL
-from .edge_types import EDGE_ASSOCIATED_WITH, EDGE_IS_A, EDGE_CONCERNS_OTHER
 from .sensory import SensoryModule
 
 logger = logging.getLogger(__name__)
@@ -25,7 +24,7 @@ class AssociationEngine:
     # ------------------------------------------------------------------
     # Generic explicit edge (kept for backward compatibility / manual use)
     # ------------------------------------------------------------------
-    def link(self, node_a: str, node_b: str, relation_type: str = EDGE_ASSOCIATED_WITH, source: str = "user"):
+    def link(self, node_a: str, node_b: str, relation_type: str = "associated-with", source: str = "user"):
         self.archivist.link(node_a, node_b, relation_type, source=source, placement="explicit")
         print(f"Linked: {node_a} --{relation_type}--> {node_b}")
 
@@ -34,7 +33,7 @@ class AssociationEngine:
     # term with its definition/context.
     # ------------------------------------------------------------------
     def place_node(self, term: str, definition: str = "", source: str = "user",
-                    context_node: Optional[str] = None, max_parent_children: Optional[int] = None) -> Dict:
+                    context_node: Optional[str] = None) -> Dict:
         """
         Places `term` into the knowledge web using §2.3's two paths:
           1. Dictionary-pattern parsing on `definition`, if it yields a
@@ -44,65 +43,60 @@ class AssociationEngine:
              in the graph) with an associated-with edge -- never mislabeled
              as is-a (§2.3 mechanism 2).
         Returns a small dict describing what happened, for logging/tests.
-
-        `max_parent_children` (new, this revision): fixes a real bug found
-        from production data -- a dense, uncapped "starburst" hub forming
-        despite self-study's degree cap (Prometheus.py's
-        _select_self_study_target). The cap only ever gated which node got
-        SELECTED as a self-study expansion target; it never actually
-        constrained what parent an edge attached to, because self-study
-        always supplies a real WordNet gloss as `definition`, so path 1
-        (dictionary-pattern parsing) usually succeeds and attaches the new
-        child to whatever parent word the GLOSS mentions -- completely
-        independent of, and uncapped relative to, the selected target. If
-        several self-study-generated words' glosses happened to reference
-        the same common word, that word became an unbounded hub, exactly
-        reproducing the runaway-growth pattern the cap was built to
-        prevent, just through the other path. When supplied, this checks
-        the parsed parent's current categorical out-degree
-        (archivist.categorical_out_degree) before committing to it; if the
-        parent is already at capacity, falls through to the co-occurrence
-        anchor instead of attaching there uncapped. None (default)
-        preserves the old, uncapped behavior -- real user/dictionary input
-        via _ingest() never passes this (it always calls with
-        definition="", so path 1 never fires for it regardless), so this
-        is scoped to self-study only.
         """
         self.archivist.store(term, source=source, tier=TIER_PROVISIONAL)
 
         parsed = self.sensory.parse_hierarchy(definition) if definition else None
         if parsed:
             parent, edge_type = parsed
-            at_capacity = (
-                max_parent_children is not None
-                and self.archivist.categorical_out_degree(parent) >= max_parent_children
-            )
-            if not at_capacity:
-                self.archivist.link(parent, term, edge_type, source=source, placement="explicit")
-                return {"term": term, "parent": parent, "edge_type": edge_type, "placement": "explicit"}
-            # Parsed parent is already at capacity -- fall through to the
-            # co-occurrence anchor below instead of attaching here uncapped.
+            self.archivist.link(parent, term, edge_type, source=source, placement="explicit")
+            return {"term": term, "parent": parent, "edge_type": edge_type, "placement": "explicit"}
 
         # Co-occurrence fallback (§2.3 mechanism 2).
         anchor = context_node or self._most_active_node(exclude=term)
         if anchor:
-            self.archivist.link(anchor, term, EDGE_ASSOCIATED_WITH, source=source, placement="cooccurrence")
-            return {"term": term, "parent": anchor, "edge_type": EDGE_ASSOCIATED_WITH, "placement": "cooccurrence"}
+            self.archivist.link(anchor, term, "associated-with", source=source, placement="cooccurrence")
+            return {"term": term, "parent": anchor, "edge_type": "associated-with", "placement": "cooccurrence"}
 
         return {"term": term, "parent": None, "edge_type": None, "placement": "isolated"}
 
     def _most_active_node(self, exclude: Optional[str] = None) -> Optional[str]:
         """"Most active" = highest recent corroboration, approximated here
-        as most-recently-reinforced node (§2.3 mechanism 2). A richer
-        version would prefer whichever node is dominant in the *current*
-        felt-state context -- callers that have that (prometheus.py, via
-        synthesizer's current felt state) should pass context_node
-        explicitly instead of relying on this fallback."""
+        as most-recently *conversationally* touched node (§2.3 mechanism
+        2). A richer version would prefer whichever node is dominant in
+        the *current* felt-state context -- callers that have that
+        (prometheus.py, via synthesizer's current felt state) should pass
+        context_node explicitly instead of relying on this fallback.
+
+        Bug fix: this previously sorted on `last_reinforced`, which
+        self-study (§5.1) also bumps on every autonomous expansion tick --
+        including on its *target* node (an existing, often legitimate
+        user/dictionary node), not just its own newly-created children.
+        Under Run Batch, one queued user message is followed by dozens of
+        consecutive self-study ticks before the next message, so by the
+        time the next real message arrived, `last_reinforced` reliably
+        pointed at whatever self-study last touched -- letting the
+        conversational anchor drift far from the actual conversation
+        (reported: "working memory wanders from user prompts"). Sorting on
+        `last_conversational_touch` instead uses a field self-study never
+        writes to at all (only prometheus.py's `_ingest()` calls
+        `touch_conversational()`), so no amount of self-study between
+        messages can change what counts as "recently talked about."
+
+        The `source != "self_generated"` filter is kept as a second,
+        independent guard against self-study's own newly-created nodes
+        specifically -- belt-and-suspenders with the field fix above, not
+        a replacement for it."""
         candidates = [
-            (n, d.get("last_reinforced", datetime.min))
+            (n, d.get("last_conversational_touch", datetime.min))
             for n, d in self.archivist.graph.nodes(data=True)
-            if n != exclude
+            if n != exclude and d.get("source") != "self_generated"
         ]
+        # A node that has never been conversationally touched (still at
+        # the datetime.min default) is not a legitimate "most active"
+        # anchor -- exclude it rather than let an arbitrary never-touched
+        # node win a tie against other never-touched nodes.
+        candidates = [(n, t) for n, t in candidates if t > datetime.min]
         if not candidates:
             return None
         candidates.sort(key=lambda t: t[1], reverse=True)
@@ -114,39 +108,21 @@ class AssociationEngine:
     # to, since it owns the dictionary-pattern parser.
     # ------------------------------------------------------------------
     def run_reparenting_pass(self, definitions: Optional[Dict[str, str]] = None) -> int:
-        """Called by prometheus.py during Consolidation only.
-
-        Previously a silent no-op: this only ever re-parented a node if a
-        `definitions` map supplied its gloss text, but no caller ever
-        passed one (Prometheus.py's _run_consolidation() calls this with
-        no arguments), so every eligible candidate fell through to
-        `continue` and nothing was ever re-parented despite §2.3
-        mechanism 3 being documented as resolved.
-
-        Fixed by using sensory.lookup_hypernym() as the primary path --
-        WordNet's own taxonomy already gives the authoritative broader
-        category for a term (e.g. "blue" -> "color") directly, with no
-        gloss to parse and no pattern-matching needed. The `definitions`
-        dict is kept as a secondary path (tried first, if supplied) for
-        callers that have cached definition text and want parse_hierarchy
-        applied to it instead/first -- e.g. a future dictionary source
-        other than WordNet.
-        """
+        """Called by prometheus.py during Consolidation only. `definitions`
+        is an optional {node: definition_text} map (e.g. from a dictionary
+        cache) used to try to find a firmer parent for eligible nodes;
+        without it, eligible nodes are simply left as-is (no data to
+        re-parent from) rather than guessing."""
         definitions = definitions or {}
         moved = 0
         for node in self.archivist.reparenting_candidates():
             definition = definitions.get(node)
-            if definition:
-                parsed = self.sensory.parse_hierarchy(definition)
-                if parsed:
-                    new_parent, edge_type = parsed
-                    self.archivist.reparent(node, new_parent, edge_type)
-                    moved += 1
-                    continue
-
-            hypernym = self.sensory.lookup_hypernym(node)
-            if hypernym and hypernym != node:
-                self.archivist.reparent(node, hypernym, EDGE_IS_A)
+            if not definition:
+                continue
+            parsed = self.sensory.parse_hierarchy(definition)
+            if parsed:
+                new_parent, edge_type = parsed
+                self.archivist.reparent(node, new_parent, edge_type)
                 moved += 1
         return moved
 
@@ -155,24 +131,15 @@ class AssociationEngine:
     # detection. Called from prometheus.py's tick loop whenever sensory.py
     # detects candidates in incoming text.
     # ------------------------------------------------------------------
-    def link_relational(self, event_node: str, relation_types: List[str], source: str = "user",
-                         felt_state: Optional[str] = None):
+    def link_relational(self, event_node: str, relation_types: List[str], source: str = "user"):
         """`concerns-other` links to a generic OTHER placeholder entity
         rather than SELF, since by definition it involves someone other
-        than SELF; the other three types link SELF -> event_node.
-
-        `felt_state` (new, this revision): passed through to
-        archivist.link() to stamp `felt_state_at_creation` directly on
-        each relational edge -- see archivist.link()'s docstring for why
-        this replaces the previous after-the-fact timestamp
-        reconstruction, which was silently dropping edges."""
+        than SELF; the other three types link SELF -> event_node."""
         for rel in relation_types:
-            if rel == EDGE_CONCERNS_OTHER:
-                self.archivist.link("OTHER", event_node, EDGE_CONCERNS_OTHER, source=source,
-                                     placement="explicit", felt_state=felt_state)
+            if rel == "concerns-other":
+                self.archivist.link("OTHER", event_node, "concerns-other", source=source, placement="explicit")
             else:
-                self.archivist.link(SELF_NODE, event_node, rel, source=source,
-                                     placement="explicit", felt_state=felt_state)
+                self.archivist.link(SELF_NODE, event_node, rel, source=source, placement="explicit")
 
     # ------------------------------------------------------------------
     # §2.1b item 4a: Schema Node naming trigger. Called whenever a term

@@ -1,16 +1,9 @@
 import json
 import logging
 import os
-from collections import Counter
-from itertools import combinations
 import networkx as nx
 from datetime import datetime
 from typing import Dict, List, Optional
-
-from .edge_types import (
-    TRUST_BEARING_EDGE_TYPES, NODE_STANDARD, NODE_BASIN, NODE_SCHEMA, NODE_SELF,
-    NODE_EPISTEMIC_SCHEMA, EDGE_ASSOCIATED_WITH, EDGE_IS_A,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +12,6 @@ _DATA_DIR = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
 )
 EPISTEMIC_GRAPH_PATH = os.path.join(_DATA_DIR, "epistemic_graph.json")
-CO_ACTIVATION_PATH = os.path.join(_DATA_DIR, "co_activation.json")
 
 # Trust tiers per spec §3.1
 TIER_PROVISIONAL = 0
@@ -55,33 +47,6 @@ DEMOTION_HYSTERESIS_N = 2
 # cycles with no reinforcement -> eligible for pruning.
 PRUNE_TIER0_CYCLES = 5
 
-# Activation / working-memory layer (new, this revision -- a v1-scoped
-# pull-forward of §11's deferred activation-based working-memory concept,
-# not the full v2 vision: no archiving to cold storage, no rehydration, no
-# per-consumer hot/cold decision. Just a per-node activation score, boosted
-# on touch and decayed at Consolidation (same clock as everything else),
-# used for two things: (a) self-study preferring active nodes over uniform
-# randomness, (b) the Graph tab rendering only a bounded neighborhood
-# instead of the entire live graph. Same "not yet numerically tuned"
-# placeholder status as every other constant here (§10).
-ACTIVATION_BOOST = 1.0
-ACTIVATION_DECAY_RATE = 0.6  # fraction retained per Consolidation pass
-ACTIVATION_CAP = 10.0
-
-# Co-activation tracking (§13.3, new) -- the detection signal epistemic
-# schema clustering depends on. Whenever a group of nodes is touched in
-# the same event (a self-study cycle's target+children, an ingestion's
-# node+anchor), every pair in that group gets a co-activation count
-# bumped. Sparse by construction: only pairs that actually co-occur in a
-# real event ever get an entry, never the full N² pairs across the graph
-# -- same sparsity property the knowledge graph itself already has (169
-# edges among 35 nodes in one production sample, not 35²). Decayed at
-# Consolidation, same clock as everything else, same shape as activation
-# decay and basin dwell-time decay -- "one clock, not several."
-CO_ACTIVATION_DECAY_RATE = 0.6
-CO_ACTIVATION_STABILIZATION_THRESHOLD = 3  # same tuning-placeholder category as §10 everywhere else
-CO_ACTIVATION_PRUNE_FLOOR = 0.2  # below this after decay, drop the pair entirely -- same shape as synthesizer.py's basin DESTABILIZATION_FLOOR
-
 
 class ArchivistModule:
     """
@@ -110,18 +75,6 @@ class ArchivistModule:
         self.PROMOTION_HYSTERESIS_N = PROMOTION_HYSTERESIS_N
         self.DEMOTION_HYSTERESIS_N = DEMOTION_HYSTERESIS_N
         self.PRUNE_TIER0_CYCLES = PRUNE_TIER0_CYCLES
-        self.ACTIVATION_BOOST = ACTIVATION_BOOST
-        self.ACTIVATION_DECAY_RATE = ACTIVATION_DECAY_RATE
-        self.ACTIVATION_CAP = ACTIVATION_CAP
-        self.CO_ACTIVATION_DECAY_RATE = CO_ACTIVATION_DECAY_RATE
-        self.CO_ACTIVATION_STABILIZATION_THRESHOLD = CO_ACTIVATION_STABILIZATION_THRESHOLD
-        self.CO_ACTIVATION_PRUNE_FLOOR = CO_ACTIVATION_PRUNE_FLOOR
-        # Sparse -- only pairs that actually co-occurred in a real event
-        # ever get an entry (§13.3's own docstring above explains why).
-        # Keyed by a sorted 2-tuple of node ids, not a frozenset, so it's
-        # directly JSON-serializable for persistence without a custom
-        # encoder.
-        self.co_activation: Counter = Counter()
 
         # MultiDiGraph, not DiGraph: §2.1b requires an event node to carry
         # *more than one* simultaneous relational edge type from SELF at
@@ -144,13 +97,11 @@ class ArchivistModule:
             self.graph.add_node(
                 SELF_NODE,
                 last_reinforced=datetime.now(),
+                last_conversational_touch=datetime.min,
                 source="axiom",
                 tier=TIER_TRUSTED,
                 regulatory_efficacy=0.5,
                 tier0_cycles=0,
-                node_type=NODE_SELF,
-                activation=ACTIVATION_CAP,  # SELF is always maximally active -- never excluded from working memory by low activation
-                valence_coloring=0.0,
             )
             self.save()
 
@@ -167,13 +118,11 @@ class ArchivistModule:
             self.graph.add_node(
                 OTHER_NODE,
                 last_reinforced=datetime.now(),
+                last_conversational_touch=datetime.min,
                 source="schema",
                 tier=TIER_WORKING,
                 regulatory_efficacy=0.5,
                 tier0_cycles=0,
-                node_type=NODE_STANDARD,
-                activation=0.0,
-                valence_coloring=0.0,
             )
             self.save()
 
@@ -190,13 +139,11 @@ class ArchivistModule:
             self.graph.add_node(
                 entity,
                 last_reinforced=datetime.now(),
+                last_conversational_touch=datetime.min,
                 source=source,
                 tier=tier,
                 regulatory_efficacy=0.5,
                 tier0_cycles=0,
-                node_type=NODE_STANDARD,
-                activation=0.0,
-                valence_coloring=0.0,
             )
         else:
             self.graph.nodes[entity]["last_reinforced"] = datetime.now()
@@ -206,9 +153,10 @@ class ArchivistModule:
                 if target not in self.graph:
                     self.graph.add_node(
                         target, source=source, tier=TIER_PROVISIONAL,
-                        last_reinforced=datetime.now(), regulatory_efficacy=0.5,
-                        tier0_cycles=0, node_type=NODE_STANDARD, activation=0.0,
-                valence_coloring=0.0,
+                        last_reinforced=datetime.now(),
+                        last_conversational_touch=datetime.min,
+                        regulatory_efficacy=0.5,
+                        tier0_cycles=0,
                     )
                 self.graph.add_edge(entity, target, relation_type=rel, source=source,
                                      created_at=datetime.now().isoformat())
@@ -221,98 +169,23 @@ class ArchivistModule:
         # sub-step (trust pass, re-parenting, schema detection, efficacy)
         # has run.
 
-    def ensure_basin_node(self, basin_id: str, pad_coordinates: tuple, dwell_density: float = 0.0):
-        """
-        Creates or updates a real graph node for a stabilized felt-state
-        basin (§2.1a/§6A). Bug fix, this revision: synthesizer.py's
-        stabilized_basins was always just a string mapping
-        ((a,v,d) -> basin_id) -- nothing anywhere ever called
-        graph.add_node() for it. §6A specifies basin nodes as a real
-        node_type with pad_coordinates/dwell_density/stabilized fields,
-        and prometheus_dashboard.py already has rendering logic ready for
-        them (diamond shape, valence-colored) -- but since no basin node
-        ever actually existed, reflector.detect_schemas()'s "link the
-        Schema Node back to its component basin" fallback
-        (`felt_state if felt_state in graph else SELF_NODE`) always took
-        the SELF_NODE branch, silently, every time. Every schema's
-        component-basin link was quietly attaching to SELF instead of a
-        real basin entity -- misrepresenting what the schema is actually
-        composed of, and dumping extra incoming edges onto SELF that
-        don't belong there.
-
-        Basin nodes deliberately don't carry `tier` (§6A: "Not applicable
-        to basin/schema/self node types -- trust tiers represent
-        epistemic corroboration of facts; basins/schemas represent
-        recurrence, a different kind of evidence") and are exempt from
-        both the trust-tier consolidation pass and pruning, the same
-        treatment Schema Nodes and SELF already get.
-
-        Called from prometheus.py's Consolidation pass, once per
-        currently-stabilized basin, right after
-        synthesizer.consolidate_basins() runs -- so any basin
-        reflector.detect_schemas() might reference later in the same pass
-        already has a real node to link to.
-        """
-        if basin_id not in self.graph:
-            self.graph.add_node(
-                basin_id,
-                source="system",
-                node_type=NODE_BASIN,
-                last_reinforced=datetime.now(),
-                activation=0.0,
-                valence_coloring=0.0,
-                pad_coordinates=list(pad_coordinates),
-                dwell_density=dwell_density,
-                stabilized=True,
-                regulatory_efficacy=0.5,  # unused for basin nodes, kept only for schema-uniformity with other node_types' field set
-            )
-        else:
-            self.graph.nodes[basin_id]["pad_coordinates"] = list(pad_coordinates)
-            self.graph.nodes[basin_id]["dwell_density"] = dwell_density
-            self.graph.nodes[basin_id]["last_reinforced"] = datetime.now()
-        # No self.save() here (§4C) -- same reasoning as store()/link();
-        # called from the Consolidation pass, which checkpoints once at
-        # the end via prometheus.py's _run_consolidation().
-
     def link(self, node_a: str, node_b: str, relation_type: str, source: str = "user",
-              placement: str = "explicit", felt_state: Optional[str] = None):
+              placement: str = "explicit"):
         """
         General typed-edge creator used by association.py's hierarchy
         placement (§2.3). `placement` records whether this edge came from
         explicit dictionary-pattern parsing or the co-occurrence fallback
         -- re-parenting (§2.3 mechanism 3) only ever reconsiders
         co-occurrence placements, never explicit ones.
-
-        `felt_state` (new, this revision): the felt state active at the
-        moment of creation, stamped directly onto the edge as
-        `felt_state_at_creation` when supplied. Fixes a real bug found in
-        reflector.py's schema detection: felt state was previously always
-        reconstructed after the fact via chronos._felt_state_near()'s
-        nearest-preceding-timestamp lookup, but since prometheus.py's
-        pulse() always calls _ingest() (which creates relational edges)
-        before that same tick's chronos.record_pulse(), an edge's own
-        timestamp is always earlier than its own tick's chronos entry --
-        the lookup could only ever find the *previous* tick's felt state,
-        or nothing at all on the very first pulse ever / right after a
-        felt-state transition, silently and permanently dropping a
-        relational edge from schema candidacy even though a real, named
-        felt state was active when it was created. Stamping ground truth
-        directly at creation is far more reliable than reconstructing it
-        approximately afterward. Optional and backward-compatible: edges
-        created without this (including everything in an existing saved
-        graph) fall back to the old timestamp-based reconstruction.
         """
         for n in (node_a, node_b):
             if n not in self.graph:
                 self.graph.add_node(n, source=source, tier=TIER_PROVISIONAL,
                                      last_reinforced=datetime.now(),
-                                     regulatory_efficacy=0.5, tier0_cycles=0,
-                                     node_type=NODE_STANDARD, activation=0.0, valence_coloring=0.0)
-        edge_kwargs = dict(relation_type=relation_type, source=source,
-                            placement=placement, created_at=datetime.now().isoformat())
-        if felt_state is not None:
-            edge_kwargs["felt_state_at_creation"] = felt_state
-        self.graph.add_edge(node_a, node_b, **edge_kwargs)
+                                     last_conversational_touch=datetime.min,
+                                     regulatory_efficacy=0.5, tier0_cycles=0)
+        self.graph.add_edge(node_a, node_b, relation_type=relation_type, source=source,
+                             placement=placement, created_at=datetime.now().isoformat())
         self.graph.nodes[node_a]["last_reinforced"] = datetime.now()
         # No self.save() here (§4C) -- see store()'s comment. link() is
         # called on every hierarchy placement and every relational edge,
@@ -334,6 +207,24 @@ class ArchivistModule:
             # No self.save() here (§4C) -- see store()'s comment.
             return True
         return False
+
+    def touch_conversational(self, node: str):
+        """Marks `node` as recently active in *real* (user/dictionary)
+        conversational input -- distinct from `last_reinforced`, which
+        self-study (§5.1) also legitimately bumps for trust/decay
+        bookkeeping purposes. association.py's co-occurrence anchor
+        selection (§2.3 mechanism 2) reads only this field, specifically
+        so a long run of self-study ticks between user messages (e.g. via
+        Run Batch) can never make an unrelated node look like "what the
+        user was just talking about." Only prometheus.py's _ingest() (the
+        real conversational path) should ever call this -- self-study
+        must never touch it, by construction (it's simply never called
+        from that code path)."""
+        if node in self.graph:
+            self.graph.nodes[node]["last_conversational_touch"] = datetime.now()
+            # No self.save() here (§4C), same rationale as store()/link():
+            # called on every ingested message, Consolidation checkpoints
+            # it along with everything else.
 
     def flag_negation(self, node: str):
         """§3.4 mechanism 1: explicit negation/correction detected by
@@ -357,17 +248,6 @@ class ArchivistModule:
         incident_sources = set()
         edge_count = 0
         for _u, _v, edata in list(self.graph.in_edges(node, data=True)) + list(self.graph.out_edges(node, data=True)):
-            # §3.2/§10: only categorical edges (is-a/part-of/associated-with)
-            # count as epistemic corroboration. Relational edges
-            # (responsible-for/violates/temporal-contrast/concerns-other)
-            # and composed-of edges represent recurrence-of-pattern or
-            # structural composition, not independent confirmation of a
-            # fact -- a node frequently on the receiving end of `violates`
-            # edges was previously drifting toward Trusted purely for
-            # showing up often in guilt-shaped schema patterns, which has
-            # nothing to do with whether the node is true.
-            if edata.get("relation_type") not in TRUST_BEARING_EDGE_TYPES:
-                continue
             edge_count += 1
             esrc = edata.get("source", "user")
             if esrc != "self_generated":  # §2.2/§9 risk 5: excluded from diversity signal
@@ -398,7 +278,7 @@ class ArchivistModule:
             if node == SELF_NODE:
                 continue  # permanent axiom, never re-evaluated (§2.1b item 1)
             data = self.graph.nodes[node]
-            if (data.get("is_schema") or data.get("node_type") in (NODE_BASIN, NODE_EPISTEMIC_SCHEMA)):
+            if data.get("is_schema"):
                 # Bug fix: Schema Nodes were falling through to the generic
                 # trust-tier formula, using a "schema" source tag that isn't
                 # in SOURCE_WEIGHT at all (silently defaulting to 0.3, the
@@ -414,18 +294,6 @@ class ArchivistModule:
                 # mechanism that was never meant to touch it. Same treatment
                 # as SELF_NODE: exempt entirely, not just given a favorable
                 # score.
-                #
-                # Basin nodes (this revision, ensure_basin_node) get the
-                # identical exemption for the identical reason: they carry
-                # no `tier` field at all (§6A -- "not applicable to
-                # basin/schema/self node types"), so without this check
-                # they'd default to TIER_PROVISIONAL here, start
-                # accumulating tier0_cycles every pass (since they're
-                # rarely touched by ordinary categorical corroboration),
-                # and eventually get silently pruned by prune()'s
-                # Tier-0-for-N-cycles rule -- deleting a graph node for a
-                # basin that synthesizer.py still considers genuinely
-                # stabilized, an inconsistency between the two.
                 continue
             current = data.get("tier", TIER_PROVISIONAL)
 
@@ -488,24 +356,6 @@ class ArchivistModule:
             if n in self.graph and self.graph.nodes[n].get("tier", TIER_PROVISIONAL) >= TIER_WORKING
         ]
 
-    def categorical_out_degree(self, node: str) -> int:
-        """Count of categorical (is-a/part-of/associated-with) out-edges
-        from `node` -- the "how many children does this hierarchy parent
-        already have" signal. Previously only existed as a local closure
-        duplicated inside Prometheus.py's _select_self_study_target;
-        centralized here, this revision, because association.place_node()
-        now needs the identical check too -- see place_node()'s docstring
-        for the cap-bypass bug this closes (dictionary-pattern-parsed
-        placements were never capped at all, only the co-occurrence
-        fallback was, even though self-study routes through the parsed
-        path most of the time)."""
-        if node not in self.graph:
-            return 0
-        return sum(
-            1 for _u, _v, edata in self.graph.out_edges(node, data=True)
-            if edata.get("relation_type") in TRUST_BEARING_EDGE_TYPES
-        )
-
     def update_regulatory_efficacy(self, node: str, worked: bool, step: float = 0.05):
         """Called during Consolidation (§4.5) after checking whether felt-
         state intensity dropped faster than baseline decay alone would
@@ -518,176 +368,6 @@ class ArchivistModule:
         # No self.save() here (§4C) -- called once per regulating node,
         # potentially several times per Consolidation pass; the
         # orchestrator's single end-of-consolidation checkpoint covers it.
-
-    # ------------------------------------------------------------------
-    # Activation / working memory (new, this revision -- §11 pull-forward,
-    # v1-scoped: no archiving/rehydration, just a live per-node score).
-    # ------------------------------------------------------------------
-    def bump_activation(self, node: str, amount: Optional[float] = None):
-        """Boosts a node's activation on touch (ingestion, self-study
-        expansion, regulation anchor use). Capped so repeated rapid
-        touches within one Consolidation window can't produce an
-        ever-growing score -- the point is "currently relevant," not
-        "historically most-touched ever," which decay_activation's
-        per-pass shrinkage already handles on its own timescale."""
-        if node not in self.graph:
-            return
-        amount = self.ACTIVATION_BOOST if amount is None else amount
-        current = self.graph.nodes[node].get("activation", 0.0)
-        self.graph.nodes[node]["activation"] = min(self.ACTIVATION_CAP, current + amount)
-        # No self.save() here (§4C) -- touched constantly during Learning,
-        # same frequency problem as store()/link(); checkpointed once at
-        # end-of-Consolidation like everything else.
-
-    def decay_activation(self):
-        """Consolidation-gated (same clock as trust/efficacy/basins/
-        schemas, per the design's own "one clock, not several" principle)
-        -- activation shrinks toward zero for anything not recently
-        touched, so working-memory membership reflects current relevance,
-        not permanent historical importance. SELF is exempt (seeded at
-        ACTIVATION_CAP, §2.1b item 1's axiom status extended here: it
-        should never silently fall out of the focused Graph-tab view)."""
-        for node, data in self.graph.nodes(data=True):
-            if node == SELF_NODE:
-                continue
-            data["activation"] = data.get("activation", 0.0) * self.ACTIVATION_DECAY_RATE
-
-    # ------------------------------------------------------------------
-    # Valence coloring (§13.2, new): mirror-neuron-style implicit
-    # emotional coloring of nodes. NOT trust, NOT epistemic tier -- a
-    # third, independent per-node property (same orthogonality pattern as
-    # §2.4's trust-vs-depth and §4.5's trust-vs-regulatory-efficacy).
-    # Deliberately never set directly from a word or category -- the only
-    # way a node's coloring moves is repeated co-occurrence between "this
-    # node was the active felt-state anchor" and "a reaction happened,"
-    # via prometheus.py's give_parental_reaction(). No fixed valence
-    # lookup table exists anywhere in this design; a node's coloring is
-    # entirely a record of what it has actually been paired with.
-    # ------------------------------------------------------------------
-    def nudge_valence_coloring(self, node: str, delta: float, cap: float = 1.0):
-        """Bounded accumulator, same clamping shape as regulatory_efficacy
-        (§4.5) -- small deltas, cannot run away, symmetric positive/
-        negative range since this represents a valence axis (like
-        synthesizer.py's own -1..1 valence projection), not a magnitude."""
-        if node not in self.graph:
-            return
-        current = self.graph.nodes[node].get("valence_coloring", 0.0)
-        self.graph.nodes[node]["valence_coloring"] = max(-cap, min(cap, current + delta))
-        # No self.save() here (§4C) -- same reasoning as bump_activation();
-        # fires live, potentially every reaction, checkpointed once at the
-        # next Consolidation pass like everything else.
-
-    def working_memory_nodes(self, top_k: int = 40, always_include: Optional[List[str]] = None,
-                              max_relational_neighbors: int = 20) -> set:
-        """Returns the set of node ids that should count as 'in focus' --
-        the top_k highest-activation nodes, plus SELF/OTHER (always
-        relevant regardless of activation), plus SELF/OTHER's relational-
-        edge neighbors, plus any caller-supplied always_include set (e.g.
-        prometheus.py's current felt-state anchors, which the archivist
-        has no way to know about on its own since felt state lives in
-        synthesizer.py).
-
-        Bug fix, this revision: SELF/OTHER were always force-included
-        here, but their relational-edge *neighbors* were not -- and
-        prometheus_dashboard.py's render_graph_html() only draws an edge
-        when BOTH endpoints are in the rendered subset. Since a
-        relational-edge event node is typically a one-off full-sentence
-        node (never a WordNet dictionary word, so self-study essentially
-        never re-selects it), its activation decays to near-zero quickly
-        after creation and it soon falls out of the top-K set at any real
-        scale. The result: SELF renders as a lonely, disconnected node on
-        the Graph tab even when it has real, confirmed edges (checkable
-        via reflector.self_other_report(), which reads the graph directly
-        and was never affected by this) -- reading as "SELF never grows"
-        when the actual problem was purely a rendering blind spot, not a
-        data one. Bounded to the most-recent `max_relational_neighbors`
-        per anchor (not unconditionally all of them), consistent with
-        every other "bounded, not unbounded" structure in this design
-        (chronos's log, felt_state_anchors's window, §4C/Addendum 6).
-
-        Used for two things (§11 pull-forward): (a) prometheus.py's
-        self-study target selection can prefer this set over the full
-        eligible pool, giving self-study something closer to genuine
-        attention/focus instead of near-uniform randomness; (b)
-        prometheus_dashboard.py's Graph-tab rendering can filter to just
-        this neighborhood instead of the entire live graph, which is the
-        actual fix for rendering cost/readability at scale that §11
-        originally proposed this mechanism for.
-        """
-        ranked = sorted(
-            self.graph.nodes(data=True),
-            key=lambda item: item[1].get("activation", 0.0),
-            reverse=True,
-        )
-        result = {n for n, _d in ranked[:top_k]}
-        result.add(SELF_NODE)
-        result.add(OTHER_NODE)
-
-        for anchor_node in (SELF_NODE, OTHER_NODE):
-            if anchor_node not in self.graph:
-                continue
-            neighbor_edges = (
-                list(self.graph.out_edges(anchor_node, data=True))
-                + list(self.graph.in_edges(anchor_node, data=True))
-            )
-            neighbor_edges.sort(key=lambda e: e[2].get("created_at", ""), reverse=True)
-            for u, v, _d in neighbor_edges[:max_relational_neighbors]:
-                result.add(v if u == anchor_node else u)
-
-        if always_include:
-            result.update(n for n in always_include if n in self.graph)
-        return result
-
-    # ------------------------------------------------------------------
-    # Co-activation (§13.3, new) -- the detection signal epistemic schema
-    # clustering depends on. Kept deliberately separate from `activation`
-    # (a per-node score): this is per-PAIR, tracking which nodes get
-    # touched together, not just how often each is touched alone.
-    # ------------------------------------------------------------------
-    def record_co_activation(self, nodes: List[str]):
-        """Bumps the co-activation count for every pair within `nodes` --
-        called once per "touch event" (a self-study cycle's target plus
-        its newly-placed children, an ingestion's node plus its felt-state
-        anchor). Deliberately pairwise-within-the-event, not all-pairs
-        across the whole graph -- this is what keeps it sparse. Silently
-        ignores nodes not actually in the graph (defensive; callers
-        shouldn't need to pre-filter)."""
-        real_nodes = [n for n in nodes if n in self.graph]
-        if len(real_nodes) < 2:
-            return
-        for a, b in combinations(sorted(set(real_nodes)), 2):
-            self.co_activation[(a, b)] += 1
-
-    def decay_co_activation(self):
-        """Consolidation-gated (same clock as activation decay, basin
-        decay, trust evaluation -- "one clock, not several"). Shrinks
-        every tracked pair's count, and drops pairs that fall below
-        CO_ACTIVATION_PRUNE_FLOOR entirely -- same shape as synthesizer.
-        py's basin dwell-time decay (DESTABILIZATION_FLOOR), so a pair
-        that stops co-occurring genuinely fades rather than accumulating
-        forever. Also silently drops any pair referencing a node that no
-        longer exists (pruned since it was recorded) -- keeps this
-        structure from quietly outliving the nodes it describes."""
-        for pair in list(self.co_activation.keys()):
-            a, b = pair
-            if a not in self.graph or b not in self.graph:
-                del self.co_activation[pair]
-                continue
-            self.co_activation[pair] *= self.CO_ACTIVATION_DECAY_RATE
-            if self.co_activation[pair] < self.CO_ACTIVATION_PRUNE_FLOOR:
-                del self.co_activation[pair]
-
-    def stabilized_co_activation_pairs(self) -> List[tuple]:
-        """Pairs whose co-activation count has crossed the stabilization
-        threshold -- the raw material reflector.detect_epistemic_clusters()
-        groups into connected components. Exposed as its own method (not
-        inlined into the detector) so it's independently diagnosable, same
-        "make it checkable" pattern as every other new mechanism this
-        session (activation_report, valence_coloring_report, etc.)."""
-        return [
-            pair for pair, count in self.co_activation.items()
-            if count >= self.CO_ACTIVATION_STABILIZATION_THRESHOLD
-        ]
 
     # ------------------------------------------------------------------
     # §2.3 mechanism 3 -- re-parenting evaluation, Consolidation-gated.
@@ -705,7 +385,7 @@ class ArchivistModule:
                 continue
             in_edges = list(self.graph.in_edges(node, data=True))
             cooccurrence_parent = any(
-                d.get("placement") == "cooccurrence" and d.get("relation_type") == EDGE_ASSOCIATED_WITH
+                d.get("placement") == "cooccurrence" and d.get("relation_type") == "associated-with"
                 for _u, _v, d in in_edges
             )
             if not cooccurrence_parent:
@@ -715,7 +395,7 @@ class ArchivistModule:
                 candidates.append(node)
         return candidates
 
-    def reparent(self, node: str, new_parent: str, relation_type: str = EDGE_IS_A):
+    def reparent(self, node: str, new_parent: str, relation_type: str = "is-a"):
         """Executes a re-parent: drops the old co-occurrence edge(s) into
         `node`, adds the new, firmer typed edge."""
         if node not in self.graph or new_parent not in self.graph:
@@ -741,8 +421,6 @@ class ArchivistModule:
         to_remove = [
             n for n, d in self.graph.nodes(data=True)
             if n != SELF_NODE
-            and not d.get("is_schema")
-            and d.get("node_type") not in (NODE_BASIN, NODE_EPISTEMIC_SCHEMA)
             and d.get("tier", TIER_PROVISIONAL) == TIER_PROVISIONAL
             and d.get("tier0_cycles", 0) >= self.PRUNE_TIER0_CYCLES
         ]
@@ -761,21 +439,8 @@ class ArchivistModule:
             data = nx.readwrite.json_graph.node_link_data(self.graph)
             with open(EPISTEMIC_GRAPH_PATH, "w") as f:
                 json.dump(data, f, default=str)
-            self._save_co_activation()
         except OSError as e:
             logger.warning("ArchivistModule.save failed: %s", e)
-
-    def _save_co_activation(self):
-        """Separate file, same pattern as synthesizer.py's basin_state.json
-        -- tuple keys aren't valid JSON object keys, encoded as a
-        delimited string (same technique, not a new one)."""
-        try:
-            os.makedirs(_DATA_DIR, exist_ok=True)
-            encoded = {f"{a}|||{b}": count for (a, b), count in self.co_activation.items()}
-            with open(CO_ACTIVATION_PATH, "w") as f:
-                json.dump(encoded, f)
-        except OSError as e:
-            logger.warning("ArchivistModule._save_co_activation failed: %s", e)
 
     def load(self):
         if os.path.exists(EPISTEMIC_GRAPH_PATH):
@@ -790,17 +455,6 @@ class ArchivistModule:
                     e,
                 )
                 self.graph = nx.MultiDiGraph()
-        if os.path.exists(CO_ACTIVATION_PATH):
-            try:
-                with open(CO_ACTIVATION_PATH, "r") as f:
-                    encoded = json.load(f)
-                for key_str, count in encoded.items():
-                    a, b = key_str.split("|||", 1)
-                    self.co_activation[(a, b)] = count
-            except (json.JSONDecodeError, OSError, ValueError) as e:
-                logger.warning(
-                    "ArchivistModule.load co_activation failed (%s); starting fresh.", e,
-                )
 
     def _deserialize_timestamps(self):
         """save() writes `last_reinforced` via json.dump's `default=str`,
@@ -821,6 +475,19 @@ class ArchivistModule:
                     data["last_reinforced"] = datetime.fromisoformat(lr)
                 except ValueError:
                     data["last_reinforced"] = datetime.min
+
+            # Same str/datetime mixing problem as last_reinforced above,
+            # for the field added alongside it. Nodes saved before this
+            # field existed simply won't have it -- default to datetime.min
+            # (never conversationally touched) rather than raising.
+            lct = data.get("last_conversational_touch")
+            if isinstance(lct, str):
+                try:
+                    data["last_conversational_touch"] = datetime.fromisoformat(lct)
+                except ValueError:
+                    data["last_conversational_touch"] = datetime.min
+            elif lct is None:
+                data["last_conversational_touch"] = datetime.min
 
     def retrieve(self, key: str, bias: str = None):
         """Minimal existing behavior preserved; returns nodes matching key
