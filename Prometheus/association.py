@@ -46,7 +46,8 @@ class AssociationEngine:
     # term with its definition/context.
     # ------------------------------------------------------------------
     def place_node(self, term: str, definition: str = "", source: str = "user",
-                    context_node: Optional[str] = None) -> Dict:
+                    context_node: Optional[str] = None,
+                    max_parent_children: Optional[int] = None) -> Dict:
         """
         Places `term` into the knowledge web using §2.3's two paths:
           1. Dictionary-pattern parsing on `definition`, if it yields a
@@ -55,41 +56,54 @@ class AssociationEngine:
              active (context_node, or else most-recently-reinforced node
              in the graph) with an associated-with edge -- never mislabeled
              as is-a (§2.3 mechanism 2).
-        Both paths respect PARENT_OUT_DEGREE_CAP (bug fix, this revision --
+        Both paths respect an out-degree cap (bug fix, this revision --
         see the class docstring): a parent already at capacity is skipped
         rather than accumulating unbounded children, whichever path found
         it. If the parsed parent is full, this falls through to the
         co-occurrence path rather than abandoning placement entirely --
         losing the *stronger* is-a evidence to a degree cap is preferable
         to leaving the term isolated.
+
+        `max_parent_children` lets a caller supply a different cap than
+        the class default (e.g. Prometheus.py's self-study passes its own
+        SELF_STUDY_SOFT_CAP, since self-study's own target-selection
+        already reasons about out-degree at a different threshold than
+        general placement, §5.1/§13). Defaults to PARENT_OUT_DEGREE_CAP
+        when the caller doesn't specify one, so existing callers (e.g.
+        prometheus.py's _ingest(), which never passes this) are unaffected.
+
         Returns a small dict describing what happened, for logging/tests.
         """
+        cap = self.PARENT_OUT_DEGREE_CAP if max_parent_children is None else max_parent_children
         self.archivist.store(term, source=source, tier=TIER_PROVISIONAL)
 
         parsed = self.sensory.parse_hierarchy(definition) if definition else None
         if parsed:
             parent, edge_type = parsed
-            if self.archivist.categorical_out_degree(parent) < self.PARENT_OUT_DEGREE_CAP:
+            if self.archivist.categorical_out_degree(parent) < cap:
                 self.archivist.link(parent, term, edge_type, source=source, placement="explicit")
                 return {"term": term, "parent": parent, "edge_type": edge_type, "placement": "explicit"}
             logger.info(f"Parsed parent '{parent}' at out-degree cap; falling back to co-occurrence for '{term}'.")
 
         # Co-occurrence fallback (§2.3 mechanism 2).
-        anchor = context_node if context_node and self._has_room(context_node) else None
+        anchor = context_node if context_node and self._has_room(context_node, cap) else None
         if anchor is None:
-            anchor = self._most_active_node(exclude=term)
+            anchor = self._most_active_node(exclude=term, cap=cap)
         if anchor:
             self.archivist.link(anchor, term, "associated-with", source=source, placement="cooccurrence")
             return {"term": term, "parent": anchor, "edge_type": "associated-with", "placement": "cooccurrence"}
 
         return {"term": term, "parent": None, "edge_type": None, "placement": "isolated"}
 
-    def _has_room(self, node: str) -> bool:
+    def _has_room(self, node: str, cap: Optional[int] = None) -> bool:
         """Shared out-degree cap check (bug fix, this revision -- see the
-        class docstring and PARENT_OUT_DEGREE_CAP)."""
-        return self.archivist.categorical_out_degree(node) < self.PARENT_OUT_DEGREE_CAP
+        class docstring and PARENT_OUT_DEGREE_CAP). `cap` lets callers
+        that received their own max_parent_children (place_node) pass it
+        through instead of always using the class default."""
+        effective_cap = self.PARENT_OUT_DEGREE_CAP if cap is None else cap
+        return self.archivist.categorical_out_degree(node) < effective_cap
 
-    def _most_active_node(self, exclude: Optional[str] = None) -> Optional[str]:
+    def _most_active_node(self, exclude: Optional[str] = None, cap: Optional[int] = None) -> Optional[str]:
         """"Most active" = highest current activation score (§11 pull-
         forward), used as the co-occurrence fallback anchor (§2.3
         mechanism 2) when no context_node was supplied and no dictionary-
@@ -150,7 +164,7 @@ class AssociationEngine:
             (n, d.get("activation", 0.0))
             for n, d in self.archivist.graph.nodes(data=True)
             if n != exclude and n not in (SELF_NODE, OTHER_NODE)
-            and d.get("source") != "self_generated" and self._has_room(n)
+            and d.get("source") != "self_generated" and self._has_room(n, cap)
         ]
         candidates = [(n, a) for n, a in candidates if a > 0.0]
         if not candidates:
