@@ -1,8 +1,7 @@
 import logging
-from datetime import datetime
 from typing import Dict, List, Optional
 
-from .archivist import SELF_NODE, TIER_PROVISIONAL
+from .archivist import SELF_NODE, OTHER_NODE, TIER_PROVISIONAL
 from .sensory import SensoryModule
 
 logger = logging.getLogger(__name__)
@@ -16,6 +15,20 @@ class AssociationEngine:
     relational edges to SELF that §2.1b's complex-schema detection needs
     (`responsible-for`, `violates`, `temporal-contrast`, `concerns-other`).
     """
+
+    # Bug fix, this revision: archivist.py's categorical_out_degree() was
+    # added specifically because "association.place_node() now needs the
+    # identical check too... dictionary-pattern-parsed placements were
+    # never capped at all, only the co-occurrence fallback was" -- but
+    # neither path here actually called it yet. Without this, a single
+    # common WordNet parent (e.g. "color", "person", "event") reachable
+    # via dictionary-pattern parsing could accumulate unlimited children
+    # from real user/dictionary input over time, even though self-study's
+    # own target selection (Prometheus.py's hard_cap=3 default) was
+    # already protected from doing the same thing. Same tuning-placeholder
+    # category and same default as self-study's cap (§10) -- not claimed
+    # to be a numerically final value, just no longer literally unbounded.
+    PARENT_OUT_DEGREE_CAP = 3
 
     def __init__(self, archivist, sensory: Optional[SensoryModule] = None):
         self.archivist = archivist
@@ -42,6 +55,13 @@ class AssociationEngine:
              active (context_node, or else most-recently-reinforced node
              in the graph) with an associated-with edge -- never mislabeled
              as is-a (§2.3 mechanism 2).
+        Both paths respect PARENT_OUT_DEGREE_CAP (bug fix, this revision --
+        see the class docstring): a parent already at capacity is skipped
+        rather than accumulating unbounded children, whichever path found
+        it. If the parsed parent is full, this falls through to the
+        co-occurrence path rather than abandoning placement entirely --
+        losing the *stronger* is-a evidence to a degree cap is preferable
+        to leaving the term isolated.
         Returns a small dict describing what happened, for logging/tests.
         """
         self.archivist.store(term, source=source, tier=TIER_PROVISIONAL)
@@ -49,54 +69,90 @@ class AssociationEngine:
         parsed = self.sensory.parse_hierarchy(definition) if definition else None
         if parsed:
             parent, edge_type = parsed
-            self.archivist.link(parent, term, edge_type, source=source, placement="explicit")
-            return {"term": term, "parent": parent, "edge_type": edge_type, "placement": "explicit"}
+            if self.archivist.categorical_out_degree(parent) < self.PARENT_OUT_DEGREE_CAP:
+                self.archivist.link(parent, term, edge_type, source=source, placement="explicit")
+                return {"term": term, "parent": parent, "edge_type": edge_type, "placement": "explicit"}
+            logger.info(f"Parsed parent '{parent}' at out-degree cap; falling back to co-occurrence for '{term}'.")
 
         # Co-occurrence fallback (§2.3 mechanism 2).
-        anchor = context_node or self._most_active_node(exclude=term)
+        anchor = context_node if context_node and self._has_room(context_node) else None
+        if anchor is None:
+            anchor = self._most_active_node(exclude=term)
         if anchor:
             self.archivist.link(anchor, term, "associated-with", source=source, placement="cooccurrence")
             return {"term": term, "parent": anchor, "edge_type": "associated-with", "placement": "cooccurrence"}
 
         return {"term": term, "parent": None, "edge_type": None, "placement": "isolated"}
 
-    def _most_active_node(self, exclude: Optional[str] = None) -> Optional[str]:
-        """"Most active" = highest recent corroboration, approximated here
-        as most-recently *conversationally* touched node (§2.3 mechanism
-        2). A richer version would prefer whichever node is dominant in
-        the *current* felt-state context -- callers that have that
-        (prometheus.py, via synthesizer's current felt state) should pass
-        context_node explicitly instead of relying on this fallback.
+    def _has_room(self, node: str) -> bool:
+        """Shared out-degree cap check (bug fix, this revision -- see the
+        class docstring and PARENT_OUT_DEGREE_CAP)."""
+        return self.archivist.categorical_out_degree(node) < self.PARENT_OUT_DEGREE_CAP
 
-        Bug fix: this previously sorted on `last_reinforced`, which
-        self-study (§5.1) also bumps on every autonomous expansion tick --
-        including on its *target* node (an existing, often legitimate
-        user/dictionary node), not just its own newly-created children.
-        Under Run Batch, one queued user message is followed by dozens of
-        consecutive self-study ticks before the next message, so by the
-        time the next real message arrived, `last_reinforced` reliably
-        pointed at whatever self-study last touched -- letting the
-        conversational anchor drift far from the actual conversation
-        (reported: "working memory wanders from user prompts"). Sorting on
-        `last_conversational_touch` instead uses a field self-study never
-        writes to at all (only prometheus.py's `_ingest()` calls
-        `touch_conversational()`), so no amount of self-study between
-        messages can change what counts as "recently talked about."
+    def _most_active_node(self, exclude: Optional[str] = None) -> Optional[str]:
+        """"Most active" = highest current activation score (§11 pull-
+        forward), used as the co-occurrence fallback anchor (§2.3
+        mechanism 2) when no context_node was supplied and no dictionary-
+        pattern parent was parseable.
+
+        Bug fix, this revision: this previously sorted on a field called
+        `last_conversational_touch`, set via an `archivist.
+        touch_conversational()` method. Both were introduced as a fix for
+        an earlier reported bug ("working memory wanders from user
+        prompts" -- self-study's constant reinforcement of
+        `last_reinforced` was letting the co-occurrence anchor drift onto
+        whatever self-study last touched between real messages). That fix
+        predates this revision's activation/working-memory layer
+        (archivist.bump_activation/decay_activation, §11 pull-forward),
+        which was built independently and never wired to touch the same
+        field -- `touch_conversational()` and `last_conversational_touch`
+        no longer exist anywhere in archivist.py at all. Since this
+        method's filter required that field to be set above its
+        datetime.min default, and nothing was setting it anymore, this
+        method silently returned None on every call -- any new node with
+        no explicit context_node and no parseable definition (routine
+        during early Childhood or any `Unformed`-felt-state period, which
+        the spec itself flags can last a long time) fell all the way
+        through to `placement: "isolated"` and was never attached to the
+        graph at all, regardless of how conversationally recent other
+        nodes were.
+
+        Fixed by switching to `activation` -- this branch's own current
+        "currently relevant" signal, already the canonical ranking used
+        by `archivist.working_memory_nodes()` and `working_memory.py`'s
+        candidate scoring, so this fallback now agrees with the rest of
+        the design instead of reading a field only it still wrote to.
+        prometheus.py's `_ingest()` calls `bump_activation()` on every
+        real-input node and its anchor, so activation still tracks
+        genuine conversational recency, not just self-study's smaller,
+        separately-tunable `ACTIVATION_BOOST_SELF_STUDY` bump.
 
         The `source != "self_generated"` filter is kept as a second,
         independent guard against self-study's own newly-created nodes
-        specifically -- belt-and-suspenders with the field fix above, not
-        a replacement for it."""
+        specifically, and requiring activation > 0 excludes nodes that
+        have simply never been touched -- consistent with the original
+        protective intent (self-study shouldn't be able to make an
+        unrelated node look like "what the user was just talking
+        about"), just expressed through the field this branch actually
+        maintains.
+
+        SELF/OTHER are also excluded, consistent with self-study's own
+        `has_room()` check (Prometheus.py's `_select_self_study_target`,
+        `n not in (SELF_NODE, OTHER_NODE)`) and the rest of this design's
+        treatment of them as relational-edge-only axioms (§2.1b), not
+        general dictionary/co-occurrence attachment targets. Without this,
+        SELF's permanent max-activation seeding (archivist._seed_self_node,
+        `activation=ACTIVATION_CAP` -- correct and necessary for its own
+        purpose, staying visible in the §11 working-memory top-K filter)
+        would otherwise make it the default fallback anchor for nearly
+        any isolated node, which was never its intended role here."""
         candidates = [
-            (n, d.get("last_conversational_touch", datetime.min))
+            (n, d.get("activation", 0.0))
             for n, d in self.archivist.graph.nodes(data=True)
-            if n != exclude and d.get("source") != "self_generated"
+            if n != exclude and n not in (SELF_NODE, OTHER_NODE)
+            and d.get("source") != "self_generated" and self._has_room(n)
         ]
-        # A node that has never been conversationally touched (still at
-        # the datetime.min default) is not a legitimate "most active"
-        # anchor -- exclude it rather than let an arbitrary never-touched
-        # node win a tie against other never-touched nodes.
-        candidates = [(n, t) for n, t in candidates if t > datetime.min]
+        candidates = [(n, a) for n, a in candidates if a > 0.0]
         if not candidates:
             return None
         candidates.sort(key=lambda t: t[1], reverse=True)
