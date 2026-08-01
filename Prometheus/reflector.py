@@ -131,6 +131,22 @@ class ReflectorModule:
         combination "means" guilt or pride -- it only counts recurrence of
         the (felt_state, relation_set) pair itself. Returns the list of
         newly-created Schema Node ids.
+
+        Deliberately NOT tier-gated to Working/Trusted event nodes, unlike
+        detect_epistemic_clusters() (§14's "Option B" agreement). This is
+        a considered exception, not an inconsistency: an event node here
+        is typically a single raw sentence (association.place_node() uses
+        the whole message as the node name, §2.2), which structurally
+        almost never accumulates the diverse corroboration §3.2's trust
+        formula requires to promote past Provisional -- nothing else ever
+        asserts "I shouldn't have done that" is a fact needing
+        confirmation. Requiring Working+ tier here would very likely make
+        somatic schema formation impossible in practice, not just rarer,
+        defeating the mechanism rather than refining it. Somatic
+        formation's existing bar -- a stabilized felt state AND a
+        *consistent*, recurring relational-edge pattern -- is already a
+        real, earned requirement of a different kind than epistemic trust,
+        and is left as the sole gate here.
         """
         graph = self.archivist.graph
         pair_events: Dict[tuple, List[str]] = {}  # (felt_state, relation_set) -> [event_node, ...]
@@ -231,6 +247,20 @@ class ReflectorModule:
         creating a second, competing structure for the same thing would
         be redundant, not useful). Returns the list of newly-created
         schema ids.
+
+        Tier-gated to Working/Trusted members only (§14, "Option B" --
+        agreed the same session as a fix for over-eager formation:
+        344 epistemic schemas formed from just 2000 pulses in production,
+        essentially clustering raw touch-recurrence alone). Co-activation
+        is still recorded and decayed on every touch regardless of tier
+        (§13.3's existing mechanism, unchanged) -- what's new is that
+        cluster FORMATION additionally requires the co-touching nodes to
+        have already earned Working+ tier through ordinary trust
+        evaluation (§3), a compound bar (recurring co-touch AND earned
+        corroboration) rather than raw co-touch-count alone. A stabilized
+        pair between two still-Provisional nodes is real data and stays
+        tracked; it just isn't eligible to form a schema until both sides
+        have separately earned cortical status.
         """
         pairs = self.archivist.stabilized_co_activation_pairs()
         if not pairs:
@@ -242,9 +272,17 @@ class ReflectorModule:
         graph = self.archivist.graph
         created = []
         for component in nx.connected_components(co_graph):
-            if len(component) < self.EPISTEMIC_MIN_CLUSTER_SIZE:
+            # Tier gate: only Working/Trusted members are eligible to
+            # participate in a schema at all -- filter before the size
+            # check, not after, so a component that's only "big enough"
+            # because of uncorroborated Provisional padding is correctly
+            # excluded, not trimmed-and-accepted.
+            members = sorted(
+                n for n in component
+                if graph.nodes.get(n, {}).get("tier", TIER_PROVISIONAL) >= TIER_WORKING
+            )
+            if len(members) < self.EPISTEMIC_MIN_CLUSTER_SIZE:
                 continue
-            members = sorted(component)
 
             if self._has_dominant_shared_parent(members):
                 continue  # already named via ordinary hierarchy -- redundant to cluster

@@ -9,6 +9,7 @@ from .executive import ExecutiveModule
 from .synthesizer import SynthesizerModule
 from .reflector import ReflectorModule
 from .chronos import ChronosModule
+from .working_memory import WorkingMemoryModule
 from .sensory import SensoryModule
 from .association import AssociationEngine
 from .stimulus import SyntheticStimulusEngine
@@ -180,6 +181,12 @@ class Prometheus:
         self.sensory = SensoryModule()
         self.association = AssociationEngine(self.archivist, self.sensory)
         self.stimulus = SyntheticStimulusEngine(self.bio, self.archivist, self.reflector)
+        self.working_memory = WorkingMemoryModule(self.archivist, self.synthesizer)
+
+        # Barren self-study targets that fell out of dead-end detection's
+        # proxy check (§14.6 item 2) need the same tracking self-study's
+        # own barren set already uses -- reuse it directly rather than a
+        # second structure, see _self_study()'s Childhood-gating block.
 
         self.pulse_count = 0
         self.fatigue = 0.0
@@ -720,10 +727,31 @@ class Prometheus:
         `hard_cap` lets the (e) escape-valve fallback below retry with a
         looser ceiling once the strict cap has genuinely exhausted every
         productive node, rather than permanently halting growth.
+
+        §14, new: working-memory-aware targeting. In Childhood, self-study
+        candidates are hard-restricted to whatever's currently reachable
+        from working memory (SELF/basin/schema slots, §14.1) -- the direct
+        mechanism behind "stored-schema expansion heavily suppressed,
+        permitted only on clear dead-ends" (§14.2), and the fix for
+        self-study drifting arbitrarily far from what the user actually
+        taught (colors in, Hundred Years' War never comes up, because the
+        small working-memory buffer stays close to real input this early).
+        The dead-end check is is_dead_end()'s documented PROXY (§14.6 item
+        2 -- genuinely unresolved as a full mechanism, not just untuned;
+        see that method's docstring), not the fully-resolved design. In
+        Adolescence/Maturity, working-memory contents are boosted in the
+        weighted choice instead of hard-gating -- matching §14.2's
+        "transitional"/"no longer monopolizing" framing.
         """
         graph = self.archivist.graph
         if graph.number_of_nodes() == 0:
             return None
+
+        epoch_value = self.bio.epoch.value
+        key = self.synthesizer.get_current_basin_key()
+        basin_anchors = self._get_unique_anchors(key)
+        wm = self.working_memory.get_working_memory(epoch_value, basin_anchors)
+        in_scope_nodes = self.working_memory.reachable_nodes(wm)
 
         def has_room(n, d):
             return (
@@ -747,6 +775,15 @@ class Prometheus:
             if d.get("tier", 0) < TIER_WORKING and d.get("source") != "self_generated" and has_room(n, d)
         ]
 
+        # §14: Childhood hard-gate, unless the dead-end proxy fires.
+        if epoch_value == "Childhood":
+            dead_end = self.working_memory.is_dead_end(
+                wm, lambda n: has_room(n, graph.nodes.get(n, {})), self._barren_self_study_targets,
+            )
+            if not dead_end:
+                working_candidates = [n for n in working_candidates if n in in_scope_nodes]
+                provisional_candidates = [n for n in provisional_candidates if n in in_scope_nodes]
+
         # Bias-modulated pool selection (§13.1, new). NEUTRAL reproduces
         # the old hardcoded 0.6 exactly -- this is a strict extension, not
         # a behavior change, for anyone who hasn't touched the bias signal.
@@ -756,25 +793,35 @@ class Prometheus:
             "BIAS_STABILIZE": self.SELF_STUDY_PROVISIONAL_PROB_STABILIZE,
         }.get(bias, self.SELF_STUDY_PROVISIONAL_PROB_NEUTRAL)
 
+        # §14: outside Childhood, working-memory contents are boosted in
+        # the weighted choice rather than hard-gated -- "transitional"/
+        # "no longer monopolizing" per §14.2. Childhood already hard-gated
+        # the pools themselves above, so no additional boost is needed
+        # there (and would be redundant, since everything left in-pool is
+        # already in scope).
+        boost_set = in_scope_nodes if epoch_value != "Childhood" else None
+
         if working_candidates and provisional_candidates:
             # Weighted toward provisional under NEUTRAL/default: established
             # hubs already got their initial attention, fresh nodes need it
             # more. Under EXPLORE/STABILIZE, the ratio shifts instead per
             # provisional_prob above. Not a tuned ratio (§10) either way.
             pool = provisional_candidates if random.random() < provisional_prob else working_candidates
-            return self._weighted_choice_by_activation(pool, bias=bias)
+            return self._weighted_choice_by_activation(pool, bias=bias, boost_set=boost_set)
         if provisional_candidates:
-            return self._weighted_choice_by_activation(provisional_candidates, bias=bias)
+            return self._weighted_choice_by_activation(provisional_candidates, bias=bias, boost_set=boost_set)
         if working_candidates:
-            return self._weighted_choice_by_activation(working_candidates, bias=bias)
+            return self._weighted_choice_by_activation(working_candidates, bias=bias, boost_set=boost_set)
 
         # (c) fallback: whatever node is currently anchoring the felt
         # state, if any -- but only if it also still has room. Previously
         # uncapped, which was the main source of runaway single-node growth.
-        key = self.synthesizer.get_current_basin_key()
-        anchors = self.felt_state_anchors.get(key, [])
-        if anchors:
-            anchor = anchors[-1]
+        # Uses the RAW deque here (not basin_anchors, which is deduped and
+        # doesn't preserve most-recent-last order) so `[-1]` still means
+        # "most recently touched," matching original behavior exactly.
+        raw_anchors = self.felt_state_anchors.get(key, [])
+        if raw_anchors:
+            anchor = raw_anchors[-1]
             if anchor in graph and has_room(anchor, graph.nodes[anchor]):
                 return anchor
 
@@ -797,7 +844,8 @@ class Prometheus:
 
         return None
 
-    def _weighted_choice_by_activation(self, pool: List[str], bias: str = "BIAS_NEUTRAL") -> Optional[str]:
+    def _weighted_choice_by_activation(self, pool: List[str], bias: str = "BIAS_NEUTRAL",
+                                        boost_set: Optional[set] = None) -> Optional[str]:
         """Activation-weighted random choice (§11 pull-forward) --
         replaces uniform random.choice() for self-study target selection
         so recently-touched nodes are preferentially re-expanded, giving
@@ -808,16 +856,25 @@ class Prometheus:
         would risk narrowing the graph's growth to an ever-smaller hot
         set over time.
 
-        `bias` (new, this revision -- §13.1): under BIAS_EXPLORE, the
-        weighting is inverted -- low-activation (novel, rarely-touched)
-        nodes are preferred instead, using ACTIVATION_CAP minus each
-        node's activation as the weight, same epsilon floor for the
-        opposite reason (keeps a saturated node selectable at nonzero
-        probability rather than fully excluded). BIAS_STABILIZE and
-        BIAS_NEUTRAL both keep the original high-activation-preferring
-        weighting -- NEUTRAL reproduces prior behavior exactly; STABILIZE
-        reads as "deepen what's already active," which is what the
-        un-inverted weighting already does."""
+        `bias` (§13.1): under BIAS_EXPLORE, the weighting is inverted --
+        low-activation (novel, rarely-touched) nodes are preferred
+        instead, using ACTIVATION_CAP minus each node's activation as the
+        weight, same epsilon floor for the opposite reason (keeps a
+        saturated node selectable at nonzero probability rather than
+        fully excluded). BIAS_STABILIZE and BIAS_NEUTRAL both keep the
+        original high-activation-preferring weighting -- NEUTRAL
+        reproduces prior behavior exactly; STABILIZE reads as "deepen
+        what's already active," which is what the un-inverted weighting
+        already does.
+
+        `boost_set` (new, this revision -- §14): a multiplicative bonus
+        for nodes reachable from current working memory, used outside
+        Childhood (which hard-gates the candidate pools instead, so
+        nothing needs boosting there -- see _select_self_study_target).
+        Multiplicative rather than additive so it composes with whatever
+        the bias weighting already computed instead of overriding it --
+        a boosted node under BIAS_EXPLORE still respects the inverted
+        preference, just scaled up within it."""
         if not pool:
             return None
         if bias == "BIAS_EXPLORE":
@@ -827,6 +884,8 @@ class Prometheus:
             ]
         else:
             weights = [self.archivist.graph.nodes[n].get("activation", 0.0) + 0.1 for n in pool]
+        if boost_set:
+            weights = [w * 3.0 if n in boost_set else w for n, w in zip(pool, weights)]
         return random.choices(pool, weights=weights, k=1)[0]
 
     # ------------------------------------------------------------------
@@ -883,6 +942,16 @@ class Prometheus:
             if pruned:
                 print(f"Pruning: removed {pruned} stale Tier-0 node(s).")
             self.fatigue *= self.FATIGUE_RECOVERY_PRUNING  # Recovery (§5: "fatigue must have its own recovery curve")
+
+    def get_current_working_memory(self) -> dict:
+        """§14 convenience wrapper -- supplies the current epoch and basin
+        anchors automatically, so app.py's diagnostic panel (and any
+        other caller) doesn't need to reconstruct them each time. Safe to
+        call every Reflection-tab render; get_working_memory() itself is
+        a cheap on-demand computation, not maintained incremental state."""
+        key = self.synthesizer.get_current_basin_key()
+        basin_anchors = self._get_unique_anchors(key)
+        return self.working_memory.get_working_memory(self.bio.epoch.value, basin_anchors)
 
     def _run_consolidation(self):
         """
