@@ -10,6 +10,7 @@ from .synthesizer import SynthesizerModule
 from .reflector import ReflectorModule
 from .chronos import ChronosModule
 from .working_memory import WorkingMemoryModule
+from .self_narrative import NarrativeModule
 from .sensory import SensoryModule
 from .association import AssociationEngine
 from .stimulus import SyntheticStimulusEngine
@@ -182,6 +183,7 @@ class Prometheus:
         self.association = AssociationEngine(self.archivist, self.sensory)
         self.stimulus = SyntheticStimulusEngine(self.bio, self.archivist, self.reflector)
         self.working_memory = WorkingMemoryModule(self.archivist, self.synthesizer)
+        self.self_narrative = NarrativeModule(self.archivist, self.synthesizer)
 
         # Barren self-study targets that fell out of dead-end detection's
         # proxy check (§14.6 item 2) need the same tracking self-study's
@@ -404,10 +406,21 @@ class Prometheus:
         every existing consumer's "most recent genuine touch" bias while
         still guaranteeing real topics remain valid candidates. dict.
         fromkeys() below already dedups, so a node present in both stays
-        at its first (general-deque) position."""
+        at its first (general-deque) position.
+
+        Also folds in self_narrative.linked_nodes_above_floor() (§16.5.1/
+        §16.5.2, new this session) -- narratively significant nodes stay
+        candidates for both working memory display and (via
+        eligible_regulation_nodes()'s tier filter downstream) regulation,
+        the same way real conversational topics do. Appended last, after
+        both the general deque and the protected pool, so it's the
+        lowest-priority tiebreak among the three -- narrative significance
+        nudges what's visible, it doesn't compete with genuinely live
+        conversational recency for ordering."""
         general = list(self.felt_state_anchors.get(basin_key, []))
         protected = list(self._global_protected_anchors)
-        return list(dict.fromkeys(general + protected))
+        narrative = self.self_narrative.linked_nodes_above_floor()
+        return list(dict.fromkeys(general + protected + narrative))
 
     def _ingest(self, text: str, source: str):
         """Runs one piece of text through sensory + association + chronos
@@ -483,6 +496,13 @@ class Prometheus:
         negation_flagged = ("no, " in text_lower or "actually" in text_lower or "that's wrong" in text_lower)
         if negation_flagged and anchor:
             self.archivist.flag_negation(anchor)
+            # §16.6, new this session: if the negated node is covered by
+            # an existing narrative element, that element takes an
+            # immediate, larger-than-normal-decay cut rather than waiting
+            # for the next ordinary decay pass -- a correction to
+            # something narratively significant should land harder than
+            # an ordinary fact getting demoted.
+            self.self_narrative.apply_negation_penalty(anchor)
 
         # Hormonal reaction to real input (new, this revision) -- only for
         # genuine externally-triggered input, not dictionary-sourced
@@ -1059,6 +1079,14 @@ class Prometheus:
         basin_anchors = self._get_unique_anchors(key)
         return self.working_memory.get_working_memory(self.bio.epoch.value, basin_anchors)
 
+    def get_narrative_report(self, top_n: int = 10) -> dict:
+        """§16 convenience wrapper, matching get_current_working_memory()'s
+        pattern -- app.py's Mind/Narrative tab reads this directly rather
+        than reaching into self.self_narrative itself. Cheap on-demand
+        read, not maintained incremental state (the underlying element
+        set only changes at Consolidation; this just formats it)."""
+        return self.self_narrative.report(top_n=top_n)
+
     def _run_consolidation(self):
         """
         Everything the spec pins to the Consolidation clock, in one place
@@ -1108,6 +1136,17 @@ class Prometheus:
         self.archivist.decay_co_activation()
         newly_named_epistemic = self.reflector.try_name_epistemic_schemas()
 
+        # §16, new this session: Self-Narrative evaluation. Runs after
+        # both schema-detection passes (so this pass's newly-formed
+        # schemas are available as trigger 1/2 material the same cycle,
+        # not a pass late -- same ordering rationale already used for
+        # everything else in this method) and before the checkpoint save.
+        narrative_summary = self.self_narrative.evaluate(
+            new_somatic_schema_ids=new_schemas,
+            new_epistemic_schema_ids=new_epistemic_schemas,
+            current_intensity=self.synthesizer.get_current_intensity(),
+        )
+
         # §4C: the single checkpoint call for this pass -- everything
         # above mutates the graph and/or hormonal state without saving
         # individually (see the "No self.save() here" comments in
@@ -1116,6 +1155,7 @@ class Prometheus:
         self.archivist.save()
         self.bio.save_state()
         self.synthesizer.save_state()
+        self.self_narrative.save()
 
         if trust_summary.get("promotions") or trust_summary.get("demotions"):
             print(f"Consolidation trust pass: {trust_summary}")
@@ -1127,6 +1167,8 @@ class Prometheus:
             print(f"Consolidation: formed {len(new_epistemic_schemas)} new Epistemic Schema Node(s): {new_epistemic_schemas}")
         if newly_named_epistemic:
             print(f"Consolidation: named {newly_named_epistemic} Epistemic Schema Node(s).")
+        if narrative_summary.get("created") or narrative_summary.get("absorbed") or narrative_summary.get("pruned"):
+            print(f"Consolidation: Self-Narrative {narrative_summary}")
 
     # ------------------------------------------------------------------
     # §4 Regulation
@@ -1277,9 +1319,11 @@ class Prometheus:
         from .chronos import CHRONOS_LOG_PATH
         from .hormonal import BIOSYSTEM_STATE_PATH
         from .synthesizer import BASIN_STATE_PATH
+        from .self_narrative import NARRATIVE_STATE_PATH
 
         removed = []
-        for path in (EPISTEMIC_GRAPH_PATH, CHRONOS_LOG_PATH, BIOSYSTEM_STATE_PATH, BASIN_STATE_PATH):
+        for path in (EPISTEMIC_GRAPH_PATH, CHRONOS_LOG_PATH, BIOSYSTEM_STATE_PATH, BASIN_STATE_PATH,
+                     NARRATIVE_STATE_PATH):
             if os.path.exists(path):
                 os.remove(path)
                 removed.append(path)

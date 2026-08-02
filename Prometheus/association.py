@@ -201,15 +201,26 @@ class AssociationEngine:
     # detection. Called from prometheus.py's tick loop whenever sensory.py
     # detects candidates in incoming text.
     # ------------------------------------------------------------------
-    def link_relational(self, event_node: str, relation_types: List[str], source: str = "user"):
+    def link_relational(self, event_node: str, relation_types: List[str], source: str = "user",
+                         felt_state: Optional[str] = None):
         """`concerns-other` links to a generic OTHER placeholder entity
         rather than SELF, since by definition it involves someone other
-        than SELF; the other three types link SELF -> event_node."""
+        than SELF; the other three types link SELF -> event_node.
+
+        `felt_state`: threaded through to archivist.link()'s own
+        felt_state parameter, which stamps felt_state_at_creation directly
+        onto the edge -- ground truth at creation time, more reliable than
+        chronos._felt_state_near()'s after-the-fact nearest-timestamp
+        reconstruction (see archivist.link()'s own docstring for the bug
+        this avoids). Optional and backward-compatible: omitting it falls
+        back to that reconstruction, same as any edge created without it."""
         for rel in relation_types:
             if rel == "concerns-other":
-                self.archivist.link("OTHER", event_node, "concerns-other", source=source, placement="explicit")
+                self.archivist.link("OTHER", event_node, "concerns-other", source=source,
+                                     placement="explicit", felt_state=felt_state)
             else:
-                self.archivist.link(SELF_NODE, event_node, rel, source=source, placement="explicit")
+                self.archivist.link(SELF_NODE, event_node, rel, source=source,
+                                     placement="explicit", felt_state=felt_state)
 
     # ------------------------------------------------------------------
     # §2.1b item 4a: Schema Node naming trigger. Called whenever a term
