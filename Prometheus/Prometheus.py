@@ -215,6 +215,62 @@ class Prometheus:
         self.felt_state_anchors = {}
         self.ANCHOR_WINDOW_SIZE = 20  # same tuning-placeholder category as everything else (§10)
 
+        # Bug fix (this session): felt_state_anchors is written by BOTH
+        # _ingest() (real user/dictionary input) and _self_study() (lines
+        # ~649/657), sharing one bounded deque per basin key. Under a Run
+        # Batch with few real messages and many self-study ticks (the
+        # reported case: 5 real seed words, 255 total pulses), self-
+        # study's own volume of appends evicts real anchors out of the
+        # window entirely within the first ANCHOR_WINDOW_SIZE (20)
+        # self-study touches after they were typed -- long before pulse
+        # 255. Two concrete, compounding consequences: (a)
+        # get_current_working_memory() can no longer see the real seed
+        # words as candidates at all (not just outranked -- evicted from
+        # the candidate pool entirely), which is what the person's
+        # screenshot showed (7 self-study-derived words, zero of the 5
+        # real ones); (b) _select_self_study_target()'s own working-
+        # memory-scoped candidate pool (§14, "colors in, Hundred Years'
+        # War never comes up") loses its tether for the same reason --
+        # self-study drifts away from exactly the topic it was designed
+        # to stay anchored to, because its own churn evicted the anchor
+        # meant to constrain it.
+        #
+        # Fixed with a second, small, separately-bounded deque per basin
+        # key that ONLY _ingest() ever writes to (self-study never
+        # touches it, by construction -- see _record_protected_anchor's
+        # only call site). _get_unique_anchors() merges both, so every
+        # existing consumer (working-memory display, self-study's own
+        # scoping, regulation, parental feedback) keeps seeing real
+        # conversational anchors regardless of how much self-study churn
+        # happened in between -- without changing felt_state_anchors'
+        # existing structure/behavior at all, since every other read site
+        # (e.g. _ingest's own `anchors[-1]` immediate-context lookup)
+        # still reads the original deque directly, unaffected.
+        # Bug fix (this session, revised after testing against the actual
+        # reported scenario): initially implemented as a second deque
+        # PER BASIN KEY, mirroring felt_state_anchors' own structure.
+        # That didn't actually solve the reported problem -- confirmed by
+        # reproducing it: real input got correctly recorded, but under
+        # whatever basin key was active AT THE MOMENT of typing, and by
+        # 255 pulses later the system had drifted to a different key,
+        # so the protected entry was invisible again anyway, just for a
+        # different reason (wrong-bucket, not evicted). The person's own
+        # framing makes the actual need clear: five words typed as
+        # deliberate topic-setting input ("colors, emotions, food,
+        # animals, plants") should keep the system engaged with those
+        # topics regardless of which momentary mood/basin it's currently
+        # in -- not be treated as mood-specific remarks that only matter
+        # when that exact mood recurs. That's a different, coarser kind
+        # of memory than felt_state_anchors was ever designed to hold
+        # (basin-scoped association is correct for ITS purpose -- this is
+        # a separate need). Implemented here as a single, basin-
+        # INDEPENDENT bounded pool instead: real conversational touches
+        # stay visible to working memory / self-study scoping across mood
+        # changes, until they age out of this small window on their own
+        # terms (still bounded -- not a route back to unbounded growth).
+        self.PROTECTED_ANCHOR_WINDOW_SIZE = 15  # global pool now (see docstring above) -- bigger than the old per-basin-key allowance made sense to be, since it's the only place real topics persist across mood changes; still a §10-category tuning placeholder
+        self._global_protected_anchors = deque(maxlen=self.PROTECTED_ANCHOR_WINDOW_SIZE)
+
         # Co-activation broadening (§13.3, new). Diagnosed from production
         # data (18 tracked pairs / 0 stabilized after 3833 pulses, 3355
         # nodes): the original co-activation sources (a self-study cycle's
@@ -306,6 +362,16 @@ class Prometheus:
 
         self.felt_state_anchors[basin_key].append(node)
 
+    def _record_protected_anchor(self, node: str):
+        """Bug fix (this session) -- see the global pool's docstring at
+        __init__ for the full diagnosis, including why this ended up
+        basin-key-independent after the first version (keyed the same
+        way as felt_state_anchors) turned out not to solve the actual
+        reported problem. Only ever called from _ingest() (real user/
+        dictionary input); _self_study() must never call this, by
+        construction -- that exclusion is the entire mechanism."""
+        self._global_protected_anchors.append(node)
+
     def _get_unique_anchors(self, basin_key) -> List[str]:
         """Bug fix, this revision (found from production data): the
         anchor deque is a touch LOG, not a set -- it can and does contain
@@ -326,8 +392,22 @@ class Prometheus:
         co-occurrence events over time" property this mechanism depends
         on (§13.2). Order-preserving dedup (most-recent-first callers
         don't currently rely on order here, but preserving it is free and
-        avoids surprising anyone who later does)."""
-        return list(dict.fromkeys(self.felt_state_anchors.get(basin_key, [])))
+        avoids surprising anyone who later does).
+
+        Merge fix (this session, revised -- see the global pool's
+        docstring at __init__): folds in _global_protected_anchors,
+        regardless of basin_key -- real conversational topics stay
+        candidates for working memory / self-study scoping across mood
+        changes, not just within whatever felt state was active at the
+        moment they were typed. Appended after the general deque's own
+        entries, not prepended, for the same reason as before: preserves
+        every existing consumer's "most recent genuine touch" bias while
+        still guaranteeing real topics remain valid candidates. dict.
+        fromkeys() below already dedups, so a node present in both stays
+        at its first (general-deque) position."""
+        general = list(self.felt_state_anchors.get(basin_key, []))
+        protected = list(self._global_protected_anchors)
+        return list(dict.fromkeys(general + protected))
 
     def _ingest(self, text: str, source: str):
         """Runs one piece of text through sensory + association + chronos
@@ -369,6 +449,32 @@ class Prometheus:
         if felt_state != "Unformed" and node:
             self.chronos.record_felt_state_link(basin_key, node)
             self._record_anchor(basin_key, node)
+
+        # Bug fix (this session), split out from the block above on
+        # purpose: the `felt_state != "Unformed"` gate exists to protect
+        # chronos.record_felt_state_link()'s role as the evidence log
+        # §6.1's naming-reliability gate reads from -- recording a link
+        # before a basin has a name would muddy what that mechanism is
+        # measuring. But that rationale has nothing to do with protected-
+        # anchor visibility (§14 working memory, self-study's own
+        # candidate scoping) -- those only care about the numeric
+        # (arousal, valence, dominance) key, which is always well-defined
+        # every tick regardless of whether that region has stabilized
+        # into a NAMED felt state yet (naming is a lookup label on top of
+        # an always-valid key, not a precondition for the key's
+        # existence). Conflating the two under one gate meant real input
+        # typed before any felt state had stabilized -- the ordinary case
+        # for a fresh session's first few messages, confirmed as the
+        # actual root cause of the reported "working memory never shows
+        # my seed words" symptom -- never got a protected anchor recorded
+        # at all, permanently, since _ingest() only records at the moment
+        # of typing and there's no later backfill once a name eventually
+        # gets assigned to that region. _record_anchor's own gating is
+        # deliberately left untouched here -- untangling its relationship
+        # to naming-reliability/co-activation is a separate, larger
+        # question this fix doesn't take on.
+        if node and source in ("user", "dictionary"):
+            self._record_protected_anchor(node)
 
         # Explicit negation/correction (§3.4 mechanism 1): flag whatever
         # node was most recently active for gradual demotion at the next

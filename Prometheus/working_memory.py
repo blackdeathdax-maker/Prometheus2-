@@ -80,6 +80,28 @@ class WorkingMemoryModule:
     # not just generically active) get a flat bonus in the ranking.
     BASIN_COOCCURRENCE_BONUS = 5.0
 
+    # Bug fix (this session): _score_candidate previously used a bare
+    # `10.0` literal for the user-priority bonus spread, not a named
+    # tunable like every other constant in this module. Worse than a
+    # style inconsistency: 10.0 is the same order of magnitude as
+    # archivist.ACTIVATION_CAP (also 10.0), so the two terms could
+    # compete on comparable footing at the extremes -- a fully-decayed
+    # real (user-linked) node in Childhood scores 0.95*10.0=9.5, while a
+    # maxed-out self-study node scores 10.0(activation)+0.05*10.0=10.5,
+    # letting self-study content win a slot despite CHILDHOOD_USER_
+    # PRIORITY's own docstring stating "almost entirely user-driven."
+    # USER_PRIORITY_WEIGHT=20.0 raises the spread enough that Childhood's
+    # 0.95 priority reliably dominates the FULL activation range (worst-
+    # case real=19.0 vs best-case self-study=11.0), while deliberately
+    # leaving Adolescence's weaker 0.6 priority genuinely contestable
+    # (worst-case real=12.0 vs best-case self-study=18.0, self-study can
+    # still win) -- consistent with §14.2's own "transitional... no
+    # longer monopolizing" framing for that epoch. Still a §10-category
+    # tuning placeholder, not a claimed-final value -- verified only to
+    # actually deliver the *qualitative* guarantee the docstrings already
+    # claimed, not tuned beyond that.
+    USER_PRIORITY_WEIGHT = 20.0
+
     def __init__(self, archivist, synthesizer):
         self.archivist = archivist
         self.synthesizer = synthesizer
@@ -98,6 +120,7 @@ class WorkingMemoryModule:
         self.MATURITY_RESERVED_SLOTS = WorkingMemoryModule.MATURITY_RESERVED_SLOTS
         self.CALM_PRIORITY_SOFTENING_MAX = WorkingMemoryModule.CALM_PRIORITY_SOFTENING_MAX
         self.BASIN_COOCCURRENCE_BONUS = WorkingMemoryModule.BASIN_COOCCURRENCE_BONUS
+        self.USER_PRIORITY_WEIGHT = WorkingMemoryModule.USER_PRIORITY_WEIGHT
 
     # ------------------------------------------------------------------
     # §14.3 Emotional Gating of Capacity
@@ -189,9 +212,9 @@ class WorkingMemoryModule:
 
         user_priority = self._effective_user_priority(epoch_value)
         if self.is_user_linked(node):
-            score += user_priority * 10.0
+            score += user_priority * self.USER_PRIORITY_WEIGHT
         else:
-            score += (1.0 - user_priority) * 10.0
+            score += (1.0 - user_priority) * self.USER_PRIORITY_WEIGHT
 
         # §14.4: schemas/nodes actually co-occurring with the CURRENT
         # basin (not just generically active) get an extra bonus, on top
