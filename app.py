@@ -3,6 +3,7 @@ Streamlit entry point (§7, §4B). Hosts the tabbed layout: Graph / State / Refl
 """
 import streamlit as st
 from Prometheus.Prometheus import Prometheus
+from Prometheus.archivist import SELF_NODE
 from prometheus_dashboard import render_graph_html
 
 st.set_page_config(page_title="Prometheus", layout="wide")
@@ -93,9 +94,9 @@ if st.session_state.prom is not None:
             result = prom.give_parental_reaction("concern")
             st.sidebar.success(f"Concern given ({len(result['anchors_colored'])} node(s) colored)")
 
-    # Tabbed layout per §4B: Graph / State / Reflection / Debug
-    tab_graph, tab_state, tab_reflection, tab_debug = st.tabs(
-        ["Graph", "State", "Reflection", "Debug"]
+    # Tabbed layout per §4B: Graph / State / Reflection / Working Memory / Debug
+    tab_graph, tab_state, tab_reflection, tab_working_memory, tab_debug = st.tabs(
+        ["Graph", "State", "Reflection", "Working Memory", "Debug"]
     )
 
     # ================================================================
@@ -473,6 +474,87 @@ if st.session_state.prom is not None:
                         "fault\" to grow SELF, or \"my friend did that\" to "
                         "grow OTHER."
                     )
+
+    # ================================================================
+    # TAB: WORKING MEMORY -- Graph view of the actual 7-slot working
+    # memory (§18 pull-forward, new), distinct from the Graph tab's
+    # top-K-by-activation focus view and from the Reflection tab's
+    # text-only slot summary (§14) -- this renders what's actually "in
+    # mind" right now as a graph, and surfaces the Self-Narrative (§16,
+    # new) alongside it, since narrative-linked nodes now feed the same
+    # anchor pool that determines what lands in these slots.
+    # ================================================================
+    with tab_working_memory:
+        st.subheader("Working Memory")
+        if prom is None:
+            st.info("Start the system from the sidebar first.")
+        else:
+            st.caption(
+                "Graph rendering of the actual 7-slot working memory "
+                "(§14): SELF + current basin + up to 7 schema-cluster "
+                "slots. Distinct from the Graph tab's 'Focus size' view, "
+                "which shows the top-K most-active nodes generally -- "
+                "this shows specifically what get_working_memory() "
+                "currently holds, the same content already listed as "
+                "text on the Reflection tab, rendered visually here."
+            )
+
+            wm = prom.get_current_working_memory()
+            key = prom.synthesizer.get_current_basin_key()
+            basin_id = prom.synthesizer.stabilized_basins.get(key)
+
+            node_subset = {SELF_NODE}
+            if basin_id and basin_id in prom.archivist.graph:
+                node_subset.add(basin_id)
+            node_subset.update(s for s in wm["slots"] if s in prom.archivist.graph)
+
+            wm_col1, wm_col2, wm_col3 = st.columns(3)
+            with wm_col1:
+                st.metric("Epoch", prom.bio.epoch.value)
+            with wm_col2:
+                st.metric("Schema slot capacity", f"{wm['capacity']} / {prom.working_memory.MAX_SCHEMA_SLOTS}")
+            with wm_col3:
+                st.metric("Nodes shown", len(node_subset))
+
+            html = render_graph_html(prom.archivist, node_subset=node_subset)
+            st.components.v1.html(html, height=500)
+
+            st.write("**Slot contents:**")
+            if wm["slots"]:
+                for slot in wm["slots"]:
+                    data = prom.archivist.graph.nodes.get(slot, {})
+                    node_type = data.get("node_type", "standard")
+                    label = data.get("name") or slot
+                    user_linked = " (user-linked)" if prom.working_memory.is_user_linked(slot) else ""
+                    st.write(f"- `{label}` ({node_type}){user_linked}")
+            else:
+                st.caption("No schema slots filled yet.")
+
+            st.divider()
+            st.subheader("Self-Narrative (§16, new)")
+            st.caption(
+                "Compressed, decaying record of what has turned out to "
+                "matter -- distinct from the slot-based working memory "
+                "above (short-horizon, 'what's in mind right now'). "
+                "Elements at or above the salience floor feed into the "
+                "same anchor pool that determines working-memory/self-"
+                "study/regulation candidacy, so narratively significant "
+                "content gets a better shot at showing up above even "
+                "when it isn't the current felt state's own anchor."
+            )
+            narrative_report = prom.get_narrative_report()
+            st.metric("Total narrative elements", narrative_report["total_elements"])
+            if narrative_report["top_elements"]:
+                for el in narrative_report["top_elements"]:
+                    sign_str = ""
+                    if el["sign"] is not None:
+                        sign_str = f", sign={el['sign']:+.2f}"
+                    linked = ", ".join(f"`{n}`" for n in el["linked_nodes"])
+                    st.write(
+                        f"- **{el['element_type']}** (weight={el['weight']:.2f}{sign_str}): {linked}"
+                    )
+            else:
+                st.caption("No narrative elements formed yet.")
 
     # ================================================================
     # TAB: DEBUG -- Raw internal state (§4B, one sanctioned exception)
