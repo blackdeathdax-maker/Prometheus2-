@@ -464,6 +464,113 @@ class NarrativeModule:
     # already used by reflector.py -- activation_report,
     # valence_coloring_report, etc.)
     # ------------------------------------------------------------------
+    _ELEMENT_TYPE_LABELS = {
+        ELEMENT_SOMATIC_SCHEMA: "Recurring emotional pattern",
+        ELEMENT_EPISTEMIC_SCHEMA: "Knowledge cluster",
+        ELEMENT_RELATIONAL_PATTERN: "Repeated self-relevant experience",
+        ELEMENT_PARENTAL_COLORING: "Strongly felt association",
+        ELEMENT_BASIN_SHIFT: "Emotional shift",
+    }
+
+    def _pad_description(self, node: str) -> str:
+        """Plain, deterministic PAD-coordinate-to-adjective mapping for
+        basin nodes -- basins are never given human names by this design
+        (§2.1a: felt states are earned/named only via §6.1's knowledge-
+        node linkage, which most basins never receive), so a raw
+        `basin_0.5_0.2_0.5`-style id is the only identifier most basins
+        ever have. This turns that id's own coordinates into a short,
+        readable phrase instead -- no new data, just decoding what the id
+        already encodes.
+
+        Bug fix (found via testing): an earlier 2-bucket-per-axis version
+        of this let two genuinely different basins collapse into an
+        identical-sounding description (e.g. a basin-shift element
+        reading "from a high-arousal, positive, in-control state to a
+        high-arousal, positive, in-control state" -- technically
+        accurate per-axis, but reads as no shift at all when the actual
+        coordinates clearly differed). Finer 3-level bucketing per axis
+        plus the raw numbers alongside fixes this -- still deliberately
+        plain/mechanical, not evocative prose, consistent with this
+        project's preference for boring, checkable descriptions over
+        flavorful ones that could misrepresent a bare coordinate."""
+        data = self.archivist.graph.nodes.get(node, {})
+        if data.get("name"):
+            return data["name"]
+        pad = data.get("pad_coordinates")
+        if pad is None and node.startswith("basin_"):
+            try:
+                pad = tuple(float(x) for x in node[len("basin_"):].split("_"))
+            except ValueError:
+                pad = None
+        if pad is None or len(pad) < 3:
+            return node
+        arousal, valence, dominance = pad[0], pad[1], pad[2]
+
+        def bucket(v: float, low: str, mid: str, high: str, low_hi: float, high_lo: float) -> str:
+            if v < low_hi:
+                return low
+            if v >= high_lo:
+                return high
+            return mid
+
+        arousal_word = bucket(arousal, "low-arousal", "moderate-arousal", "high-arousal", 0.35, 0.65)
+        valence_word = bucket(valence, "negative", "mixed/neutral", "positive", -0.2, 0.2)
+        dominance_word = bucket(dominance, "overwhelmed", "somewhat in-control", "in-control", 0.35, 0.65)
+        return (f"{arousal_word} ({arousal:.2f}), {valence_word} ({valence:.2f}), "
+                f"{dominance_word} ({dominance:.2f})")
+
+    def _describe_element(self, el: dict) -> str:
+        """Resolves an element's linked_nodes into a human-readable
+        description using data that already exists on the graph (name
+        fields, member_count, relation_types, basin coordinates) --
+        display-time only, never stored, never influences any decision
+        logic. The raw element_id/linked_nodes are still returned
+        alongside this in report()'s output for anyone who wants the
+        exact underlying data."""
+        etype = el["element_type"]
+        nodes = el["linked_nodes"]
+        graph = self.archivist.graph
+
+        def label(n: str) -> str:
+            data = graph.nodes.get(n, {})
+            return data.get("name") or n
+
+        if etype in (ELEMENT_SOMATIC_SCHEMA, ELEMENT_EPISTEMIC_SCHEMA):
+            node = nodes[0]
+            data = graph.nodes.get(node, {})
+            if data.get("name"):
+                return f'named "{data["name"]}"'
+            if etype == ELEMENT_EPISTEMIC_SCHEMA:
+                members = [
+                    v for _u, v, d in graph.out_edges(node, data=True)
+                    if d.get("relation_type") == EDGE_COMPOSED_OF
+                ]
+                preview = ", ".join(label(m) for m in members[:4])
+                more = f" (+{len(members) - 4} more)" if len(members) > 4 else ""
+                return f"not yet named -- {data.get('member_count', len(members))} member(s): {preview}{more}"
+            relation_types = data.get("relation_types", [])
+            basin_label = self._pad_description(data.get("basin", ""))
+            return f"not yet named -- felt during {basin_label}, involving {', '.join(relation_types)}"
+
+        if etype == ELEMENT_RELATIONAL_PATTERN:
+            node = nodes[0]
+            rel_types = sorted({
+                d.get("relation_type") for u, v, d in graph.in_edges(node, data=True)
+                if u in (SELF_NODE, OTHER_NODE) and d.get("relation_type") in RELATIONAL_EDGE_TYPES
+            })
+            return f'"{label(node)}" ({", ".join(rel_types) if rel_types else "relational"})'
+
+        if etype == ELEMENT_PARENTAL_COLORING:
+            node = nodes[0]
+            sign = el.get("sign") or 0.0
+            feeling = "warmly regarded" if sign >= 0 else "uneasily regarded"
+            return f'"{label(node)}" -- {feeling} ({sign:+.2f})'
+
+        if etype == ELEMENT_BASIN_SHIFT and len(nodes) >= 2:
+            return f"from {self._pad_description(nodes[0])} to {self._pad_description(nodes[1])}"
+
+        return ", ".join(label(n) for n in nodes)
+
     def report(self, top_n: int = 10) -> Dict:
         ranked = sorted(self.elements.values(), key=lambda el: el["weight"], reverse=True)
         return {
@@ -472,9 +579,13 @@ class NarrativeModule:
                 {
                     "element_id": el["element_id"],
                     "element_type": el["element_type"],
+                    "type_label": self._ELEMENT_TYPE_LABELS.get(el["element_type"], el["element_type"]),
+                    "description": self._describe_element(el),
                     "linked_nodes": el["linked_nodes"],
                     "weight": round(el["weight"], 3),
                     "sign": el["sign"],
+                    "formed_at": el["formed_at"],
+                    "last_reinforced_at": el["last_reinforced_at"],
                 }
                 for el in ranked[:top_n]
             ],
