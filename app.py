@@ -496,17 +496,54 @@ if st.session_state.prom is not None:
                 "which shows the top-K most-active nodes generally -- "
                 "this shows specifically what get_working_memory() "
                 "currently holds, the same content already listed as "
-                "text on the Reflection tab, rendered visually here."
+                "text on the Reflection tab, rendered visually here. "
+                "Each slot's immediate graph neighbors are also shown "
+                "(bounded, most-recent-first) so real edges are visible "
+                "instead of the view looking artificially disconnected -- "
+                "slots are chosen by independent activation scoring, not "
+                "by being graph-adjacent to each other, so without this "
+                "a node can have confirmed edges that simply have nowhere "
+                "to render. The **Slot contents** list below is the exact "
+                "slot set, unaffected by this -- the graph shows more "
+                "nodes than that list for context."
             )
 
             wm = prom.get_current_working_memory()
             key = prom.synthesizer.get_current_basin_key()
             basin_id = prom.synthesizer.stabilized_basins.get(key)
 
-            node_subset = {SELF_NODE}
+            wm_core = {SELF_NODE}
             if basin_id and basin_id in prom.archivist.graph:
-                node_subset.add(basin_id)
-            node_subset.update(s for s in wm["slots"] if s in prom.archivist.graph)
+                wm_core.add(basin_id)
+            wm_core.update(s for s in wm["slots"] if s in prom.archivist.graph)
+
+            # Bug fix (this session): rendering *only* the slot set makes
+            # the graph look artificially empty/disconnected even when the
+            # underlying data is healthy -- working-memory slots are
+            # chosen by independent activation-based scoring, not by being
+            # graph-adjacent to each other, so a node like "Emotions" can
+            # have real, confirmed edges (to its co-occurrence anchor, a
+            # self-study-derived child, etc.) that simply don't render
+            # because the OTHER endpoint didn't also score into the top-7
+            # and so isn't in node_subset -- render_graph_html() only
+            # draws an edge when BOTH endpoints are present. This is the
+            # exact same rendering blind spot archivist.working_memory_
+            # nodes() already fixed for SELF/OTHER specifically (see that
+            # method's own docstring) -- generalized here to every node in
+            # THIS subset, not just SELF/OTHER, since the slot members
+            # deserve the same treatment. Bounded per-node (not
+            # unconditionally all neighbors), same "bounded, not
+            # unbounded" principle as everything else in this design.
+            MAX_NEIGHBORS_PER_NODE = 5
+            graph = prom.archivist.graph
+            node_subset = set(wm_core)
+            for n in wm_core:
+                if n not in graph:
+                    continue
+                neighbor_edges = list(graph.out_edges(n, data=True)) + list(graph.in_edges(n, data=True))
+                neighbor_edges.sort(key=lambda e: e[2].get("created_at", ""), reverse=True)
+                for u, v, _d in neighbor_edges[:MAX_NEIGHBORS_PER_NODE]:
+                    node_subset.add(v if u == n else u)
 
             wm_col1, wm_col2, wm_col3 = st.columns(3)
             with wm_col1:
@@ -514,7 +551,7 @@ if st.session_state.prom is not None:
             with wm_col2:
                 st.metric("Schema slot capacity", f"{wm['capacity']} / {prom.working_memory.MAX_SCHEMA_SLOTS}")
             with wm_col3:
-                st.metric("Nodes shown", len(node_subset))
+                st.metric("Nodes shown", f"{len(node_subset)} ({len(wm_core)} slot members + neighbors)")
 
             html = render_graph_html(prom.archivist, node_subset=node_subset)
             st.components.v1.html(html, height=500)
@@ -546,13 +583,12 @@ if st.session_state.prom is not None:
             st.metric("Total narrative elements", narrative_report["total_elements"])
             if narrative_report["top_elements"]:
                 for el in narrative_report["top_elements"]:
-                    sign_str = ""
-                    if el["sign"] is not None:
-                        sign_str = f", sign={el['sign']:+.2f}"
-                    linked = ", ".join(f"`{n}`" for n in el["linked_nodes"])
-                    st.write(
-                        f"- **{el['element_type']}** (weight={el['weight']:.2f}{sign_str}): {linked}"
-                    )
+                    st.write(f"**{el['type_label']}** (weight={el['weight']:.2f}): {el['description']}")
+                    with st.expander("Raw data", expanded=False):
+                        st.write(f"`{el['element_id']}`")
+                        st.write(f"Linked nodes: {', '.join(f'`{n}`' for n in el['linked_nodes'])}")
+                        st.write(f"First formed: {el['formed_at']}")
+                        st.write(f"Last reinforced: {el['last_reinforced_at']}")
             else:
                 st.caption("No narrative elements formed yet.")
 
