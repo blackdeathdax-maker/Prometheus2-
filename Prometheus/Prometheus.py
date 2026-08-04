@@ -1134,7 +1134,7 @@ class Prometheus:
         # eligible.
         new_epistemic_schemas = self.reflector.detect_epistemic_clusters()
         self.archivist.decay_co_activation()
-        newly_named_epistemic = self.reflector.try_name_epistemic_schemas()
+        merged_epistemic = self.reflector.merge_duplicate_epistemic_schemas()
 
         # §16, new this session: Self-Narrative evaluation. Runs after
         # both schema-detection passes (so this pass's newly-formed
@@ -1165,8 +1165,8 @@ class Prometheus:
             print(f"Consolidation: formed {len(new_schemas)} new Schema Node(s): {new_schemas}")
         if new_epistemic_schemas:
             print(f"Consolidation: formed {len(new_epistemic_schemas)} new Epistemic Schema Node(s): {new_epistemic_schemas}")
-        if newly_named_epistemic:
-            print(f"Consolidation: named {newly_named_epistemic} Epistemic Schema Node(s).")
+        if merged_epistemic:
+            print(f"Consolidation: merged {merged_epistemic} duplicate Epistemic Schema Node(s) into their named parent.")
         if narrative_summary.get("created") or narrative_summary.get("absorbed") or narrative_summary.get("pruned"):
             print(f"Consolidation: Self-Narrative {narrative_summary}")
 

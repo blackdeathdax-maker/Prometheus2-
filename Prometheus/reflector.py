@@ -240,13 +240,46 @@ class ReflectorModule:
         connected components of a temporary co-activation graph --
         deterministic, inspectable graph theory (same standard already
         used for cycle handling in the original §13.3 proposal), not an
-        opaque clustering library. A candidate becomes a real (unnamed)
-        Epistemic Schema Node if it has at least EPISTEMIC_MIN_CLUSTER_SIZE
-        members and doesn't already share a single dominant parent
-        (skipped in that case -- that parent already names the group,
-        creating a second, competing structure for the same thing would
-        be redundant, not useful). Returns the list of newly-created
-        schema ids.
+        opaque clustering library. Returns the list of newly-CREATED
+        schema ids (growing an existing schema's membership doesn't count
+        as "new" here, same as before).
+
+        Bug fix, this session ("epistemic schema collapse and naming"):
+        cluster identity previously came from a hash of the exact member
+        set (_epistemic_cluster_id's old implementation). As a cluster
+        grows -- the ordinary, expected case, since co-activation keeps
+        accumulating every tick -- that hash changes completely, so a
+        *new* schema node got created for the grown cluster instead of
+        the existing one updating in place. The old node was never
+        removed or superseded; it just sat there, decaying, orphaned.
+        Confirmed in production: 4 separate epistemic_schema elements
+        with descending weights turned out to be successive growth
+        snapshots of the same evolving cluster, each permanently frozen
+        as its own node.
+
+        This also explains why naming rarely landed on the cases that
+        most needed it: _has_dominant_shared_parent() only ran at
+        FORMATION time, to decide whether to skip creating a schema at
+        all (a real parent already "names" the group). It was never
+        rechecked for schemas already formed earlier, before their parent
+        had caught up in coverage -- so a schema could become genuinely
+        redundant with an already-named hierarchy parent later on, and
+        nothing ever collapsed it into that name; it just stayed an
+        anonymous hash forever.
+
+        Fixed by giving a cluster's identity to its dominant is-a parent
+        directly, once that parent covers >= EPISTEMIC_NAME_MIN_COVERAGE
+        members ("the most logical naming is the parent node's original
+        name" -- there's no need for separate naming logic at all once
+        identity IS the parent): the schema id becomes
+        `epistemic_of_{parent}`, named immediately at creation using the
+        parent's own existing label, and growing membership under the
+        same parent updates that SAME node (new composed-of edges added,
+        member_count bumped) rather than spawning a duplicate. Only
+        clusters with NO dominant parent (genuine cross-cutting co-
+        activation with no existing hierarchy explaining it) still get an
+        anonymous hash id and stay unnamed -- exactly the case that
+        legitimately has no existing word to borrow.
 
         Tier-gated to Working/Trusted members only (§14, "Option B" --
         agreed the same session as a fix for over-eager formation:
@@ -284,15 +317,31 @@ class ReflectorModule:
             if len(members) < self.EPISTEMIC_MIN_CLUSTER_SIZE:
                 continue
 
-            if self._has_dominant_shared_parent(members):
-                continue  # already named via ordinary hierarchy -- redundant to cluster
+            dominant_parent, _coverage = self._dominant_parent(members)
+            cluster_id = self._epistemic_cluster_id(members, dominant_parent)
 
-            cluster_id = self._epistemic_cluster_id(members)
             if cluster_id in graph:
-                continue  # already formed, nothing new to do
+                # Growth path: the same schema (identified by parent, or
+                # by member-hash for parent-less clusters) already exists
+                # -- add any newly-qualifying members and refresh
+                # metadata, rather than treating "already exists" as
+                # "nothing to do." This is the actual collapse fix: a
+                # cluster that keeps growing keeps updating ONE node.
+                existing_members = {
+                    v for _u, v, edata in graph.out_edges(cluster_id, data=True)
+                    if edata.get("relation_type") == EDGE_COMPOSED_OF
+                }
+                new_members = [m for m in members if m not in existing_members]
+                for member in new_members:
+                    graph.add_edge(cluster_id, member, relation_type=EDGE_COMPOSED_OF,
+                                    source="schema", placement="explicit",
+                                    created_at=datetime.now().isoformat())
+                if new_members:
+                    graph.nodes[cluster_id]["member_count"] = len(existing_members) + len(new_members)
+                    graph.nodes[cluster_id]["last_reinforced"] = datetime.now()
+                continue
 
-            graph.add_node(
-                cluster_id,
+            node_kwargs = dict(
                 source="schema",
                 tier=TIER_WORKING,
                 last_reinforced=datetime.now(),
@@ -302,10 +351,16 @@ class ReflectorModule:
                 valence_coloring=0.0,
                 node_type=NODE_EPISTEMIC_SCHEMA,
                 abstraction_level=1,
-                named=False,
-                name=None,
                 member_count=len(members),
             )
+            if dominant_parent:
+                node_kwargs["name"] = dominant_parent
+                node_kwargs["named"] = True
+            else:
+                node_kwargs["name"] = None
+                node_kwargs["named"] = False
+
+            graph.add_node(cluster_id, **node_kwargs)
             for member in members:
                 graph.add_edge(cluster_id, member, relation_type=EDGE_COMPOSED_OF,
                                 source="schema", placement="explicit",
@@ -314,12 +369,14 @@ class ReflectorModule:
 
         return created
 
-    def _has_dominant_shared_parent(self, members: List[str], min_coverage: Optional[int] = None) -> bool:
-        """True if a single existing is-a parent already covers enough of
-        `members` that clustering them again would be redundant. Reuses
-        the same "does a parent word cover >= K members" check that also
-        underlies naming (§13.3.1) -- kept as a shared helper so the two
-        can't silently diverge into different definitions of "covers.\""""
+    def _dominant_parent(self, members: List[str], min_coverage: Optional[int] = None) -> tuple:
+        """Returns (best_parent, coverage) -- the is-a parent covering the
+        most of `members`, and how many it covers. Returns (None, 0) if
+        no member has an is-a parent at all. `min_coverage` lets a caller
+        check against a different bar than EPISTEMIC_NAME_MIN_COVERAGE
+        without needing a second near-duplicate method (used by
+        merge_duplicate_epistemic_schemas() below, same threshold by
+        default but kept as a parameter for that reuse)."""
         min_coverage = self.EPISTEMIC_NAME_MIN_COVERAGE if min_coverage is None else min_coverage
         graph = self.archivist.graph
         parent_counts: Counter = Counter()
@@ -329,45 +386,94 @@ class ReflectorModule:
             for u, _v, edata in graph.in_edges(member, data=True):
                 if edata.get("relation_type") == EDGE_IS_A:
                     parent_counts[u] += 1
-        return bool(parent_counts) and max(parent_counts.values()) >= min_coverage
+        if not parent_counts:
+            return None, 0
+        best_parent, coverage = parent_counts.most_common(1)[0]
+        if coverage < min_coverage:
+            return None, coverage
+        return best_parent, coverage
 
-    def try_name_epistemic_schemas(self) -> int:
-        """§13.3.1's resolved naming rule, implemented: an epistemic
-        schema earns a name only when a dictionary-pattern-parsed is-a
-        assertion ties back to enough of its members -- never generated
-        by the system. Consolidation-time scan (not a live trigger) is
-        the simplest correct implementation of the same rule §2.1b item
-        4a and §6.1 already use elsewhere, just checked periodically
-        instead of on every placement. Returns the count newly named."""
+    def merge_duplicate_epistemic_schemas(self) -> int:
+        """Migration/ongoing-cleanup pass (this session): handles two
+        cases detect_epistemic_clusters()'s own formation-time logic
+        can't reach on its own --
+          1. Anonymous-hash schemas created before this fix existed
+             (production already has these -- confirmed 4 duplicate
+             epistemic_schema elements from one evolving cluster).
+          2. A schema that legitimately had no dominant parent at
+             formation time, but gained one later (e.g. a member received
+             a NEW is-a edge via re-parenting, §2.3 mechanism 3, after the
+             schema already formed).
+        In both cases: once a dominant parent now covers the schema's
+        members, fold it into the parent-identified schema (creating one
+        if needed) and remove the redundant anonymous node -- same
+        "absorb into existing structure, don't silently duplicate"
+        principle self_narrative.py's own absorption mechanism already
+        uses (§16.4), applied here to a different structure. Consolidation
+        -gated, called from prometheus.py's _run_consolidation() alongside
+        detect_epistemic_clusters(). Returns the count collapsed."""
         graph = self.archivist.graph
-        named_count = 0
-        for node, data in list(graph.nodes(data=True)):
-            if data.get("node_type") != NODE_EPISTEMIC_SCHEMA or data.get("named"):
+        collapsed = 0
+        for node in list(graph.nodes):
+            data = graph.nodes.get(node, {})
+            if data.get("node_type") != NODE_EPISTEMIC_SCHEMA:
                 continue
+            # Parent-identified schemas (epistemic_of_X) are already
+            # correctly collapsed by construction -- only anonymous-hash
+            # ones are migration candidates.
+            if not node.startswith("epistemic_") or node.startswith("epistemic_of_"):
+                continue
+
             members = [
                 v for _u, v, edata in graph.out_edges(node, data=True)
                 if edata.get("relation_type") == EDGE_COMPOSED_OF
             ]
             if not members:
                 continue
-            parent_counts: Counter = Counter()
+            dominant_parent, _coverage = self._dominant_parent(members)
+            if not dominant_parent:
+                continue  # still a genuine no-parent cluster -- leave it as-is
+
+            target_id = f"epistemic_of_{dominant_parent}"
+            if target_id not in graph:
+                graph.add_node(
+                    target_id,
+                    source="schema", tier=TIER_WORKING,
+                    last_reinforced=datetime.now(), regulatory_efficacy=0.5,
+                    tier0_cycles=0, activation=data.get("activation", 0.0),
+                    valence_coloring=data.get("valence_coloring", 0.0),
+                    node_type=NODE_EPISTEMIC_SCHEMA, abstraction_level=1,
+                    name=dominant_parent, named=True, member_count=0,
+                )
+            existing_members = {
+                v for _u, v, edata in graph.out_edges(target_id, data=True)
+                if edata.get("relation_type") == EDGE_COMPOSED_OF
+            }
             for member in members:
-                if member not in graph:
+                if member in existing_members:
                     continue
-                for u, _v, edata in graph.in_edges(member, data=True):
-                    if edata.get("relation_type") == EDGE_IS_A:
-                        parent_counts[u] += 1
-            if not parent_counts:
-                continue
-            best_parent, coverage = parent_counts.most_common(1)[0]
-            if coverage >= self.EPISTEMIC_NAME_MIN_COVERAGE:
-                graph.nodes[node]["name"] = best_parent
-                graph.nodes[node]["named"] = True
-                named_count += 1
-        return named_count
+                graph.add_edge(target_id, member, relation_type=EDGE_COMPOSED_OF,
+                                source="schema", placement="explicit",
+                                created_at=datetime.now().isoformat())
+            graph.nodes[target_id]["member_count"] = len(existing_members | set(members))
+
+            graph.remove_node(node)
+            collapsed += 1
+        return collapsed
 
     @staticmethod
-    def _epistemic_cluster_id(members: List[str]) -> str:
+    def _epistemic_cluster_id(members: List[str], dominant_parent: Optional[str] = None) -> str:
+        """Bug fix, this session: previously always a hash of the exact
+        member set, meaning any membership growth produced a completely
+        different id and therefore a brand-new, duplicate schema node
+        (see detect_epistemic_clusters()'s docstring for the full
+        diagnosis). When a dominant is-a parent exists, identity comes
+        from that parent directly instead -- stable across membership
+        growth, and doubles as the schema's name with no separate naming
+        step needed. Only genuinely parent-less clusters still get the
+        anonymous member-hash id."""
+        if dominant_parent:
+            return f"epistemic_of_{dominant_parent}"
         digest = hashlib.sha1("|".join(sorted(members)).encode()).hexdigest()[:8]
         return f"epistemic_{digest}"
 

@@ -1,5 +1,6 @@
 """
-edge_types.py -- shared vocabulary (spec §6A / §10 item 18).
+edge_types.py -- shared vocabulary (spec §6A / §10 item 18, extended by
+§13.4.3's meta-edge family system).
 
 Every module that creates or reads a typed edge or a node_type must import
 from here rather than typing a literal string. This is the fix for the
@@ -10,8 +11,22 @@ nothing existed to import instead.
 Also owns the Graph-tab color/style map (§4B, §10 item 21) so visual
 encoding lives next to the vocabulary it encodes, not duplicated into
 prometheus_dashboard.py by hand.
+
+§13.4.3, new this revision: every edge choice (is-a, violates, causes,
+etc.) now also belongs to a FAMILY (HIERARCHY, SOCIAL_NORM, CAUSAL, etc.).
+Families are the layer schema detection, trust diversity, collapse merge,
+and working-memory ranking are meant to operate on going forward; choices
+remain what meaning/UI display use. This is a NEW, separate classification
+alongside the existing CATEGORICAL_EDGE_TYPES/RELATIONAL_EDGE_TYPES/
+TRUST_BEARING_EDGE_TYPES groupings below -- those are untouched and keep
+their exact existing behavior (trust scoring in particular must not change
+as a side effect of this addition). Notably the two schemes disagree on
+associated-with: the old "categorical" grouping lumps it with is-a/part-of
+for trust-scoring purposes, but under the new, more precise family table
+it's RESIDUAL, not HIERARCHY -- both are correct for their own purpose,
+this file just now expresses both.
 """
-from typing import Dict
+from typing import Dict, Optional
 
 # ---------------------------------------------------------------------
 # Edge types
@@ -29,30 +44,147 @@ EDGE_VIOLATES = "violates"
 EDGE_TEMPORAL_CONTRAST = "temporal-contrast"
 EDGE_CONCERNS_OTHER = "concerns-other"
 
-# Structural (new, this revision). Schema Nodes link back to their
-# component basin/event nodes (reflector.detect_schemas) -- this is a
-# permanent compositional fact about what the schema *is made of*, not a
-# tentative co-occurrence placement, and was previously mislabeled
-# associated-with, which made it indistinguishable from a re-parenting-
-# eligible placement it structurally isn't (it never carries
-# placement="cooccurrence", so it was only accidentally safe from being
-# treated as one).
+# Structural / MEMBERSHIP family (new, this revision -- extended by
+# §13.4.3). Schema Nodes link back to their component basin/event nodes
+# (reflector.detect_schemas) -- this is a permanent compositional fact
+# about what the schema *is made of*, not a tentative co-occurrence
+# placement, and was previously mislabeled associated-with, which made it
+# indistinguishable from a re-parenting-eligible placement it structurally
+# isn't (it never carries placement="cooccurrence", so it was only
+# accidentally safe from being treated as one).
 EDGE_COMPOSED_OF = "composed-of"
+# §13.4.3's second MEMBERSHIP choice, new this revision -- distinct from
+# composed-of: an instance is a concrete particular of a category (this
+# specific event *is an instance of* a recognized pattern), not a part of
+# a whole the way a schema's components are. No producer creates this yet
+# (§13.4's collapse/rehydration algorithm is the intended first user, via
+# rehydration's "P --composed-of/instance-of--> C" restoration step,
+# §13.4.6) -- the constant exists now so that implementation has
+# something real to import rather than inventing a literal string.
+EDGE_INSTANCE_OF = "instance-of"
+
+# ROLE family (new, this revision -- §13.4.3). Event-participant binding
+# ("who did what to what, with what") -- feeds the somatic-schema pattern
+# skeleton §13.4.7 describes (SOCIAL_NORM + ROLE + optional TEMPORAL). No
+# producer creates these yet; same status as EDGE_INSTANCE_OF above.
+EDGE_AGENT = "agent"
+EDGE_PATIENT = "patient"
+EDGE_INSTRUMENT = "instrument"
+
+# CAUSAL family (new, this revision -- §13.4.3). The explanatory backbone
+# §13.4.3's family table names -- "X causes Y", "X prevents Y", etc. No
+# producer creates these yet.
+EDGE_CAUSES = "causes"
+EDGE_RESULTS_IN = "results-in"
+EDGE_PREVENTS = "prevents"
+EDGE_ENABLES = "enables"
+
+# ABSTRACTION family (new, this revision -- §13.4.3). This section's own
+# collapse bookkeeping (§13.4.4 step 5, §13.4.6 step 5): written when a
+# child C is absorbed into parent P (C -abstracted-from-> P) and its
+# inverse on rehydration (P -elaborates-> C). Directed pair, not a
+# frozenset of independent choices, since the two are meant to stay
+# consistent inverses of each other (§13.4.4's edge-rewiring rule:
+# "maintain inverse consistency").
+EDGE_ABSTRACTED_FROM = "abstracted-from"
+EDGE_ELABORATES = "elaborates"
 
 CATEGORICAL_EDGE_TYPES = frozenset({EDGE_IS_A, EDGE_PART_OF, EDGE_ASSOCIATED_WITH})
 RELATIONAL_EDGE_TYPES = frozenset({
     EDGE_RESPONSIBLE_FOR, EDGE_VIOLATES, EDGE_TEMPORAL_CONTRAST, EDGE_CONCERNS_OTHER,
 })
-STRUCTURAL_EDGE_TYPES = frozenset({EDGE_COMPOSED_OF})
-ALL_EDGE_TYPES = CATEGORICAL_EDGE_TYPES | RELATIONAL_EDGE_TYPES | STRUCTURAL_EDGE_TYPES
+MEMBERSHIP_EDGE_TYPES = frozenset({EDGE_COMPOSED_OF, EDGE_INSTANCE_OF})
+STRUCTURAL_EDGE_TYPES = MEMBERSHIP_EDGE_TYPES  # deprecated alias, kept for safety -- nothing outside this file referenced the old name, but costs nothing to preserve
+ROLE_EDGE_TYPES = frozenset({EDGE_AGENT, EDGE_PATIENT, EDGE_INSTRUMENT})
+CAUSAL_EDGE_TYPES = frozenset({EDGE_CAUSES, EDGE_RESULTS_IN, EDGE_PREVENTS, EDGE_ENABLES})
+ABSTRACTION_EDGE_TYPES = frozenset({EDGE_ABSTRACTED_FROM, EDGE_ELABORATES})
+ALL_EDGE_TYPES = (
+    CATEGORICAL_EDGE_TYPES | RELATIONAL_EDGE_TYPES | MEMBERSHIP_EDGE_TYPES
+    | ROLE_EDGE_TYPES | CAUSAL_EDGE_TYPES | ABSTRACTION_EDGE_TYPES
+)
 
 # Edge types that count toward epistemic trust corroboration (§3.2).
 # Relational and structural edges represent recurrence/composition, not
 # independent confirmation of a fact -- counting them inflated a node's
 # trust score for reasons unrelated to whether it's true (e.g. a node
 # frequently on the receiving end of `violates` edges was drifting toward
-# Trusted purely for showing up in guilt-shaped patterns).
+# Trusted purely for showing up in guilt-shaped patterns). Unchanged by
+# §13.4.3's addition below -- this grouping's exact membership and every
+# consumer of it (archivist.py's trust scoring) must not change as a side
+# effect of adding the new family layer.
 TRUST_BEARING_EDGE_TYPES = CATEGORICAL_EDGE_TYPES
+
+# ---------------------------------------------------------------------
+# §13.4.3 Meta-edge families -- new this revision.
+# ---------------------------------------------------------------------
+# Family name constants, so nothing hardcodes the literal strings from
+# §13.4.3's family table.
+FAMILY_HIERARCHY = "HIERARCHY"
+FAMILY_MEMBERSHIP = "MEMBERSHIP"
+FAMILY_ROLE = "ROLE"
+FAMILY_CAUSAL = "CAUSAL"
+FAMILY_SOCIAL_NORM = "SOCIAL_NORM"
+FAMILY_TEMPORAL = "TEMPORAL"
+FAMILY_ABSTRACTION = "ABSTRACTION"
+FAMILY_RESIDUAL = "RESIDUAL"
+
+# Every choice this file knows about, mapped to its family -- the single
+# source of truth §13.4.3 calls for ("Legacy flat relation_type strings
+# map into this table"). Deliberately a plain dict built explicitly
+# choice-by-choice rather than derived by iterating the frozensets above,
+# so a new choice added to a frozenset without a FAMILY_OF entry fails
+# loudly (KeyError in get_family, not a silent RESIDUAL fallback) instead
+# of quietly mis-classifying.
+FAMILY_OF: Dict[str, str] = {
+    EDGE_IS_A: FAMILY_HIERARCHY,
+    EDGE_PART_OF: FAMILY_HIERARCHY,
+    EDGE_ASSOCIATED_WITH: FAMILY_RESIDUAL,
+    EDGE_COMPOSED_OF: FAMILY_MEMBERSHIP,
+    EDGE_INSTANCE_OF: FAMILY_MEMBERSHIP,
+    EDGE_AGENT: FAMILY_ROLE,
+    EDGE_PATIENT: FAMILY_ROLE,
+    EDGE_INSTRUMENT: FAMILY_ROLE,
+    EDGE_CAUSES: FAMILY_CAUSAL,
+    EDGE_RESULTS_IN: FAMILY_CAUSAL,
+    EDGE_PREVENTS: FAMILY_CAUSAL,
+    EDGE_ENABLES: FAMILY_CAUSAL,
+    EDGE_RESPONSIBLE_FOR: FAMILY_SOCIAL_NORM,
+    EDGE_VIOLATES: FAMILY_SOCIAL_NORM,
+    EDGE_CONCERNS_OTHER: FAMILY_SOCIAL_NORM,
+    EDGE_TEMPORAL_CONTRAST: FAMILY_TEMPORAL,
+    EDGE_ABSTRACTED_FROM: FAMILY_ABSTRACTION,
+    EDGE_ELABORATES: FAMILY_ABSTRACTION,
+}
+
+# Families where a given directed (u, v) pair may hold at most one choice
+# at a time, per §13.4.3's exclusivity rule -- HIERARCHY and ROLE are
+# exclusive-per-direction/context, SOCIAL_NORM explicitly allows a dual
+# (the spec's own "I shouldn't have done that" example needs both
+# responsible-for and violates simultaneously, §2.1b), MEMBERSHIP/CAUSAL/
+# TEMPORAL/RESIDUAL are multi. Consulted by collapse's edge-rewrite merge
+# step (§13.4.4) to decide whether landing a second choice on an existing
+# (u, v) pair is a reinforcement or a conflict -- not enforced by this
+# file itself, since edge_types.py only owns vocabulary, not graph
+# mutation (archivist.py's job, per the module responsibility table).
+EXCLUSIVE_FAMILIES = frozenset({FAMILY_HIERARCHY, FAMILY_ROLE})
+
+
+def get_family(relation_type: str, family: Optional[str] = None) -> str:
+    """Resolves the family for an edge. `family` is the edge's own stored
+    `family` attribute if the caller already has it (graceful pass-
+    through -- once an edge is written with a family at creation time,
+    later readers shouldn't need to re-derive it). When `family` is None
+    (the migration case: every edge created before this revision has no
+    `family` attribute at all, §13.4.14 item 5), falls back to looking
+    `relation_type` up in FAMILY_OF. An unrecognized relation_type with no
+    stored family falls back to RESIDUAL -- the "weak glue, low weight
+    everywhere" family, the correct conservative default for something
+    this lookup can't otherwise classify, rather than raising or silently
+    picking a structural family that would overstate what's known about
+    the edge."""
+    if family:
+        return family
+    return FAMILY_OF.get(relation_type, FAMILY_RESIDUAL)
 
 # ---------------------------------------------------------------------
 # Node types (§6A: node_type field -- standard | basin | schema | self)
@@ -85,9 +217,31 @@ EDGE_STYLE: Dict[str, Dict[str, str]] = {
     EDGE_TEMPORAL_CONTRAST: {"color": "#d68a1c", "width": "1.5", "dashes": "[1,3]"},
     EDGE_CONCERNS_OTHER:    {"color": "#e0a11a", "width": "1.5", "dashes": "[4,2,1,2]"},
 
-    # Structural -- purple, dotted. Visually signals "membership fact,"
-    # not a corroboration edge.
+    # Structural / MEMBERSHIP -- purple, dotted. Visually signals
+    # "membership fact," not a corroboration edge.
     EDGE_COMPOSED_OF:      {"color": "#7a4bb0", "width": "1.5", "dashes": "[1,1]"},
+    EDGE_INSTANCE_OF:      {"color": "#9b6bc9", "width": "1.5", "dashes": "[1,1]"},
+
+    # ROLE -- teal-green family, short dashes. Distinct from MEMBERSHIP's
+    # purple since a role binding is a different kind of fact (who did
+    # what to what) than a part/whole or category/instance relationship.
+    EDGE_AGENT:      {"color": "#2f8f6f", "width": "1.5", "dashes": "[3,1]"},
+    EDGE_PATIENT:    {"color": "#4fae8c", "width": "1.5", "dashes": "[3,1,1,1]"},
+    EDGE_INSTRUMENT: {"color": "#6ec7ab", "width": "1.5", "dashes": "[1,1,3,1]"},
+
+    # CAUSAL -- deep red family, long dashes (an explanatory claim, reads
+    # heavier than a relational/narrative edge).
+    EDGE_CAUSES:     {"color": "#8b1a1a", "width": "2.0", "dashes": "[8,3]"},
+    EDGE_RESULTS_IN: {"color": "#a83232", "width": "1.5", "dashes": "[8,3,2,3]"},
+    EDGE_PREVENTS:   {"color": "#5c1010", "width": "1.5", "dashes": "[8,3]"},
+    EDGE_ENABLES:    {"color": "#c24949", "width": "1.5", "dashes": "[8,3,2,3]"},
+
+    # ABSTRACTION -- gray-blue, fine dotted. §13.4's own collapse
+    # bookkeeping (§13.4.4/§13.4.6) -- deliberately understated, since
+    # this is infrastructure the collapse mechanism reads, not primarily
+    # a fact the person is meant to read off the graph visually.
+    EDGE_ABSTRACTED_FROM: {"color": "#6b7a8f", "width": "1.0", "dashes": "[1,2]"},
+    EDGE_ELABORATES:      {"color": "#8a97a8", "width": "1.0", "dashes": "[1,2]"},
 }
 DEFAULT_EDGE_STYLE = {"color": "#999999", "width": "1.0", "dashes": "false"}
 
