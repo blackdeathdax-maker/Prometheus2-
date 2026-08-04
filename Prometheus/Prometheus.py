@@ -1,5 +1,6 @@
 import os
 import random
+import logging
 from collections import deque
 from typing import List, Optional
 
@@ -14,6 +15,9 @@ from .self_narrative import NarrativeModule
 from .sensory import SensoryModule
 from .association import AssociationEngine
 from .stimulus import SyntheticStimulusEngine
+
+
+logger = logging.getLogger(__name__)
 
 
 class Prometheus:
@@ -1136,11 +1140,44 @@ class Prometheus:
         self.archivist.decay_co_activation()
         merged_epistemic = self.reflector.merge_duplicate_epistemic_schemas()
 
+        # §13.4, new this session: Graph Collapse & Abstraction Layer.
+        # Runs after schema detection ("new schemas can claim members
+        # before leaves are absorbed", §13.4.10), before Self-Narrative
+        # (moved below this call, per §13.4.10's reconciled ordering --
+        # so a Narrative Element referencing a node collapsed THIS pass
+        # can absorb into its new parent immediately via self_narrative's
+        # own §16.4 ancestor-walk, not a pass late).
+        #
+        # protected_nodes assembles §13.4.2's "protected nodes never
+        # collapse" set from every source that currently exists: real
+        # conversational topics (_global_protected_anchors, basin-
+        # independent), narratively significant nodes (self_narrative.
+        # linked_nodes_above_floor()), and whatever's currently in the
+        # 7-slot working memory (get_current_working_memory()'s slots --
+        # collapsing something the person is actively being shown as "in
+        # mind right now" would be confusing regardless of its neglect
+        # stats). SELF/OTHER are protected unconditionally inside
+        # archivist.collapse_eligible() itself, not repeated here.
+        # Active Thread's central_node/supporting_nodes and a Goal's
+        # target_node (§13.4.14 item 1/2) will need to join this same
+        # union once those modules exist -- not yet, since neither is
+        # built.
+        protected_nodes = set(self._global_protected_anchors) | set(self.self_narrative.linked_nodes_above_floor())
+        try:
+            protected_nodes |= set(self.get_current_working_memory().get("slots", []))
+        except Exception as e:  # defensive -- working memory's own computation must never block Consolidation
+            logger.warning("Could not compute working-memory protection set for collapse pass: %s", e)
+        collapse_summary = self.archivist.run_collapse_pass(
+            protected_nodes=protected_nodes, current_pulse=self.pulse_count,
+        )
+
         # §16, new this session: Self-Narrative evaluation. Runs after
-        # both schema-detection passes (so this pass's newly-formed
-        # schemas are available as trigger 1/2 material the same cycle,
-        # not a pass late -- same ordering rationale already used for
-        # everything else in this method) and before the checkpoint save.
+        # both schema-detection passes AND the collapse pass (moved here
+        # this revision, §13.4.10) so this pass's newly-formed schemas
+        # and any node collapse just resolved are both available as
+        # trigger/absorption material the same cycle, not a pass late --
+        # same ordering rationale already used for everything else in
+        # this method.
         narrative_summary = self.self_narrative.evaluate(
             new_somatic_schema_ids=new_schemas,
             new_epistemic_schema_ids=new_epistemic_schemas,
@@ -1167,6 +1204,8 @@ class Prometheus:
             print(f"Consolidation: formed {len(new_epistemic_schemas)} new Epistemic Schema Node(s): {new_epistemic_schemas}")
         if merged_epistemic:
             print(f"Consolidation: merged {merged_epistemic} duplicate Epistemic Schema Node(s) into their named parent.")
+        if collapse_summary.get("collapsed"):
+            print(f"Consolidation: §13.4 collapse {collapse_summary}")
         if narrative_summary.get("created") or narrative_summary.get("absorbed") or narrative_summary.get("pruned"):
             print(f"Consolidation: Self-Narrative {narrative_summary}")
 

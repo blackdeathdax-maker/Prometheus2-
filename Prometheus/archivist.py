@@ -9,7 +9,9 @@ from typing import Dict, List, Optional
 
 from .edge_types import (
     TRUST_BEARING_EDGE_TYPES, NODE_STANDARD, NODE_BASIN, NODE_SCHEMA, NODE_SELF,
-    NODE_EPISTEMIC_SCHEMA, EDGE_ASSOCIATED_WITH, EDGE_IS_A,
+    NODE_EPISTEMIC_SCHEMA, EDGE_ASSOCIATED_WITH, EDGE_IS_A, EDGE_PART_OF,
+    EDGE_COMPOSED_OF, EDGE_INSTANCE_OF, EDGE_ABSTRACTED_FROM, EDGE_ELABORATES,
+    get_family, EXCLUSIVE_FAMILIES, FAMILY_RESIDUAL, FAMILY_MEMBERSHIP,
 )
 
 logger = logging.getLogger(__name__)
@@ -82,6 +84,13 @@ CO_ACTIVATION_DECAY_RATE = 0.6
 CO_ACTIVATION_STABILIZATION_THRESHOLD = 3  # same tuning-placeholder category as §10 everywhere else
 CO_ACTIVATION_PRUNE_FLOOR = 0.2  # below this after decay, drop the pair entirely -- same shape as synthesizer.py's basin DESTABILIZATION_FLOOR
 
+# §13.4 Graph Collapse & Abstraction Layer -- starter placeholders per
+# §13.4.9, same "not yet numerically tuned" status as everything else.
+N_COLLAPSE = 6                     # neglect cycles before absorption (spec range 4-8)
+D_COLLAPSE = 4                     # depth from nearest schema root (spec range 3-5)
+COLLAPSE_ACTIVATION_FLOOR = 1.0    # out of ACTIVATION_CAP=10.0 -- "low", additional required condition alongside neglect (see run_collapse_pass's docstring for why AND, not OR)
+REHYDRATE_EDGE_MOVE_FRACTION = 0.25  # spec range 0.0-0.5
+
 
 class ArchivistModule:
     """
@@ -116,6 +125,10 @@ class ArchivistModule:
         self.CO_ACTIVATION_DECAY_RATE = CO_ACTIVATION_DECAY_RATE
         self.CO_ACTIVATION_STABILIZATION_THRESHOLD = CO_ACTIVATION_STABILIZATION_THRESHOLD
         self.CO_ACTIVATION_PRUNE_FLOOR = CO_ACTIVATION_PRUNE_FLOOR
+        self.N_COLLAPSE = N_COLLAPSE
+        self.D_COLLAPSE = D_COLLAPSE
+        self.COLLAPSE_ACTIVATION_FLOOR = COLLAPSE_ACTIVATION_FLOOR
+        self.REHYDRATE_EDGE_MOVE_FRACTION = REHYDRATE_EDGE_MOVE_FRACTION
         # Sparse -- only pairs that actually co-occurred in a real event
         # ever get an entry (§13.3's own docstring above explains why).
         # Keyed by a sorted 2-tuple of node ids, not a frozenset, so it's
@@ -535,6 +548,13 @@ class ArchivistModule:
         amount = self.ACTIVATION_BOOST if amount is None else amount
         current = self.graph.nodes[node].get("activation", 0.0)
         self.graph.nodes[node]["activation"] = min(self.ACTIVATION_CAP, current + amount)
+        # §13.4.4: a touch resets neglect tracking -- this is the "not
+        # been directly reinforced" clock the collapse eligibility check
+        # reads. Reset here rather than in a separate method so every
+        # existing bump_activation() call site (real input, self-study,
+        # regulation anchor use) automatically counts as reinforcement
+        # without needing to be individually updated.
+        self.graph.nodes[node]["neglect_cycles"] = 0
         # No self.save() here (§4C) -- touched constantly during Learning,
         # same frequency problem as store()/link(); checkpointed once at
         # end-of-Consolidation like everything else.
@@ -551,6 +571,11 @@ class ArchivistModule:
             if node == SELF_NODE:
                 continue
             data["activation"] = data.get("activation", 0.0) * self.ACTIVATION_DECAY_RATE
+            # §13.4.4 neglect tracking: one more Consolidation pass has
+            # elapsed without a fresh touch (bump_activation resets this
+            # to 0 the moment one occurs). Same pass, same node loop as
+            # activation decay -- one sweep, not a second one.
+            data["neglect_cycles"] = data.get("neglect_cycles", 0) + 1
 
     # ------------------------------------------------------------------
     # Valence coloring (§13.2, new): mirror-neuron-style implicit
@@ -576,6 +601,399 @@ class ArchivistModule:
         # No self.save() here (§4C) -- same reasoning as bump_activation();
         # fires live, potentially every reaction, checkpointed once at the
         # next Consolidation pass like everything else.
+
+    # ------------------------------------------------------------------
+    # §13.4 Graph Collapse & Abstraction Layer -- new this revision.
+    # Owner per the spec's own statement: archivist.py (graph mutation),
+    # called from prometheus.py's _run_consolidation(). Distinct from
+    # reflector.py's merge_duplicate_epistemic_schemas() (an unrelated
+    # mechanism, deduplicating schema nodes -- renamed earlier this
+    # session specifically to keep "collapse" unambiguous for this
+    # section going forward).
+    # ------------------------------------------------------------------
+
+    _SCHEMA_NODE_TYPES = (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA)
+    _PARENT_SEARCH_IN_EDGE_TYPES = frozenset({EDGE_IS_A, EDGE_PART_OF, EDGE_COMPOSED_OF, EDGE_INSTANCE_OF})
+    _DEPTH_SEARCH_EDGE_TYPES = frozenset({
+        EDGE_IS_A, EDGE_PART_OF, EDGE_COMPOSED_OF, EDGE_INSTANCE_OF,
+        EDGE_ABSTRACTED_FROM, EDGE_ELABORATES,
+    })
+
+    def _is_schema_node(self, node: str) -> bool:
+        data = self.graph.nodes.get(node, {})
+        return bool(data.get("is_schema")) or data.get("node_type") in self._SCHEMA_NODE_TYPES
+
+    def _find_collapse_parent(self, node: str) -> Optional[str]:
+        """§13.4.4: "P is a stable parent of C via MEMBERSHIP/composed-of,
+        a clear HIERARCHY chain, or an existing ABSTRACTION/abstracted-
+        from record." Checks C's in-edges for is-a/part-of/composed-of/
+        instance-of (P -> C, the existing parent->child edge direction
+        convention throughout this codebase) first; falls back to C's
+        own out-edges for abstracted-from (C -> P, per §13.4.4 step 5's
+        own direction) -- a node re-collapsing after a prior rehydration
+        already has this record and should return to the same parent
+        rather than searching for a new one. Returns the first match;
+        real data rarely has more than one candidate parent edge type
+        present at once, and §13.4's own algorithm doesn't specify a
+        tiebreak when it does -- documented here as a first-pass choice,
+        not a claimed-final policy."""
+        if node not in self.graph:
+            return None
+        for u, _v, edata in self.graph.in_edges(node, data=True):
+            if edata.get("relation_type") in self._PARENT_SEARCH_IN_EDGE_TYPES:
+                return u
+        for _u, v, edata in self.graph.out_edges(node, data=True):
+            if edata.get("relation_type") == EDGE_ABSTRACTED_FROM:
+                return v
+        return None
+
+    def _depth_from_schema_root(self, node: str, max_search: Optional[int] = None) -> int:
+        """BFS over HIERARCHY/MEMBERSHIP/ABSTRACTION edges (both
+        directions -- depth is a distance, not a direction-sensitive
+        query) to the nearest schema-tagged node. Capped at max_search
+        hops (default D_COLLAPSE + 2) since anything beyond that already
+        trivially satisfies the "depth >= D_COLLAPSE" neglect condition;
+        no need to search further once that's already established, and
+        capping keeps this cheap on a large graph even though it runs
+        inside a per-node Consolidation loop."""
+        if node not in self.graph:
+            return 0
+        max_search = (self.D_COLLAPSE + 2) if max_search is None else max_search
+        if self._is_schema_node(node):
+            return 0
+
+        visited = {node}
+        frontier = [node]
+        depth = 0
+        while frontier and depth < max_search:
+            depth += 1
+            next_frontier = []
+            for n in frontier:
+                neighbors = (
+                    [u for u, _v, d in self.graph.in_edges(n, data=True)
+                     if d.get("relation_type") in self._DEPTH_SEARCH_EDGE_TYPES]
+                    + [v for _u, v, d in self.graph.out_edges(n, data=True)
+                       if d.get("relation_type") in self._DEPTH_SEARCH_EDGE_TYPES]
+                )
+                for neighbor in neighbors:
+                    if neighbor in visited:
+                        continue
+                    if self._is_schema_node(neighbor):
+                        return depth
+                    visited.add(neighbor)
+                    next_frontier.append(neighbor)
+            frontier = next_frontier
+        return max_search  # no schema root found within range -- treat as "far enough"
+
+    def collapse_eligible(self, node: str, protected_nodes: Optional[set] = None) -> Optional[str]:
+        """§13.4.4 eligibility check. Returns the parent to collapse into,
+        or None if not eligible. `protected_nodes` is caller-supplied
+        (§13.4.2/§13.4.14 item 1: the shared protection query unioning
+        conversational anchors, narrative-linked nodes, Active Thread's
+        focus, and any active Goal's target lives in prometheus.py, which
+        has access to all those modules -- archivist.py stays graph-
+        mutation-only and just takes the resulting set as a parameter,
+        same pattern eligible_regulation_nodes() already uses for its own
+        caller-supplied anchor list). SELF/OTHER are always protected
+        regardless of what's passed, as a hard floor.
+
+        Design choice, stated explicitly since the source spec left it
+        ambiguous ("Optional: C's activation below a floor"): implemented
+        here as an ADDITIONAL required condition (AND with the neglect
+        check), not a third alternative. This is the more conservative
+        reading -- something still meaningfully active shouldn't collapse
+        just because a cycle counter ticked over, even if it also happens
+        to sit deep in the hierarchy. Easy to loosen to OR later if this
+        turns out to be too conservative once observed under real load."""
+        protected_nodes = protected_nodes or set()
+        if node in (SELF_NODE, OTHER_NODE) or node in protected_nodes:
+            return None
+        if node not in self.graph:
+            return None
+        if self._is_schema_node(node):
+            return None
+
+        parent = self._find_collapse_parent(node)
+        if parent is None or parent not in self.graph:
+            return None
+
+        data = self.graph.nodes[node]
+        neglected = (data.get("neglect_cycles", 0) >= self.N_COLLAPSE
+                     or self._depth_from_schema_root(node) >= self.D_COLLAPSE)
+        if not neglected:
+            return None
+        if data.get("activation", 0.0) > self.COLLAPSE_ACTIVATION_FLOOR:
+            return None
+
+        return parent
+
+    def run_collapse_pass(self, protected_nodes: Optional[set] = None, current_pulse: int = 0) -> Dict[str, int]:
+        """§13.4.4's main driver -- Consolidation-gated, called from
+        prometheus.py's _run_consolidation() after schema detection
+        (§13.4.10: "Collapse runs after schema detection so new schemas
+        can claim members before leaves are absorbed"). Iterates eligible
+        (node, parent) pairs and executes the rewire-then-remove
+        algorithm. Returns a summary dict for logging, matching the
+        existing convention (run_consolidation_pass() etc)."""
+        protected_nodes = protected_nodes or set()
+        candidates = []
+        for node in list(self.graph.nodes):
+            parent = self.collapse_eligible(node, protected_nodes)
+            if parent:
+                candidates.append((node, parent))
+
+        collapsed = 0
+        conflicts = 0
+        for child, parent in candidates:
+            # A node could have been removed already this pass if it was
+            # itself absorbed as part of an earlier pair's rewiring (rare,
+            # but possible if a chain collapses in one pass) -- re-check
+            # both endpoints still exist before proceeding.
+            if child not in self.graph or parent not in self.graph:
+                continue
+            result = self._collapse_node(child, parent, current_pulse)
+            if result is not None:
+                collapsed += 1
+                conflicts += result
+        return {"collapsed": collapsed, "conflicts": conflicts, "candidates_considered": len(candidates)}
+
+    def _collapse_node(self, child: str, parent: str, current_pulse: int) -> Optional[int]:
+        """Executes §13.4.4's algorithm steps 1-6 for one (child, parent)
+        pair (step 7, ordinary Tier-0 prune, stays a separate existing
+        call in prometheus.py's consolidation sequence -- not duplicated
+        here). Returns the number of exclusive-family conflicts
+        encountered (for the caller's summary), or None if the child
+        turned out to no longer exist (defensive; shouldn't happen given
+        run_collapse_pass's own re-check, kept here too since this method
+        could in principle be called directly)."""
+        if child not in self.graph or parent not in self.graph:
+            return None
+        graph = self.graph
+        child_data = dict(graph.nodes[child])
+        conflicts = 0
+
+        # Steps 2-3: rewire every edge incident on C, except the edge(s)
+        # that directly define the P-relationship itself (§13.4.4's own
+        # "do not create P composed-of P; fold into membership summary"
+        # rule, generalized to any family -- any edge that would become a
+        # P->P self-loop after rewiring is dropped here, not carried
+        # forward, regardless of which family it belongs to).
+        out_edges = list(graph.out_edges(child, keys=True, data=True))
+        in_edges = list(graph.in_edges(child, keys=True, data=True))
+
+        for _u, v, _k, edata in out_edges:
+            if v == parent:
+                continue  # the defining C->P edge (e.g. abstracted-from from a prior collapse) -- dropped, not rewired
+            conflicts += self._rewire_edge(child, parent, v, edata, direction="out")
+
+        for u, _v, _k, edata in in_edges:
+            if u == parent:
+                continue  # the defining P->C edge (is-a/part-of/composed-of) -- dropped, not rewired
+            conflicts += self._rewire_edge(child, parent, u, edata, direction="in")
+
+        # Step 3 (scalar evidence transfer): activation transfers directly
+        # (capped, same shape as bump_activation's own cap). Trust/
+        # diversity signals are NOT separately transferred -- P's trust
+        # score is recomputed live from its own incident edges at the
+        # next trust pass (_trust_score()), and C's edges were just
+        # rewired onto P above, so the corroboration those edges
+        # represent is already reflected without a redundant manual step.
+        # Regulatory efficacy: only nudged if C actually had regulation
+        # history (efficacy != the never-used 0.5 default), and only by a
+        # small fraction toward C's value -- a coping mechanism's track
+        # record shouldn't overwrite the parent's own history wholesale.
+        parent_data = graph.nodes[parent]
+        parent_data["activation"] = min(
+            self.ACTIVATION_CAP, parent_data.get("activation", 0.0) + child_data.get("activation", 0.0)
+        )
+        child_efficacy = child_data.get("regulatory_efficacy", 0.5)
+        if child_efficacy != 0.5:
+            parent_efficacy = parent_data.get("regulatory_efficacy", 0.5)
+            parent_data["regulatory_efficacy"] = parent_efficacy + 0.15 * (child_efficacy - parent_efficacy)
+
+        # Step 4: membership summary on P. Step 5 (ABSTRACTION edge): per
+        # the spec's own alternative ("identity may be stored as an
+        # attribute on P if node C is fully removed") -- since C IS fully
+        # removed here (step 6 below), the absorbed-member record below
+        # already fully captures the abstracted-from relationship; no
+        # separate graph edge is created, since C won't exist to be its
+        # source. Rehydration (§13.4.6) recreates C and writes the real
+        # inverse edges at that point, when both nodes actually exist.
+        absorbed = parent_data.setdefault("absorbed", [])
+        absorbed.append({
+            "id": child,
+            "source": child_data.get("source", "user"),
+            "absorbed_pulse": current_pulse,
+            "absorbed_at": datetime.now().isoformat(),
+            "node_data": {
+                k: v for k, v in child_data.items()
+                if k not in ("absorbed",) and not isinstance(v, (list, dict))
+            },
+            "primary_relations_summary": {
+                "out_edge_count": len(out_edges),
+                "in_edge_count": len(in_edges),
+            },
+        })
+
+        # Step 6: remove C. MultiDiGraph.remove_node() cleans up any
+        # remaining incident edges automatically -- everything meaningful
+        # was already rewired above, so nothing is silently lost by this.
+        graph.remove_node(child)
+        return conflicts
+
+    def _rewire_edge(self, child: str, parent: str, other: str, edata: dict, direction: str) -> int:
+        """One edge's rewiring per §13.4.4's edge-rewiring table. `other`
+        is the non-child endpoint; `direction` is "out" (child was the
+        source: parent -> other after rewrite) or "in" (child was the
+        target: other -> parent after rewrite). Returns 1 if an exclusive
+        -family conflict was encountered and resolved, else 0.
+
+        Conflict-resolution evidence heuristic (design choice, stated
+        explicitly -- the source spec names the policy "keep higher-
+        evidence choice" without specifying what counts as evidence):
+        explicit placement beats co-occurrence placement; a genuine tie
+        keeps whatever P already has, since P is the more-established
+        node by construction (it's the collapse target, not the
+        collapsed leaf). Flagged as a §13.4.9-category placeholder, not a
+        claimed-final policy."""
+        if other == parent:
+            return 0  # would create a self-loop -- drop, not rewire (same rule as the defining edge above)
+        if other not in self.graph:
+            return 0  # dangling reference, nothing to rewire onto
+
+        relation_type = edata.get("relation_type", EDGE_ASSOCIATED_WITH)
+        family = get_family(relation_type, edata.get("family"))
+        u, v = (parent, other) if direction == "out" else (other, parent)
+
+        # Bug fix while implementing: rewired_from must be set on every
+        # rewired edge, not just the rare exclusive-family-conflict case
+        # -- rehydrate()'s "move back edges that are clearly child-
+        # specific" step (§13.4.6 step 4) reads this to find candidates,
+        # and without it on the common (non-conflict) path there would
+        # never be anything for that step to find in the ordinary case.
+        rewired_from = {"_original_child": child, "original_relation_type": relation_type}
+
+        existing = None
+        for _u2, _v2, _k2, ed2 in self.graph.edges(keys=True, data=True):
+            if _u2 == u and _v2 == v and get_family(ed2.get("relation_type"), ed2.get("family")) == family:
+                existing = ed2
+                break
+
+        conflict = 0
+        if existing is not None:
+            if existing.get("relation_type") == relation_type:
+                # Same family, same choice -- merge/reinforce rather than
+                # duplicate.
+                existing["collapse_reinforced"] = existing.get("collapse_reinforced", 0) + 1
+                existing["last_reinforced"] = datetime.now().isoformat()
+                return 0
+            if family in EXCLUSIVE_FAMILIES:
+                # Same family, different choice, exclusive -- conflict.
+                incoming_explicit = edata.get("placement") == "explicit"
+                existing_explicit = existing.get("placement") == "explicit"
+                if incoming_explicit and not existing_explicit:
+                    # Incoming wins: demote the existing edge to RESIDUAL,
+                    # add the incoming one at full strength.
+                    existing["relation_type"] = EDGE_ASSOCIATED_WITH
+                    existing["family"] = FAMILY_RESIDUAL
+                    existing["conflict"] = True
+                    self.graph.add_edge(u, v, relation_type=relation_type, family=family,
+                                         source=edata.get("source", "user"), placement=edata.get("placement"),
+                                         created_at=datetime.now().isoformat(), rewired_from=rewired_from)
+                else:
+                    # Existing wins (tie or existing already explicit):
+                    # incoming gets added demoted to RESIDUAL instead of
+                    # silently dropped -- §13.4.5's "never lost: that a
+                    # relational fact existed."
+                    self.graph.add_edge(u, v, relation_type=EDGE_ASSOCIATED_WITH, family=FAMILY_RESIDUAL,
+                                         source=edata.get("source", "user"), placement=edata.get("placement"),
+                                         created_at=datetime.now().isoformat(), conflict=True,
+                                         rewired_from=rewired_from)
+                conflict = 1
+            # else: same family, different choice, but a multi-cardinality
+            # family (MEMBERSHIP/CAUSAL/TEMPORAL/RESIDUAL) -- just add
+            # below, no conflict; multiple choices are allowed to coexist.
+
+        if existing is None or family not in EXCLUSIVE_FAMILIES:
+            self.graph.add_edge(u, v, relation_type=relation_type, family=family,
+                                 source=edata.get("source", "user"), placement=edata.get("placement"),
+                                 created_at=datetime.now().isoformat(), rewired_from=rewired_from)
+        return conflict
+
+    def rehydrate(self, child_id: str, parent_id: str, edge_move_fraction: Optional[float] = None) -> bool:
+        """§13.4.6. Recreates an absorbed child from its parent's
+        membership record. Returns True on success, False if no matching
+        absorbed record exists (not an error -- callers should treat this
+        as "nothing to rehydrate," e.g. association.place_node() checking
+        speculatively before creating a fresh node).
+
+        `edge_move_fraction` (default REHYDRATE_EDGE_MOVE_FRACTION):
+        fraction of P's *own* edges to consider moving back onto the
+        rehydrated C, when an edge is clearly child-specific. v1
+        implementation of "clearly child-specific" is deliberately
+        conservative: only edges whose stored data still names this exact
+        child (via `rewired_from`, written during collapse's own conflict
+        -handling path above) are moved -- genuinely ambiguous edges stay
+        on P, consistent with §13.4.6's own policy of preferring parent
+        grain unless there's real evidence an edge belongs to the leaf."""
+        if parent_id not in self.graph:
+            return False
+        parent_data = self.graph.nodes[parent_id]
+        absorbed = parent_data.get("absorbed", [])
+        record = next((r for r in absorbed if r.get("id") == child_id), None)
+        if record is None:
+            return False
+
+        edge_move_fraction = self.REHYDRATE_EDGE_MOVE_FRACTION if edge_move_fraction is None else edge_move_fraction
+
+        # Step 2: recreate C with restored provenance, tier capped at
+        # Working unless the record's own data says otherwise (§13.4.6:
+        # "restored provenance (tier <= Working unless evidence says
+        # otherwise)").
+        restored = dict(record.get("node_data", {}))
+        restored["tier"] = min(restored.get("tier", TIER_WORKING), TIER_WORKING)
+        restored["last_reinforced"] = datetime.now()
+        restored["neglect_cycles"] = 0
+        restored.setdefault("activation", 0.0)
+        restored.setdefault("regulatory_efficacy", 0.5)
+        restored.setdefault("valence_coloring", 0.0)
+        self.graph.add_node(child_id, **restored)
+
+        # Step 3: restore MEMBERSHIP.
+        self.graph.add_edge(parent_id, child_id, relation_type=EDGE_COMPOSED_OF, family=FAMILY_MEMBERSHIP,
+                             source="rehydration", placement="explicit",
+                             created_at=datetime.now().isoformat())
+
+        # Step 4: optionally move edges back that are clearly child-
+        # specific (rewired_from data naming this child).
+        if edge_move_fraction > 0:
+            candidates = [
+                (u, v, k, ed) for u, v, k, ed in self.graph.edges(keys=True, data=True)
+                if (u == parent_id or v == parent_id) and isinstance(ed.get("rewired_from"), dict)
+                and ed["rewired_from"].get("_original_child") == child_id
+            ]
+            move_count = int(len(candidates) * edge_move_fraction)
+            for u, v, k, ed in candidates[:move_count]:
+                new_u = child_id if u == parent_id else u
+                new_v = child_id if v == parent_id else v
+                self.graph.add_edge(new_u, new_v, **{kk: vv for kk, vv in ed.items() if kk != "rewired_from"})
+                self.graph.remove_edge(u, v, key=k)
+
+        # Step 5: ABSTRACTION inverse -- P elaborates C, now that both
+        # nodes genuinely exist as real graph entities.
+        self.graph.add_edge(parent_id, child_id, relation_type=EDGE_ELABORATES, family="ABSTRACTION",
+                             source="rehydration", placement="explicit",
+                             created_at=datetime.now().isoformat())
+
+        # Step 6: leave P's summarised edges intact -- do NOT remove the
+        # absorbed record; §13.4.6 is explicit that another collapse must
+        # remain safe afterward, so the record needs to persist for that
+        # future collapse to reuse. Only remove this one entry from the
+        # list so it doesn't get double-processed by a future rehydration
+        # call for the same child.
+        parent_data["absorbed"] = [r for r in absorbed if r.get("id") != child_id]
+
+        return True
 
     def working_memory_nodes(self, top_k: int = 40, always_include: Optional[List[str]] = None,
                               max_relational_neighbors: int = 20) -> set:
