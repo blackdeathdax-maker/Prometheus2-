@@ -86,14 +86,17 @@ class FocusModule:
     W_PAR = 0.5
 
     # --- Piece B defaults ---
-    MIN_FOCUS_RESIDENCY = 20
-    FOCUS_SWITCH_MARGIN = 0.25  # challenger must beat current by this fraction
+    MIN_FOCUS_RESIDENCY = 8
+    FOCUS_SWITCH_MARGIN = 0.15  # challenger must beat current by this fraction
     CANDIDATE_POOL_CAP = 40
-    # If focus is held this long with no activation residual, treat prediction
-    # as stagnant: slash r_pred and allow an immediate switch (escape valve).
-    MAX_FOCUS_AGE_STAGNANT = 120
-    STAGNANT_PRED_DECAY = 0.35  # multiply r_pred when stagnant
-    STAGNANT_ACT_FLOOR = 0.05  # act residual at/below this counts as "cold"
+    # Soft stagnation (cold act): slash pred and force switch opportunity.
+    MAX_FOCUS_AGE_STAGNANT = 60
+    STAGNANT_PRED_DECAY = 0.15
+    STAGNANT_ACT_FLOOR = 0.2
+    # Hard max age: force switch regardless of act/pred (breaks hot-node feedback locks).
+    MAX_FOCUS_AGE_HARD = 100
+    # After leaving a target, block it from winning focus again for this many pulses.
+    FOCUS_COOLDOWN_PULSES = 40
 
     # --- Piece E defaults ---
     # Lower gain so unfilled gaps cannot pin equilibrium against decay forever.
@@ -116,6 +119,9 @@ class FocusModule:
         self.last_tick_summary: Dict = {}
         self._force_switch: bool = False
         self._stagnation_events: int = 0
+        self._hard_age_events: int = 0
+        # node_id -> pulse when cooldown expires
+        self._cooldown_until: Dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Piece A — residual store
@@ -272,12 +278,20 @@ class FocusModule:
         best_id = None
         best_score = -1.0
         best_mix: Dict[str, float] = {}
+        best_open_id = None
+        best_open_score = -1.0
+        best_open_mix: Dict[str, float] = {}
         for n in candidates:
             s, mix = self.composite_score(graph, n, basin_anchor_set)
             if s > best_score:
                 best_score = s
                 best_id = n
                 best_mix = mix
+            # Track best candidate not in cooldown (for forced switches)
+            if not self._in_cooldown(n, pulse) and s > best_open_score:
+                best_open_score = s
+                best_open_id = n
+                best_open_mix = mix
 
         if best_id is None:
             self.thread = None
@@ -313,19 +327,34 @@ class FocusModule:
         challenger_wins = best_id != current.target_id and best_score > cur_score + margin_needed
 
         # Stagnation escape: cold activation + long age → allow switch without margin
-        if self._force_switch and best_id != current.target_id:
-            self.thread = FocusThread(
-                target_id=best_id,
-                kind=kind,
-                score=best_score,
-                created_pulse=pulse,
-                last_seen_pulse=pulse,
-                source_mix=best_mix,
-            )
+        if self._force_switch:
+            # Prefer best non-cooldown candidate; fall back to any other node
+            pick = best_open_id if (best_open_id and best_open_id != current.target_id) else None
+            if pick is None and best_id is not None and best_id != current.target_id:
+                pick = best_id
+            if pick is not None:
+                pdata = graph.nodes.get(pick, {})
+                pkind = (
+                    "schema"
+                    if (pdata.get("is_schema") or pdata.get("node_type") in (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA))
+                    else "node"
+                )
+                ps, pmix = self.composite_score(graph, pick, basin_anchor_set)
+                self.thread = FocusThread(
+                    target_id=pick,
+                    kind=pkind,
+                    score=ps,
+                    created_pulse=pulse,
+                    last_seen_pulse=pulse,
+                    source_mix=pmix if pick == best_open_id else (best_mix if pick == best_id else pmix),
+                )
+                self._force_switch = False
+                return self.thread
+            # No alternative exists — clear flag and keep current one more cycle
             self._force_switch = False
-            return self.thread
 
         if residency_met and challenger_wins:
+            self._start_cooldown(current.target_id, pulse)
             self.thread = FocusThread(
                 target_id=best_id,
                 kind=kind,
@@ -493,29 +522,61 @@ class FocusModule:
             )
         return err
 
-    def _maybe_stagnation_escape(self, pulse: int) -> bool:
-        """If focus is old and activation-cold, slash prediction residual
-        and force a switch opportunity next select_focus. Returns True if
-        escape fired."""
+    def _purge_expired_cooldowns(self, pulse: int) -> None:
+        dead = [k for k, until in self._cooldown_until.items() if until <= pulse]
+        for k in dead:
+            del self._cooldown_until[k]
+
+    def _start_cooldown(self, node_id: str, pulse: int) -> None:
+        if not node_id:
+            return
+        self._cooldown_until[node_id] = pulse + self.FOCUS_COOLDOWN_PULSES
+
+    def _in_cooldown(self, node_id: str, pulse: int) -> bool:
+        until = self._cooldown_until.get(node_id)
+        return until is not None and until > pulse
+
+    def _force_leave_current(self, pulse: int, reason: str) -> None:
+        """Slash residuals on current focus, blacklist it, arm force switch."""
         if self.thread is None:
-            return False
-        age = pulse - self.thread.created_pulse
-        if age < self.MAX_FOCUS_AGE_STAGNANT:
-            return False
+            return
         fid = self.thread.target_id
-        act = self.residuals.get(fid, 0.0)
-        if act > self.STAGNANT_ACT_FLOOR:
-            return False
-        # Slash prediction lock
         if fid in self.r_pred:
             self.r_pred[fid] *= self.STAGNANT_PRED_DECAY
             if self.r_pred[fid] < self.RESIDUAL_FLOOR:
                 del self.r_pred[fid]
+        if fid in self.residuals:
+            self.residuals[fid] *= self.STAGNANT_PRED_DECAY
+            if self.residuals[fid] < self.RESIDUAL_FLOOR:
+                del self.residuals[fid]
+        self._start_cooldown(fid, pulse)
         self._force_switch = True
-        self._stagnation_events += 1
-        # Soften unsatisfiable expectations slightly so the same gap
-        # does not immediately rebuild the same lock after switch-back.
-        return True
+        if reason == "hard_age":
+            self._hard_age_events += 1
+        else:
+            self._stagnation_events += 1
+
+    def _maybe_stagnation_escape(self, pulse: int) -> bool:
+        """Soft escape: old + relatively cold act.
+        Hard escape: age >= MAX_FOCUS_AGE_HARD regardless of act
+        (breaks hot-node self-study feedback locks like 'jubilation')."""
+        if self.thread is None:
+            return False
+        age = pulse - self.thread.created_pulse
+        fid = self.thread.target_id
+        act = self.residuals.get(fid, 0.0)
+
+        # Hard max age — always leaves, even if act is hot
+        if age >= self.MAX_FOCUS_AGE_HARD:
+            self._force_leave_current(pulse, "hard_age")
+            return True
+
+        # Soft stagnation — cold-ish act
+        if age >= self.MAX_FOCUS_AGE_STAGNANT and act <= self.STAGNANT_ACT_FLOOR:
+            self._force_leave_current(pulse, "stagnant")
+            return True
+
+        return False
 
     # ------------------------------------------------------------------
     # Per-pulse tick (call from prometheus.pulse)
@@ -527,6 +588,7 @@ class FocusModule:
         basin_anchor_set: Optional[Set[str]] = None,
     ) -> Dict:
         basin_anchor_set = basin_anchor_set or set()
+        self._purge_expired_cooldowns(pulse)
         self.decay_residuals(consolidation=False)
         stagnant = self._maybe_stagnation_escape(pulse)
         err = self.apply_prediction_to_residuals(graph, pulse=pulse)
@@ -538,6 +600,8 @@ class FocusModule:
             "prediction_error": err,
             "stagnation_escape": stagnant,
             "stagnation_events": self._stagnation_events,
+            "hard_age_events": self._hard_age_events,
+            "cooldowns_active": len(self._cooldown_until),
             "residual_count": len(self.residuals),
             "top_residuals": self.top_residuals(8),
         }
@@ -563,6 +627,8 @@ class FocusModule:
             "last_prediction_error": dict(self.last_error),
             "residual_count": len(self.residuals),
             "stagnation_events": self._stagnation_events,
+            "hard_age_events": self._hard_age_events,
+            "cooldowns_active": len(self._cooldown_until),
             "force_switch_armed": self._force_switch,
             "last_tick": dict(self.last_tick_summary),
         }
