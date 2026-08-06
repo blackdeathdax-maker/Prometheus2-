@@ -89,11 +89,19 @@ class FocusModule:
     MIN_FOCUS_RESIDENCY = 8
     FOCUS_SWITCH_MARGIN = 0.15  # challenger must beat current by this fraction
     CANDIDATE_POOL_CAP = 40
+    # If focus is held this long with no activation residual, treat prediction
+    # as stagnant: slash r_pred and allow an immediate switch (escape valve).
+    MAX_FOCUS_AGE_STAGNANT = 120
+    STAGNANT_PRED_DECAY = 0.35  # multiply r_pred when stagnant
+    STAGNANT_ACT_FLOOR = 0.05  # act residual at/below this counts as "cold"
 
     # --- Piece E defaults ---
-    K_PRED = 1.0
+    # Lower gain so unfilled gaps cannot pin equilibrium against decay forever.
+    K_PRED = 0.25
     PRED_EMA_ALPHA = 0.2
     MIN_MEMBERS_FOR_EXPECTATION = 3
+    # Only inject prediction residual every N pulses (breaks perfect fixed-point).
+    PRED_INJECT_EVERY = 3
 
     # Consumer boosts
     WM_FOCUS_BONUS = 6.0
@@ -106,6 +114,8 @@ class FocusModule:
         self.thread: Optional[FocusThread] = None
         self.last_error: Dict[str, float] = {}
         self.last_tick_summary: Dict = {}
+        self._force_switch: bool = False
+        self._stagnation_events: int = 0
 
     # ------------------------------------------------------------------
     # Piece A — residual store
@@ -297,9 +307,23 @@ class FocusModule:
         current.source_mix = cur_mix
         current.last_seen_pulse = pulse
 
-        residency_met = (pulse - current.created_pulse) >= self.MIN_FOCUS_RESIDENCY
+        age = pulse - current.created_pulse
+        residency_met = age >= self.MIN_FOCUS_RESIDENCY
         margin_needed = max(abs(cur_score) * self.FOCUS_SWITCH_MARGIN, 0.5)
         challenger_wins = best_id != current.target_id and best_score > cur_score + margin_needed
+
+        # Stagnation escape: cold activation + long age → allow switch without margin
+        if self._force_switch and best_id != current.target_id:
+            self.thread = FocusThread(
+                target_id=best_id,
+                kind=kind,
+                score=best_score,
+                created_pulse=pulse,
+                last_seen_pulse=pulse,
+                source_mix=best_mix,
+            )
+            self._force_switch = False
+            return self.thread
 
         if residency_met and challenger_wins:
             self.thread = FocusThread(
@@ -447,9 +471,10 @@ class FocusModule:
                 error += s
         return error
 
-    def apply_prediction_to_residuals(self, graph) -> float:
-        """If focus is a schema (or any high residual schema in WM later),
-        add prediction error into r_pred. Returns error applied to focus."""
+    def apply_prediction_to_residuals(self, graph, pulse: int = 0) -> float:
+        """If focus is a schema, add prediction error into r_pred.
+        Injected only every PRED_INJECT_EVERY pulses so decay can move
+        the residual instead of locking a perfect fixed point."""
         fid = self.focus_id
         if not fid or fid not in graph:
             return 0.0
@@ -461,12 +486,36 @@ class FocusModule:
             return 0.0
         err = self.prediction_error(graph, fid)
         self.last_error[fid] = err
-        if err > 0:
+        if err > 0 and (pulse % max(1, self.PRED_INJECT_EVERY) == 0):
             self.r_pred[fid] = min(
                 self.RESIDUAL_CAP,
                 self.r_pred.get(fid, 0.0) + self.K_PRED * err,
             )
         return err
+
+    def _maybe_stagnation_escape(self, pulse: int) -> bool:
+        """If focus is old and activation-cold, slash prediction residual
+        and force a switch opportunity next select_focus. Returns True if
+        escape fired."""
+        if self.thread is None:
+            return False
+        age = pulse - self.thread.created_pulse
+        if age < self.MAX_FOCUS_AGE_STAGNANT:
+            return False
+        fid = self.thread.target_id
+        act = self.residuals.get(fid, 0.0)
+        if act > self.STAGNANT_ACT_FLOOR:
+            return False
+        # Slash prediction lock
+        if fid in self.r_pred:
+            self.r_pred[fid] *= self.STAGNANT_PRED_DECAY
+            if self.r_pred[fid] < self.RESIDUAL_FLOOR:
+                del self.r_pred[fid]
+        self._force_switch = True
+        self._stagnation_events += 1
+        # Soften unsatisfiable expectations slightly so the same gap
+        # does not immediately rebuild the same lock after switch-back.
+        return True
 
     # ------------------------------------------------------------------
     # Per-pulse tick (call from prometheus.pulse)
@@ -479,13 +528,16 @@ class FocusModule:
     ) -> Dict:
         basin_anchor_set = basin_anchor_set or set()
         self.decay_residuals(consolidation=False)
-        err = self.apply_prediction_to_residuals(graph)
+        stagnant = self._maybe_stagnation_escape(pulse)
+        err = self.apply_prediction_to_residuals(graph, pulse=pulse)
         thread = self.select_focus(graph, pulse, basin_anchor_set)
         summary = {
             "focus_id": thread.target_id if thread else None,
             "focus_kind": thread.kind if thread else None,
             "focus_score": thread.score if thread else 0.0,
             "prediction_error": err,
+            "stagnation_escape": stagnant,
+            "stagnation_events": self._stagnation_events,
             "residual_count": len(self.residuals),
             "top_residuals": self.top_residuals(8),
         }
@@ -510,5 +562,7 @@ class FocusModule:
             "top_residuals": self.top_residuals(10),
             "last_prediction_error": dict(self.last_error),
             "residual_count": len(self.residuals),
+            "stagnation_events": self._stagnation_events,
+            "force_switch_armed": self._force_switch,
             "last_tick": dict(self.last_tick_summary),
         }
