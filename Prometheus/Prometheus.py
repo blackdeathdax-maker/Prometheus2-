@@ -83,7 +83,7 @@ class Prometheus:
     # dominance from going completely flat during long batch-only runs,
     # it doesn't make self-study a real driver of felt-state exploration
     # the way genuine engagement is.
-    SELF_STUDY_AROUSAL_BUMP = 0.005
+    SELF_STUDY_AROUSAL_BUMP = 0.025
 
     # Hormonal reaction to real input -- new, this revision. §5.1 has
     # always described self-study's dopamine bump as "scaled down
