@@ -42,6 +42,8 @@ STRUCTURAL_FAMILIES = frozenset({
 })
 
 # Families tracked as schema expectations in v1.
+# Growable first: hierarchy/membership are what self-study actually writes.
+# Role/causal/social are tracked but down-weighted until write paths mature.
 TRACKED_EXPECTATION_FAMILIES = frozenset({
     FAMILY_ROLE,
     FAMILY_CAUSAL,
@@ -49,6 +51,16 @@ TRACKED_EXPECTATION_FAMILIES = frozenset({
     FAMILY_HIERARCHY,
     FAMILY_MEMBERSHIP,
 })
+
+# Relative weight on prediction error contribution by family.
+# Unfillable families (no producer yet) must not dominate focus forever.
+EXPECTATION_FAMILY_WEIGHT = {
+    FAMILY_HIERARCHY: 1.0,
+    FAMILY_MEMBERSHIP: 1.0,
+    FAMILY_SOCIAL_NORM: 0.45,  # only if relational intake fires
+    FAMILY_ROLE: 0.25,         # thin write path
+    FAMILY_CAUSAL: 0.15,       # almost no producer yet
+}
 
 
 @dataclass
@@ -105,6 +117,10 @@ class FocusModule:
     MIN_MEMBERS_FOR_EXPECTATION = 3
     # Only inject prediction residual every N pulses (breaks perfect fixed-point).
     PRED_INJECT_EVERY = 3
+    # Soften expected_families that stay missing while schema is focused.
+    EXPECTATION_SOFTEN_AFTER = 40   # pulses of focus with family still missing
+    EXPECTATION_SOFTEN_FACTOR = 0.92  # per soften tick toward ignoring dead gaps
+    EXPECTATION_SOFTEN_FLOOR = 0.12  # below this, family stops generating error
 
     # Consumer boosts
     WM_FOCUS_BONUS = 6.0
@@ -122,6 +138,8 @@ class FocusModule:
         self._hard_age_events: int = 0
         # node_id -> pulse when cooldown expires
         self._cooldown_until: Dict[str, int] = {}
+        # schema_id -> {family: consecutive pulses still missing while focused}
+        self._missing_streak: Dict[str, Dict[str, int]] = {}
 
     # ------------------------------------------------------------------
     # Piece A — residual store
@@ -449,8 +467,11 @@ class FocusModule:
             alpha = self.PRED_EMA_ALPHA
             merged = {}
             for f in TRACKED_EXPECTATION_FAMILIES:
-                old = float(prev.get(f, observed[f]))
-                merged[f] = (1.0 - alpha) * old + alpha * observed[f]
+                # Down-weight ungrowable families in the prototype itself
+                w = EXPECTATION_FAMILY_WEIGHT.get(f, 0.3)
+                obs = observed[f] * (0.5 + 0.5 * w)  # hierarchy full; causal muted
+                old = float(prev.get(f, obs))
+                merged[f] = (1.0 - alpha) * old + alpha * obs
             graph.nodes[sid]["expected_families"] = merged
             updated += 1
         return updated
@@ -483,21 +504,40 @@ class FocusModule:
         return present
 
     def prediction_error(self, graph, schema_id: str) -> float:
+        """Weighted structural gap. Hierarchy/membership count fully;
+        role/causal/social are discounted. Strengths already softened for
+        long-missing families are stored back onto the schema node."""
         data = graph.nodes.get(schema_id, {})
-        expected = data.get("expected_families") or {}
+        expected = dict(data.get("expected_families") or {})
         if not expected:
             return 0.0
         present = self._local_families_present(graph, schema_id)
         error = 0.0
-        for fam, strength in expected.items():
+        changed = False
+        streak = self._missing_streak.setdefault(schema_id, {})
+        for fam, strength in list(expected.items()):
             try:
                 s = float(strength)
             except (TypeError, ValueError):
                 continue
-            if s < 0.15:
+            if s < self.EXPECTATION_SOFTEN_FLOOR:
                 continue
-            if fam not in present:
-                error += s
+            if fam in present:
+                streak[fam] = 0
+                continue
+            # Still missing
+            streak[fam] = streak.get(fam, 0) + 1
+            if streak[fam] >= self.EXPECTATION_SOFTEN_AFTER:
+                new_s = max(self.EXPECTATION_SOFTEN_FLOOR * 0.5, s * self.EXPECTATION_SOFTEN_FACTOR)
+                if new_s != s:
+                    expected[fam] = new_s
+                    s = new_s
+                    changed = True
+            w = EXPECTATION_FAMILY_WEIGHT.get(fam, 0.3)
+            if s >= self.EXPECTATION_SOFTEN_FLOOR:
+                error += s * w
+        if changed:
+            graph.nodes[schema_id]["expected_families"] = expected
         return error
 
     def apply_prediction_to_residuals(self, graph, pulse: int = 0) -> float:
