@@ -146,30 +146,70 @@ class SensoryModule:
     # flags both `responsible-for` and `violates`).
     # ------------------------------------------------------------------
     def detect_relational(self, text: str) -> List[str]:
-        text = text.lower()
+        """§2.1b keyword intake — expanded trigger lists (still no LLM).
+        A single sentence may flag multiple families. Keep patterns
+        conservative enough to avoid tagging every dictionary gloss.
+        """
+        text = text.lower().strip()
         found = []
 
         # violates -- conflicts with a standard/value linked to SELF
-        if "should not" in text or "shouldn't" in text or "wrong" in text or "not supposed to" in text:
+        violates_markers = (
+            "should not", "shouldn't", "shouldnt", "must not", "mustn't",
+            "not supposed to", "wasn't supposed to", "ought not",
+            "wrong to", "it was wrong", "that was wrong", "i was wrong",
+            "guilty", "shame on", "i regret", "regretted", "shouldn't have",
+            "should not have", "broke the rule", "against the rules",
+            "i lied", "i cheated", "i stole",
+        )
+        if any(m in text for m in violates_markers):
             found.append(EDGE_VIOLATES)
 
         # responsible-for -- SELF as agent of an action/outcome
-        if "i did" in text or "my fault" in text or " i caused" in f" {text}" or "i made" in text:
+        # Word-boundary-ish checks via leading/trailing spaces where needed.
+        padded = f" {text} "
+        responsible_markers = (
+            " i did ", " i didn", " i done ", " my fault", " i caused ",
+            " i made ", " i chose ", " i decided ", " i hurt ", " i broke ",
+            " i said ", " i told ", " because of me", " i am responsible",
+            " i'm responsible", "im responsible", " i was responsible",
+            " i messed up", " i screwed up", " on me ", " blame me",
+        )
+        if any(m in padded for m in responsible_markers):
             found.append(EDGE_RESPONSIBLE_FOR)
+        # Leading "i did" / "i made" without relying only on padded mid-string
+        if re.search(r"\b(i did|i made|i caused|i chose|my fault)\b", text):
+            if EDGE_RESPONSIBLE_FOR not in found:
+                found.append(EDGE_RESPONSIBLE_FOR)
 
-        # temporal-contrast -- relates a node to a differing past state
-        # (nostalgia). Keyword-level only, per spec: "using timestamps
-        # chronos.py already logs" rather than any semantic comparison.
-        if "used to" in text or "back then" in text or "remember when" in text or "before, " in text:
+        # temporal-contrast -- past vs present framing
+        temporal_markers = (
+            "used to", "back then", "remember when", "before,", "before i",
+            "in the past", "years ago", "long ago", "those days",
+            "not like before", "things were different", "i used to",
+            "we used to", "once i", "once upon", "formerly",
+        )
+        if any(m in text for m in temporal_markers):
             found.append(EDGE_TEMPORAL_CONTRAST)
 
-        # concerns-other -- involves a distinct entity other than SELF
-        # (jealousy, embarrassment, social emotions generally). Cheap
-        # heuristic: third-person pronoun or "they/he/she/someone" present.
-        if re.search(r"\b(he|she|they|someone|another person|my friend|my sister|my brother)\b", text):
+        # concerns-other -- distinct entity other than SELF
+        if re.search(
+            r"\b(he|she|they|him|her|them|someone|somebody|"
+            r"another person|my friend|my sister|my brother|"
+            r"my mother|my father|my mom|my dad|my partner|"
+            r"my boss|people|everyone|nobody)\b",
+            text,
+        ):
             found.append(EDGE_CONCERNS_OTHER)
 
-        return found
+        # Dedup while preserving order
+        seen = set()
+        ordered = []
+        for r in found:
+            if r not in seen:
+                seen.add(r)
+                ordered.append(r)
+        return ordered
 
     def lookup_expansion(self, node: str):
         """Self-study expansion (§5.1): "an existing 'colors' node gets
