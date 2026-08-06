@@ -102,9 +102,10 @@ class WorkingMemoryModule:
     # claimed, not tuned beyond that.
     USER_PRIORITY_WEIGHT = 20.0
 
-    def __init__(self, archivist, synthesizer):
+    def __init__(self, archivist, synthesizer, focus=None):
         self.archivist = archivist
         self.synthesizer = synthesizer
+        self.focus = focus  # §13.y optional; set by Prometheus after FocusModule init
 
         # Instance attributes, not just module-level constants -- same
         # pattern as every other tunable in this design, so the Debug
@@ -221,6 +222,10 @@ class WorkingMemoryModule:
         # of whatever candidacy they already have.
         if node in basin_anchor_set:
             score += self.BASIN_COOCCURRENCE_BONUS
+
+        # §13.y: sticky focus boost
+        if self.focus is not None:
+            score += self.focus.focus_boost_for(node)
 
         return score
 

@@ -12,6 +12,7 @@ from .reflector import ReflectorModule
 from .chronos import ChronosModule
 from .working_memory import WorkingMemoryModule
 from .self_narrative import NarrativeModule
+from .focus import FocusModule
 from .sensory import SensoryModule
 from .association import AssociationEngine
 from .stimulus import SyntheticStimulusEngine
@@ -188,6 +189,10 @@ class Prometheus:
         self.stimulus = SyntheticStimulusEngine(self.bio, self.archivist, self.reflector)
         self.working_memory = WorkingMemoryModule(self.archivist, self.synthesizer)
         self.self_narrative = NarrativeModule(self.archivist, self.synthesizer)
+        self.focus = FocusModule()
+        self.working_memory.focus = self.focus  # §13.y WM consumer hook
+        self.last_collapse_summary = {"collapsed": 0, "conflicts": 0, "candidates_considered": 0}
+        self.last_focus_summary = {}
 
         # Barren self-study targets that fell out of dead-end detection's
         # proxy check (§14.6 item 2) need the same tracking self-study's
@@ -445,8 +450,10 @@ class Prometheus:
         node = result.get("term")
         if node:
             self.archivist.bump_activation(node)
+            self.focus.boost_residual(node)
         if anchor:
             self.archivist.bump_activation(anchor)
+            self.focus.boost_residual(anchor)
         # Co-activation (§13.3, new): node and anchor were touched in the
         # same event -- the raw signal epistemic schema clustering
         # depends on. A no-op if anchor is None (fewer than 2 real nodes).
@@ -630,6 +637,12 @@ class Prometheus:
             # feeds the same activation/working-memory signal as any
             # other interaction with it (§11 pull-forward).
             self.archivist.bump_activation(n)
+            self.focus.boost_residual(n)
+            # Disapproval / concern stick more; approval mildly satisfies via smaller residual.
+            if reaction_type in ("disapproval", "concern"):
+                self.focus.add_parental_residual(n, 1.0)
+            elif reaction_type in ("approval", "warmth"):
+                self.focus.add_parental_residual(n, 0.3)
 
         return {"reaction": reaction_type, "anchors_colored": unique_anchors}
 
@@ -683,12 +696,22 @@ class Prometheus:
         self._cycle_state()
         self.maybe_advance_epoch()
 
+        # §13.y: residual decay + prediction error + sticky focus selection
+        key = self.synthesizer.get_current_basin_key()
+        basin_anchors = set(self._get_unique_anchors(key))
+        self.last_focus_summary = self.focus.tick(
+            self.archivist.graph,
+            pulse=self.pulse_count,
+            basin_anchor_set=basin_anchors,
+        )
+
         results = self.archivist.retrieve("context")
 
         print(
             f"Pulse {self.pulse_count} | Epoch: {self.bio.epoch.value} | "
             f"State: {self.state} | Bias: {bias} | Fatigue: {self.fatigue:.2f} | "
-            f"Felt: {self.synthesizer.get_current_felt_state()}"
+            f"Felt: {self.synthesizer.get_current_felt_state()} | "
+            f"Focus: {self.focus.focus_id}"
         )
         return {
             "pulse": self.pulse_count,
@@ -696,6 +719,7 @@ class Prometheus:
             "state": self.state,
             "epoch": self.bio.epoch.value,
             "felt_state": self.synthesizer.get_current_felt_state(),
+            "focus_id": self.focus.focus_id,
         }
 
     # ------------------------------------------------------------------
@@ -791,8 +815,10 @@ class Prometheus:
         # same "gentler than externally-triggered" pattern already used
         # for the hormonal bump just below.
         self.archivist.bump_activation(target, self.ACTIVATION_BOOST_SELF_STUDY)
+        self.focus.boost_residual(target)
         for child_node in placed_children:
             self.archivist.bump_activation(child_node, self.ACTIVATION_BOOST_SELF_STUDY)
+            self.focus.boost_residual(child_node)
 
         # Small, scaled-down dopaminergic bump (§5.1, §9 risk 7) via the
         # same fast-layer pathway as any other event -- no bespoke
@@ -1016,6 +1042,8 @@ class Prometheus:
             weights = [self.archivist.graph.nodes[n].get("activation", 0.0) + 0.1 for n in pool]
         if boost_set:
             weights = [w * 3.0 if n in boost_set else w for n, w in zip(pool, weights)]
+        # §13.y: sticky focus / residual neighbourhood bias
+        weights = [w * self.focus.self_study_weight(n) for n, w in zip(pool, weights)]
         return random.choices(pool, weights=weights, k=1)[0]
 
     # ------------------------------------------------------------------
@@ -1090,6 +1118,10 @@ class Prometheus:
         read, not maintained incremental state (the underlying element
         set only changes at Consolidation; this just formats it)."""
         return self.self_narrative.report(top_n=top_n)
+
+    def get_focus_report(self) -> dict:
+        """§13.y debug/Reflection helper -- residual + sticky focus state."""
+        return self.focus.report()
 
     def _run_consolidation(self):
         """
@@ -1167,9 +1199,19 @@ class Prometheus:
             protected_nodes |= set(self.get_current_working_memory().get("slots", []))
         except Exception as e:  # defensive -- working memory's own computation must never block Consolidation
             logger.warning("Could not compute working-memory protection set for collapse pass: %s", e)
+        # §13.y: current sticky focus never collapses while active
+        protected_nodes |= self.focus.protected_ids()
+
+        # §13.y Piece D: update schema expected_families before collapse densifies parents
+        n_exp = self.focus.update_expected_families(self.archivist.graph)
+        if n_exp:
+            print(f"Consolidation: updated expected_families on {n_exp} schema(s)")
+
         collapse_summary = self.archivist.run_collapse_pass(
             protected_nodes=protected_nodes, current_pulse=self.pulse_count,
         )
+        self.last_collapse_summary = collapse_summary
+        self.focus.decay_residuals(consolidation=True)
 
         # §16, new this session: Self-Narrative evaluation. Runs after
         # both schema-detection passes AND the collapse pass (moved here
@@ -1204,8 +1246,8 @@ class Prometheus:
             print(f"Consolidation: formed {len(new_epistemic_schemas)} new Epistemic Schema Node(s): {new_epistemic_schemas}")
         if merged_epistemic:
             print(f"Consolidation: merged {merged_epistemic} duplicate Epistemic Schema Node(s) into their named parent.")
-        if collapse_summary.get("collapsed"):
-            print(f"Consolidation: §13.4 collapse {collapse_summary}")
+        # Always print (including zeros) so Streamlit logs show the pass ran
+        print(f"Consolidation: §13.4 collapse {collapse_summary}")
         if narrative_summary.get("created") or narrative_summary.get("absorbed") or narrative_summary.get("pruned"):
             print(f"Consolidation: Self-Narrative {narrative_summary}")
 
