@@ -621,6 +621,24 @@ if st.session_state.prom is not None:
                 f"Stabilized basins: {len(prom.synthesizer.stabilized_basins)}"
             )
 
+            st.subheader("Focus / Residuals (§13.y)")
+            if hasattr(prom, "get_focus_report"):
+                st.json(prom.get_focus_report())
+            else:
+                st.caption("Focus module not wired on this instance.")
+
+            st.subheader("Last collapse summary (§13.4)")
+            st.json(getattr(prom, "last_collapse_summary", {}))
+
+            absorbed_parents = [
+                {"parent": n, "absorbed_count": len(d.get("absorbed") or [])}
+                for n, d in prom.archivist.graph.nodes(data=True)
+                if d.get("absorbed")
+            ]
+            if absorbed_parents:
+                st.subheader("Parents with absorbed children")
+                st.json(absorbed_parents[:30])
+
             st.divider()
             st.markdown(
                 "<div style='background-color:#402020;padding:8px;border-radius:4px;'>"
