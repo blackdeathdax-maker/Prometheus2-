@@ -86,8 +86,8 @@ class FocusModule:
     W_PAR = 0.5
 
     # --- Piece B defaults ---
-    MIN_FOCUS_RESIDENCY = 8
-    FOCUS_SWITCH_MARGIN = 0.15  # challenger must beat current by this fraction
+    MIN_FOCUS_RESIDENCY = 20
+    FOCUS_SWITCH_MARGIN = 0.25  # challenger must beat current by this fraction
     CANDIDATE_POOL_CAP = 40
     # If focus is held this long with no activation residual, treat prediction
     # as stagnant: slash r_pred and allow an immediate switch (escape valve).
