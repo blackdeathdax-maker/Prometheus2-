@@ -27,6 +27,45 @@ SCHEMA_STABILIZATION_THRESHOLD = 3
 EPISTEMIC_MIN_CLUSTER_SIZE = 3
 EPISTEMIC_NAME_MIN_COVERAGE = 2  # how many cluster members a parsed is-a parent must cover before it's recognized as earning the cluster's name (§13.3.1)
 
+# §13 naming hygiene: graph node *ids* must stay short/stable; human-readable
+# glosses live on attributes (name / definition), not in the id string.
+_MAX_ID_FRAGMENT_LEN = 40
+_MAX_DISPLAY_NAME_LEN = 80
+
+
+def _slug_id_fragment(label: str) -> str:
+    """Turn an arbitrary parent label into a safe, short id fragment.
+    Long WordNet glosses become a short slug + hash so ids stay navigable.
+    """
+    import re
+    raw = (label or "").strip()
+    if not raw:
+        return "unknown"
+    # Prefer already-short lemma-like labels
+    if len(raw) <= _MAX_ID_FRAGMENT_LEN and " " not in raw and raw.isascii():
+        safe = re.sub(r"[^A-Za-z0-9_\-]+", "_", raw)
+        return safe[:_MAX_ID_FRAGMENT_LEN] or "unknown"
+    # Multi-word / gloss: take first 3 meaningful tokens + short hash
+    stop = {
+        "a", "an", "the", "of", "or", "and", "to", "in", "on", "for", "with",
+        "as", "by", "from", "that", "which", "who", "is", "are", "was", "were",
+    }
+    tokens = re.findall(r"[A-Za-z0-9]+", raw.lower())
+    keep = [tok for tok in tokens if tok not in stop][:3]
+    slug = "_".join(keep) if keep else "gloss"
+    digest = hashlib.sha1(raw.encode()).hexdigest()[:6]
+    frag = f"{slug}_{digest}"
+    return frag[:_MAX_ID_FRAGMENT_LEN]
+
+
+def _display_name(label: str) -> str:
+    """Human-facing name: keep short labels; truncate long glosses."""
+    raw = (label or "").strip()
+    if len(raw) <= _MAX_DISPLAY_NAME_LEN:
+        return raw
+    return raw[: _MAX_DISPLAY_NAME_LEN - 1].rstrip() + "…"
+
+
 
 
 class ReflectorModule:
@@ -354,7 +393,8 @@ class ReflectorModule:
                 member_count=len(members),
             )
             if dominant_parent:
-                node_kwargs["name"] = dominant_parent
+                node_kwargs["name"] = _display_name(dominant_parent)
+                node_kwargs["definition"] = dominant_parent  # full gloss if any
                 node_kwargs["named"] = True
             else:
                 node_kwargs["name"] = None
@@ -434,7 +474,7 @@ class ReflectorModule:
             if not dominant_parent:
                 continue  # still a genuine no-parent cluster -- leave it as-is
 
-            target_id = f"epistemic_of_{dominant_parent}"
+            target_id = f"epistemic_of_{_slug_id_fragment(dominant_parent)}"
             if target_id not in graph:
                 graph.add_node(
                     target_id,
@@ -443,7 +483,7 @@ class ReflectorModule:
                     tier0_cycles=0, activation=data.get("activation", 0.0),
                     valence_coloring=data.get("valence_coloring", 0.0),
                     node_type=NODE_EPISTEMIC_SCHEMA, abstraction_level=1,
-                    name=dominant_parent, named=True, member_count=0,
+                    name=_display_name(dominant_parent), definition=dominant_parent, named=True, member_count=0,
                 )
             existing_members = {
                 v for _u, v, edata in graph.out_edges(target_id, data=True)
@@ -463,17 +503,12 @@ class ReflectorModule:
 
     @staticmethod
     def _epistemic_cluster_id(members: List[str], dominant_parent: Optional[str] = None) -> str:
-        """Bug fix, this session: previously always a hash of the exact
-        member set, meaning any membership growth produced a completely
-        different id and therefore a brand-new, duplicate schema node
-        (see detect_epistemic_clusters()'s docstring for the full
-        diagnosis). When a dominant is-a parent exists, identity comes
-        from that parent directly instead -- stable across membership
-        growth, and doubles as the schema's name with no separate naming
-        step needed. Only genuinely parent-less clusters still get the
-        anonymous member-hash id."""
+        """Stable cluster id. Parent-based ids use a *short slug*, not the
+        raw parent string — long WordNet glosses must not become node ids
+        (naming hygiene). Full parent text is stored on the node as
+        `name` / `definition` at creation time."""
         if dominant_parent:
-            return f"epistemic_of_{dominant_parent}"
+            return f"epistemic_of_{_slug_id_fragment(dominant_parent)}"
         digest = hashlib.sha1("|".join(sorted(members)).encode()).hexdigest()[:8]
         return f"epistemic_{digest}"
 
