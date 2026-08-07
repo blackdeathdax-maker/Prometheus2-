@@ -627,10 +627,10 @@ if st.session_state.prom is not None:
             if hasattr(prom, "get_focus_report"):
                 st.json(prom.get_focus_report())
             else:
-            st.caption("Focus module not wired on this instance.")
+                st.caption("Focus module not wired on this instance.")
 
-            st.subheader("Last collapse summary (§13.4)")
-            st.json(getattr(prom, "last_collapse_summary", {}))
+                st.subheader("Last collapse summary (§13.4)")
+                st.json(getattr(prom, "last_collapse_summary", {}))
 
             absorbed_parents = [
                 {"parent": n, "absorbed_count": len(d.get("absorbed") or [])}
