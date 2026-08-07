@@ -620,12 +620,14 @@ if st.session_state.prom is not None:
             st.caption(
                 f"Stabilized basins: {len(prom.synthesizer.stabilized_basins)}"
             )
-
+            st.subheader("Somatic topography (basin map)")
+            st.caption("Basins and transitions — not raw hormone gauges.")
+            st.json(prom.get_somatic_topo_report())
             st.subheader("Focus / Residuals (§13.y)")
             if hasattr(prom, "get_focus_report"):
                 st.json(prom.get_focus_report())
             else:
-                st.caption("Focus module not wired on this instance.")
+            st.caption("Focus module not wired on this instance.")
 
             st.subheader("Last collapse summary (§13.4)")
             st.json(getattr(prom, "last_collapse_summary", {}))
