@@ -1,6 +1,7 @@
 """
 Streamlit entry point (§7, §4B). Hosts the tabbed layout: Graph / State / Reflection / Debug (Task 3).
 """
+import time
 import streamlit as st
 from Prometheus.Prometheus import Prometheus
 from Prometheus.archivist import SELF_NODE
@@ -11,6 +12,12 @@ st.title("Prometheus – Living Brain")
 
 if "prom" not in st.session_state:
     st.session_state.prom = None
+if "semi_live" not in st.session_state:
+    st.session_state.semi_live = False
+if "last_auto_pulse_t" not in st.session_state:
+    st.session_state.last_auto_pulse_t = 0.0
+if "semi_live_pause_until" not in st.session_state:
+    st.session_state.semi_live_pause_until = 0.0
 
 st.sidebar.header("Controls")
 if st.sidebar.button("Start System", disabled=st.session_state.prom is not None):
@@ -41,15 +48,89 @@ if st.session_state.prom is not None:
     if st.sidebar.button("Send") and user_text.strip():
         prom.queue_input(user_text.strip(), source="user")
         st.sidebar.success("Queued for next pulse")
+        # Give the next Learning pulse a chance to ingest before auto continues
+        if st.session_state.get("semi_live_pause_on_send", True):
+            st.session_state.semi_live_pause_until = time.time() + max(
+                2.0, float(st.session_state.get("semi_live_interval", 3.0))
+            )
 
     if st.sidebar.button("Pulse"):
         prom.pulse()
 
+    # ------------------------------------------------------------------
+    # Semi-live: auto-pulse while the browser session is open (§4D lite).
+    # Not a headless daemon — closing the tab or toggling off stops the clock.
+    # ------------------------------------------------------------------
+    st.sidebar.subheader("Semi-live")
     st.sidebar.caption(
-        "Not §4D's real-time catch-up (still unimplemented, §10.20) -- "
-        "a simple stopgap for running many ticks at once, e.g. to watch "
-        "fatigue cycling or a slider change play out without clicking "
-        "Pulse by hand."
+        "Auto-advances pulse() on a timer while this page is open. "
+        "Pause/resume anytime. Not unsupervised 24/7 hosting."
+    )
+    semi = st.sidebar.toggle(
+        "Auto-pulse",
+        value=st.session_state.semi_live,
+        key="semi_live_toggle",
+    )
+    st.session_state.semi_live = bool(semi)
+    interval_s = st.sidebar.slider(
+        "Interval (seconds)",
+        min_value=1.0,
+        max_value=30.0,
+        value=3.0,
+        step=0.5,
+        key="semi_live_interval",
+    )
+    pulses_per_tick = st.sidebar.number_input(
+        "Pulses per tick",
+        min_value=1,
+        max_value=25,
+        value=1,
+        step=1,
+        key="semi_live_ppt",
+    )
+    pause_on_send = st.sidebar.checkbox(
+        "Pause briefly after Send",
+        value=True,
+        key="semi_live_pause_on_send",
+    )
+
+    # Drive the clock: prefer streamlit-autorefresh; else timed st.rerun fallback.
+    if st.session_state.semi_live:
+        has_autorefresh = False
+        try:
+            from streamlit_autorefresh import st_autorefresh
+            st_autorefresh(
+                interval=int(float(interval_s) * 1000),
+                key="semi_live_autorefresh",
+            )
+            has_autorefresh = True
+        except ImportError:
+            has_autorefresh = False
+
+        now = time.time()
+        paused = now < float(st.session_state.semi_live_pause_until)
+        if not paused and (now - float(st.session_state.last_auto_pulse_t)) >= float(interval_s):
+            n = int(pulses_per_tick)
+            for _ in range(n):
+                prom.pulse()
+            st.session_state.last_auto_pulse_t = now
+        st.sidebar.caption(
+            f"{'⏸ Paused' if paused else '▶ Running'} · "
+            f"pulse {prom.pulse_count} · {prom.state} · "
+            f"fatigue {prom.fatigue:.3f}"
+        )
+        if not has_autorefresh:
+            # Heavier on the server; install streamlit-autorefresh when possible.
+            time.sleep(min(0.5, float(interval_s)))
+            st.rerun()
+
+    st.sidebar.caption(
+        "Batch run remains available for fast lab soaks. "
+        "Prefer semi-live for continuous-time behavior."
+    )
+    st.sidebar.caption(
+        "Not §4D's full real-time catch-up -- semi-live is the intentional "
+        "middle step (timer while the session is open)."
     )
     batch_n = st.sidebar.number_input("Run N pulses", min_value=1, max_value=2000, value=50, step=10)
     if st.sidebar.button("Run Batch"):
