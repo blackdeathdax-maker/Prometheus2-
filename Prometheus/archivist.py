@@ -567,7 +567,7 @@ class ArchivistModule:
         not permanent historical importance. SELF is exempt (seeded at
         ACTIVATION_CAP, §2.1b item 1's axiom status extended here: it
         should never silently fall out of the focused Graph-tab view)."""
-        for node, data in self.graph.nodes(data=True):
+        for node, data in list(self.graph.nodes(data=True)):
             if node == SELF_NODE:
                 continue
             data["activation"] = data.get("activation", 0.0) * self.ACTIVATION_DECAY_RATE
@@ -1118,7 +1118,7 @@ class ArchivistModule:
         firmer parent should be (it has the dictionary-pattern parser);
         this just flags who's eligible."""
         candidates = []
-        for node in self.graph.nodes:
+        for node in list(self.graph.nodes):
             if node == SELF_NODE:
                 continue
             in_edges = list(self.graph.in_edges(node, data=True))
