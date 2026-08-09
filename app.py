@@ -704,6 +704,13 @@ if st.session_state.prom is not None:
             st.subheader("Somatic topography (basin map)")
             st.caption("Basins and transitions — not raw hormone gauges.")
             st.json(prom.get_somatic_topo_report())
+
+            st.subheader("Felt anchors (linkable felt identities)")
+            st.caption("Stable ids over PAD; names only when earned — not basin_0.6_…")
+            if hasattr(prom, "get_felt_anchor_report"):
+                st.json(prom.get_felt_anchor_report())
+            else:
+                st.caption("Felt anchors not wired on this instance.")
             st.subheader("Focus / Residuals (§13.y)")
             if hasattr(prom, "get_focus_report"):
                 st.json(prom.get_focus_report())
