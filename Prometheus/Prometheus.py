@@ -14,6 +14,7 @@ from .working_memory import WorkingMemoryModule
 from .self_narrative import NarrativeModule
 from .focus import FocusModule
 from .somatic_topo import SomaticTopo
+from .felt_anchors import FeltAnchorStore
 from .sensory import SensoryModule
 from .association import AssociationEngine
 from .stimulus import SyntheticStimulusEngine
@@ -193,6 +194,7 @@ class Prometheus:
         self.focus = FocusModule()
         self.working_memory.focus = self.focus  # §13.y WM consumer hook
         self.somatic_topo = SomaticTopo()
+        self.felt_anchors = FeltAnchorStore()
         self.last_collapse_summary = {"collapsed": 0, "conflicts": 0, "candidates_considered": 0}
         self.last_focus_summary = {}
 
@@ -453,6 +455,9 @@ class Prometheus:
         if node:
             self.archivist.bump_activation(node)
             self.focus.boost_residual(node)
+            # Felt-anchor naming: short lemma-like user words while in a basin
+            if source == "user" and len(text.split()) <= 3:
+                self.felt_anchors.try_name_current(text.strip())
         if anchor:
             self.archivist.bump_activation(anchor)
             self.focus.boost_residual(anchor)
@@ -664,6 +669,10 @@ class Prometheus:
         # synthesizer.py's output, never on `somatic` directly.
         self.synthesizer.update_from_core(self.bio.get_raw_variables())
         self.somatic_topo.record(self.synthesizer.get_current_basin_key())
+        self.felt_anchors.observe(
+            self.synthesizer.get_current_basin_key(),
+            raw_body=self.bio.get_raw_variables(),
+        )
         intensity = self.synthesizer.get_current_intensity()
 
         bias = self.executive.bias_processing(intensity)
@@ -1129,6 +1138,10 @@ class Prometheus:
     def get_somatic_topo_report(self) -> dict:
         """Basin dwell + transition map (not raw hormone gauges)."""
         return self.somatic_topo.report()
+
+    def get_felt_anchor_report(self) -> dict:
+        """Linkable felt identities over PAD (coords stay internal)."""
+        return self.felt_anchors.report()
 
     def _run_consolidation(self):
         """
