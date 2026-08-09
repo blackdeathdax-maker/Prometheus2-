@@ -13,6 +13,7 @@ from .chronos import ChronosModule
 from .working_memory import WorkingMemoryModule
 from .self_narrative import NarrativeModule
 from .focus import FocusModule
+from .somatic_topo import SomaticTopo
 from .sensory import SensoryModule
 from .association import AssociationEngine
 from .stimulus import SyntheticStimulusEngine
@@ -191,6 +192,7 @@ class Prometheus:
         self.self_narrative = NarrativeModule(self.archivist, self.synthesizer)
         self.focus = FocusModule()
         self.working_memory.focus = self.focus  # §13.y WM consumer hook
+        self.somatic_topo = SomaticTopo()
         self.last_collapse_summary = {"collapsed": 0, "conflicts": 0, "candidates_considered": 0}
         self.last_focus_summary = {}
 
@@ -661,6 +663,7 @@ class Prometheus:
         # Principle, prometheus.py and executive.py must only condition on
         # synthesizer.py's output, never on `somatic` directly.
         self.synthesizer.update_from_core(self.bio.get_raw_variables())
+        self.somatic_topo.record(self.synthesizer.get_current_basin_key())
         intensity = self.synthesizer.get_current_intensity()
 
         bias = self.executive.bias_processing(intensity)
@@ -1123,6 +1126,10 @@ class Prometheus:
         """§13.y debug/Reflection helper -- residual + sticky focus state."""
         return self.focus.report()
 
+    def get_somatic_topo_report(self) -> dict:
+        """Basin dwell + transition map (not raw hormone gauges)."""
+        return self.somatic_topo.report()
+
     def _run_consolidation(self):
         """
         Everything the spec pins to the Consolidation clock, in one place
@@ -1131,6 +1138,8 @@ class Prometheus:
         principle (see conversation summary).
         """
         self.synthesizer.consolidate_basins()
+        topo_summary = self.somatic_topo.consolidate()
+        print(f"Consolidation: somatic topo {topo_summary}")
 
         # Bug fix, this revision: stabilized_basins was previously only
         # ever a string mapping inside synthesizer.py -- no corresponding
