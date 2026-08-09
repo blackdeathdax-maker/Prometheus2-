@@ -1,6 +1,6 @@
 # Prometheus Design Specification — Current Build
 
-**Document status:** Working spec reflecting implemented architecture as of 2026-08-08  
+**Document status:** Working spec reflecting implemented architecture as of 2026-08-09  
 **Project:** Prometheus2 (`Prometheus – Living Brain`)  
 **Codename intent:** A pulse-driven cognitive architecture aimed at schema formation, collapse/abstraction, somatic grounding, and directed attention — not an LLM wrapper.
 
@@ -165,10 +165,18 @@ Promotion/demotion uses source weights, diversity, edges, **hysteresis** (not si
 
 ### 7.1 Epistemic schemas
 
-- Co-activation → connected components → cluster
-- Dominant is-a parent → stable id + display name
+- Co-activation → connected components → cluster (Working+ members only)
+- **Admission gates (quality repair):**
+  - mean pairwise coherence ≥ `EPISTEMIC_MIN_COHERENCE` (token Jaccard + optional WordNet hypernym bonus)
+  - lemma-like member ratio ≥ `EPISTEMIC_MIN_LEMMA_RATIO` (rejects sentence-soup clusters)
+- **Ids:** short stable `epistemic_of_{slug}` or `epistemic_{hash}` — never full gloss as id
+- **Naming (delayed):** schemas are created **unnamed**; `name` is set only when:
+  - coherence still holds
+  - context diversity ≥ `EPISTEMIC_NAME_MIN_CONTEXTS` (distinct sources / felt stamps)
+  - a lemma-like member meets frequency ≥ `EPISTEMIC_NAME_MIN_FREQ`
+- **Unnamed expiry:** after `EPISTEMIC_UNNAMED_MAX_CYCLES` consolidations stagnant and not improving coherence → **dissolve schema wrapper only**; members and their edges remain
 - Membership via composed-of edges
-- Formation/growth on **Consolidation**
+- Formation / naming / expiry on **Consolidation**
 
 ### 7.2 Complex emotional (somatic) schemas
 
@@ -335,7 +343,10 @@ Optional later: prosody biased by arousal; silence while prediction residual hig
 | Focus + residuals + pred + max-age/cooldown | Implemented |
 | Working memory | Implemented |
 | Complex schema candidates | Implemented (needs recurrence) |
-| Epistemic schema clusters + naming hygiene | Implemented (new ids short) |
+| Epistemic schema clusters + naming hygiene | Implemented (short ids) |
+| Schema coherence gate + delayed naming + unnamed expiry | Implemented |
+| Felt anchors (linkable basins) | Not done — next |
+| Differentiated hormone drive | Partial (arousal bump raised; full role map not done) |
 | Somatic topo data | Implemented |
 | Semi-live Streamlit | Implemented |
 | Headless live loop | Implemented (`live.py`) |
@@ -381,7 +392,7 @@ Avoid broad fatigue tuning until live dynamics are the normal case.
 | Rev | Notes |
 |-----|--------|
 | rev18 family | Prior basin/schema/WM/narrative design |
-| **Current (this file)** | Collapse, focus/pred, naming hygiene, somatic topo, semi-live, headless live, mobile/speech deferral, status table |
+| **Current (this file)** | + schema coherence, delayed naming, unnamed expiry; arousal bump; roadmap for felt anchors |
 
 ---
 
