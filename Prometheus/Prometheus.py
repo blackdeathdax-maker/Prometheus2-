@@ -921,7 +921,7 @@ class Prometheus:
             )
 
         working_candidates = [
-            n for n, d in graph.nodes(data=True)
+            n for n, d in list(graph.nodes(data=True))
             if d.get("tier", 0) >= TIER_WORKING and has_room(n, d)
         ]
         # (b) NEW: Provisional nodes with room, source-tagged non-self-generated
@@ -930,7 +930,7 @@ class Prometheus:
         # self-study attention instead of waiting on a tier it may never
         # reach without exactly this kind of reinforcement.
         provisional_candidates = [
-            n for n, d in graph.nodes(data=True)
+            n for n, d in list(graph.nodes(data=True))
             if d.get("tier", 0) < TIER_WORKING and d.get("source") != "self_generated" and has_room(n, d)
         ]
 
@@ -986,7 +986,7 @@ class Prometheus:
 
         # (d) last resort: any node with room, not just any node at all
         # (same fix -- this used to be truly uncapped).
-        low_degree_any = [n for n, d in graph.nodes(data=True) if has_room(n, d)]
+        low_degree_any = [n for n, d in list(graph.nodes(data=True)) if has_room(n, d)]
         if low_degree_any:
             return random.choice(low_degree_any)
 
