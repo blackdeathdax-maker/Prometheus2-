@@ -1,4 +1,5 @@
 import hashlib
+import re
 from collections import Counter
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -26,6 +27,13 @@ SCHEMA_STABILIZATION_THRESHOLD = 3
 # tuning-placeholder status as everything else in this design (§10).
 EPISTEMIC_MIN_CLUSTER_SIZE = 3
 EPISTEMIC_NAME_MIN_COVERAGE = 2  # how many cluster members a parsed is-a parent must cover before it's recognized as earning the cluster's name (§13.3.1)
+
+# Schema quality gates (repair pass — sense before promotion)
+EPISTEMIC_MIN_COHERENCE = 0.22          # mean pairwise token/hypernym overlap
+EPISTEMIC_MIN_LEMMA_RATIO = 0.5         # fraction of members that look like lemmas not sentences
+EPISTEMIC_NAME_MIN_FREQ = 2             # times a candidate label appears as member-ish
+EPISTEMIC_NAME_MIN_CONTEXTS = 2         # distinct sources or basins before naming
+EPISTEMIC_UNNAMED_MAX_CYCLES = 8        # consolidations unnamed+stagnant → dissolve wrapper
 
 # §13 naming hygiene: graph node *ids* must stay short/stable; human-readable
 # glosses live on attributes (name / definition), not in the id string.
@@ -97,6 +105,11 @@ class ReflectorModule:
         self.SCHEMA_STABILIZATION_THRESHOLD = SCHEMA_STABILIZATION_THRESHOLD
         self.EPISTEMIC_MIN_CLUSTER_SIZE = EPISTEMIC_MIN_CLUSTER_SIZE
         self.EPISTEMIC_NAME_MIN_COVERAGE = EPISTEMIC_NAME_MIN_COVERAGE
+        self.EPISTEMIC_MIN_COHERENCE = EPISTEMIC_MIN_COHERENCE
+        self.EPISTEMIC_MIN_LEMMA_RATIO = EPISTEMIC_MIN_LEMMA_RATIO
+        self.EPISTEMIC_NAME_MIN_FREQ = EPISTEMIC_NAME_MIN_FREQ
+        self.EPISTEMIC_NAME_MIN_CONTEXTS = EPISTEMIC_NAME_MIN_CONTEXTS
+        self.EPISTEMIC_UNNAMED_MAX_CYCLES = EPISTEMIC_UNNAMED_MAX_CYCLES
 
     # ------------------------------------------------------------------
     # 1. Structural self-report (pre-existing, unchanged)
@@ -272,6 +285,171 @@ class ReflectorModule:
     # here, deliberately, rather than attempting the full recursive system
     # in one unvalidated leap.
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Schema quality: coherence, lemma filter, delayed naming, expire
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_lemma_like(label: str) -> bool:
+        """True for short concept-like labels; false for sentences/glosses."""
+        if not label or label in (SELF_NODE,):
+            return False
+        s = str(label).strip()
+        if len(s) > 48:
+            return False
+        if " " in s and len(s.split()) > 4:
+            return False
+        low = s.lower()
+        if low.startswith(("i ", "i'", "it was", "it is", "she ", "he ", "they ")):
+            return False
+        if s.startswith("epistemic_") or s.startswith("schema_"):
+            return False
+        return True
+
+    @staticmethod
+    def _tokens(label: str) -> set:
+        stop = {
+            "a", "an", "the", "of", "or", "and", "to", "in", "on", "for", "with",
+            "as", "by", "from", "that", "which", "who", "is", "are", "was", "were",
+            "my", "me", "i",
+        }
+        return {t for t in re.findall(r"[a-z0-9]+", str(label).lower()) if t not in stop and len(t) > 1}
+
+    def _pair_similarity(self, a: str, b: str) -> float:
+        """Token Jaccard; optional WordNet hypernym bonus if available."""
+        ta, tb = self._tokens(a), self._tokens(b)
+        if not ta or not tb:
+            return 0.0
+        inter = len(ta & tb)
+        union = len(ta | tb)
+        jacc = inter / union if union else 0.0
+        # Light WordNet hypernym overlap on first token
+        try:
+            from nltk.corpus import wordnet as wn
+            wa = wn.synsets(next(iter(ta)))
+            wb = wn.synsets(next(iter(tb)))
+            if wa and wb:
+                ha = set(wa[0].closure(lambda s: s.hypernyms()))
+                hb = set(wb[0].closure(lambda s: s.hypernyms()))
+                # include self
+                ha.add(wa[0]); hb.add(wb[0])
+                if ha & hb:
+                    jacc = min(1.0, jacc + 0.25)
+        except Exception:
+            pass
+        return jacc
+
+    def cluster_coherence(self, members: List[str]) -> float:
+        """Mean pairwise similarity over lemma-like members (fallback: all)."""
+        core = [m for m in members if self._is_lemma_like(m)]
+        if len(core) < 2:
+            core = list(members)
+        if len(core) < 2:
+            return 0.0
+        total = 0.0
+        n = 0
+        for i in range(len(core)):
+            for j in range(i + 1, len(core)):
+                total += self._pair_similarity(core[i], core[j])
+                n += 1
+        return total / n if n else 0.0
+
+    def lemma_ratio(self, members: List[str]) -> float:
+        if not members:
+            return 0.0
+        return sum(1 for m in members if self._is_lemma_like(m)) / len(members)
+
+    def _member_context_diversity(self, members: List[str]) -> int:
+        """Count distinct sources and felt_state_at_creation on incident edges."""
+        graph = self.archivist.graph
+        contexts = set()
+        for m in members:
+            if m not in graph:
+                continue
+            data = graph.nodes.get(m, {})
+            src = data.get("source")
+            if src:
+                contexts.add(f"src:{src}")
+            for _u, _v, ed in list(graph.in_edges(m, data=True)) + list(graph.out_edges(m, data=True)):
+                if ed.get("source"):
+                    contexts.add(f"esrc:{ed.get('source')}")
+                if ed.get("felt_state_at_creation"):
+                    contexts.add(f"felt:{ed.get('felt_state_at_creation')}")
+        return len(contexts)
+
+    def _name_candidate(self, members: List[str]) -> Optional[str]:
+        """Best lemma-like member to use as human name, or None."""
+        freq = Counter(m for m in members if self._is_lemma_like(m))
+        if not freq:
+            return None
+        ranked = sorted(freq.items(), key=lambda t: (-t[1], len(str(t[0]))))
+        for term, count in ranked:
+            if count >= self.EPISTEMIC_NAME_MIN_FREQ:
+                return str(term)
+        return None
+
+    def try_name_epistemic_schemas(self) -> int:
+        """Delayed naming pass: only name when coherence + diversity + candidate."""
+        graph = self.archivist.graph
+        named = 0
+        for node, data in list(graph.nodes(data=True)):
+            if data.get("node_type") != NODE_EPISTEMIC_SCHEMA:
+                continue
+            if data.get("named"):
+                continue
+            members = [
+                v for _u, v, ed in graph.out_edges(node, data=True)
+                if ed.get("relation_type") == EDGE_COMPOSED_OF
+            ]
+            if len(members) < self.EPISTEMIC_MIN_CLUSTER_SIZE:
+                continue
+            coh = self.cluster_coherence(members)
+            if coh < self.EPISTEMIC_MIN_COHERENCE:
+                continue
+            if self._member_context_diversity(members) < self.EPISTEMIC_NAME_MIN_CONTEXTS:
+                continue
+            candidate = self._name_candidate(members)
+            if not candidate:
+                continue
+            data["name"] = _display_name(candidate)
+            data["named"] = True
+            data["unnamed_cycles"] = 0
+            named += 1
+        return named
+
+    def expire_unnamed_epistemic_schemas(self) -> int:
+        """Dissolve stagnant unnamed schema wrappers; members and their edges remain."""
+        graph = self.archivist.graph
+        dissolved = 0
+        for node, data in list(graph.nodes(data=True)):
+            if data.get("node_type") != NODE_EPISTEMIC_SCHEMA:
+                continue
+            if data.get("named"):
+                data["unnamed_cycles"] = 0
+                continue
+            cycles = int(data.get("unnamed_cycles", 0)) + 1
+            data["unnamed_cycles"] = cycles
+            # Reinforced recently? treat as not stagnant
+            # last_reinforced is datetime — if member_count grew this pass, growth path resets via caller
+            if cycles < self.EPISTEMIC_UNNAMED_MAX_CYCLES:
+                continue
+            members = [
+                v for _u, v, ed in list(graph.out_edges(node, data=True))
+                if ed.get("relation_type") == EDGE_COMPOSED_OF
+            ]
+            coh = self.cluster_coherence(members) if members else 0.0
+            # Still improving coherence — keep probation
+            prev = float(data.get("last_coherence", 0.0))
+            data["last_coherence"] = coh
+            if coh > prev + 0.02 and cycles < self.EPISTEMIC_UNNAMED_MAX_CYCLES * 2:
+                continue
+            # Dissolve wrapper only
+            if node in graph:
+                graph.remove_node(node)
+                dissolved += 1
+        return dissolved
+
+
     def detect_epistemic_clusters(self) -> List[str]:
         """
         Groups nodes whose co-activation has stabilized (archivist.
@@ -357,6 +535,15 @@ class ReflectorModule:
                 continue
 
             dominant_parent, _coverage = self._dominant_parent(members)
+
+            # Quality gates: reject nonsense clusters before they enter cortex
+            coh = self.cluster_coherence(members)
+            lr = self.lemma_ratio(members)
+            if coh < self.EPISTEMIC_MIN_COHERENCE:
+                continue
+            if lr < self.EPISTEMIC_MIN_LEMMA_RATIO:
+                continue
+
             cluster_id = self._epistemic_cluster_id(members, dominant_parent)
 
             if cluster_id in graph:
@@ -378,8 +565,14 @@ class ReflectorModule:
                 if new_members:
                     graph.nodes[cluster_id]["member_count"] = len(existing_members) + len(new_members)
                     graph.nodes[cluster_id]["last_reinforced"] = datetime.now()
+                    graph.nodes[cluster_id]["last_coherence"] = coh
+                    # Growth counts as activity — slow unnamed expiry
+                    if not graph.nodes[cluster_id].get("named"):
+                        prev_u = int(graph.nodes[cluster_id].get("unnamed_cycles", 0))
+                        graph.nodes[cluster_id]["unnamed_cycles"] = max(0, prev_u - 1)
                 continue
 
+            # Always create unnamed; naming is a separate strict pass.
             node_kwargs = dict(
                 source="schema",
                 tier=TIER_WORKING,
@@ -391,14 +584,14 @@ class ReflectorModule:
                 node_type=NODE_EPISTEMIC_SCHEMA,
                 abstraction_level=1,
                 member_count=len(members),
+                name=None,
+                named=False,
+                unnamed_cycles=0,
+                last_coherence=coh,
+                candidate_parent=dominant_parent,
             )
             if dominant_parent:
-                node_kwargs["name"] = _display_name(dominant_parent)
-                node_kwargs["definition"] = dominant_parent  # full gloss if any
-                node_kwargs["named"] = True
-            else:
-                node_kwargs["name"] = None
-                node_kwargs["named"] = False
+                node_kwargs["definition"] = dominant_parent
 
             graph.add_node(cluster_id, **node_kwargs)
             for member in members:

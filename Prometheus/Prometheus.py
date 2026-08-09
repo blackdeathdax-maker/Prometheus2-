@@ -13,7 +13,6 @@ from .chronos import ChronosModule
 from .working_memory import WorkingMemoryModule
 from .self_narrative import NarrativeModule
 from .focus import FocusModule
-from .somatic_topo import SomaticTopo
 from .sensory import SensoryModule
 from .association import AssociationEngine
 from .stimulus import SyntheticStimulusEngine
@@ -192,7 +191,6 @@ class Prometheus:
         self.self_narrative = NarrativeModule(self.archivist, self.synthesizer)
         self.focus = FocusModule()
         self.working_memory.focus = self.focus  # §13.y WM consumer hook
-        self.somatic_topo = SomaticTopo()
         self.last_collapse_summary = {"collapsed": 0, "conflicts": 0, "candidates_considered": 0}
         self.last_focus_summary = {}
 
@@ -706,7 +704,6 @@ class Prometheus:
             pulse=self.pulse_count,
             basin_anchor_set=basin_anchors,
         )
-        self.somatic_topo.record(self.synthesizer.get_current_basin_key())
 
         results = self.archivist.retrieve("context")
 
@@ -1126,10 +1123,6 @@ class Prometheus:
         """§13.y debug/Reflection helper -- residual + sticky focus state."""
         return self.focus.report()
 
-    def get_somatic_topo_report(self) -> dict:
-        """UI-facing basin / transition map (§2.1a)."""
-        return self.somatic_topo.report()
-
     def _run_consolidation(self):
         """
         Everything the spec pins to the Consolidation clock, in one place
@@ -1139,8 +1132,6 @@ class Prometheus:
         """
         self.synthesizer.consolidate_basins()
 
-        topo_summary = self.somatic_topo.consolidate()
-        print(f"Consolidation: somatic topo {topo_summary}")
         # Bug fix, this revision: stabilized_basins was previously only
         # ever a string mapping inside synthesizer.py -- no corresponding
         # node ever existed in archivist.graph. Every schema's "linked
@@ -1180,6 +1171,8 @@ class Prometheus:
         new_epistemic_schemas = self.reflector.detect_epistemic_clusters()
         self.archivist.decay_co_activation()
         merged_epistemic = self.reflector.merge_duplicate_epistemic_schemas()
+        named_epistemic = self.reflector.try_name_epistemic_schemas()
+        expired_epistemic = self.reflector.expire_unnamed_epistemic_schemas()
 
         # §13.4, new this session: Graph Collapse & Abstraction Layer.
         # Runs after schema detection ("new schemas can claim members
@@ -1255,6 +1248,10 @@ class Prometheus:
             print(f"Consolidation: formed {len(new_epistemic_schemas)} new Epistemic Schema Node(s): {new_epistemic_schemas}")
         if merged_epistemic:
             print(f"Consolidation: merged {merged_epistemic} duplicate Epistemic Schema Node(s) into their named parent.")
+        if named_epistemic:
+            print(f"Consolidation: named {named_epistemic} epistemic schema(s) (delayed naming).")
+        if expired_epistemic:
+            print(f"Consolidation: dissolved {expired_epistemic} stagnant unnamed epistemic schema(s).")
         # Always print (including zeros) so Streamlit logs show the pass ran
         print(f"Consolidation: §13.4 collapse {collapse_summary}")
         if narrative_summary.get("created") or narrative_summary.get("absorbed") or narrative_summary.get("pruned"):
