@@ -1174,12 +1174,29 @@ class ArchivistModule:
     # Persistence
     # ------------------------------------------------------------------
     def save(self):
+        """Persist graph to disk. Uses a graph *copy* so NetworkX
+        node_link_data never iterates a structure mid-mutation (semi-live
+        / consolidation interleaving caused RuntimeError: dictionary
+        changed size during iteration)."""
         try:
             os.makedirs(_DATA_DIR, exist_ok=True)
-            data = nx.readwrite.json_graph.node_link_data(self.graph)
+            # Snapshot — do not serialize the live MultiDiGraph in place
+            g = self.graph.copy()
+            data = nx.readwrite.json_graph.node_link_data(g)
             with open(EPISTEMIC_GRAPH_PATH, "w") as f:
                 json.dump(data, f, default=str)
             self._save_co_activation()
+        except RuntimeError as e:
+            # Rare race: retry one snapshot
+            logger.warning("ArchivistModule.save RuntimeError (%s); retrying once", e)
+            try:
+                g = self.graph.copy()
+                data = nx.readwrite.json_graph.node_link_data(g)
+                with open(EPISTEMIC_GRAPH_PATH, "w") as f:
+                    json.dump(data, f, default=str)
+                self._save_co_activation()
+            except Exception as e2:
+                logger.warning("ArchivistModule.save retry failed: %s", e2)
         except OSError as e:
             logger.warning("ArchivistModule.save failed: %s", e)
 
