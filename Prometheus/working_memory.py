@@ -288,6 +288,21 @@ class WorkingMemoryModule:
                 candidates.append(n)
         candidates = list(dict.fromkeys(candidates))  # de-dup, preserve order
 
+        # Prefer a single schema per display name before scoring (fixes triple Sweat)
+        by_ident = {}
+        for n in candidates:
+            key = self._identity_key(n)
+            prev = by_ident.get(key)
+            if prev is None:
+                by_ident[key] = n
+            else:
+                # keep higher activation
+                a_new = float(graph.nodes.get(n, {}).get("activation", 0) or 0)
+                a_old = float(graph.nodes.get(prev, {}).get("activation", 0) or 0)
+                if a_new > a_old:
+                    by_ident[key] = n
+        candidates = list(by_ident.values())
+
         scored = [(n, self._score_candidate(n, epoch_value, basin_anchor_set)) for n in candidates]
 
         # §14.2 Maturity reserved channel: "never fully displaced" --

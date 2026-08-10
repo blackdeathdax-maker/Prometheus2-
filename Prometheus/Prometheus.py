@@ -15,6 +15,7 @@ from .self_narrative import NarrativeModule
 from .focus import FocusModule
 from .somatic_topo import SomaticTopo
 from .felt_anchors import FeltAnchorStore
+from .schema_felt import SchemaFeltBinder
 from .sensory import SensoryModule
 from .association import AssociationEngine
 from .stimulus import SyntheticStimulusEngine
@@ -86,6 +87,13 @@ class Prometheus:
     # it doesn't make self-study a real driver of felt-state exploration
     # the way genuine engagement is.
     SELF_STUDY_AROUSAL_BUMP = 0.025
+    SELF_STUDY_CORTISOL_BUMP = 0.008   # mild load while working
+    SELF_STUDY_SEROTONIN_BUMP = 0.006  # small settle on successful expand
+    SELF_STUDY_TESTOSTERONE_BUMP = 0.004  # slow stance — rare micro-nudge
+    FOCUS_PRED_DOPAMINE = 0.01         # prediction residual inject path
+    FOCUS_STAGNANT_CORTISOL = 0.012    # stuck focus → stress load
+    FOCUS_SWITCH_DOPAMINE = 0.008      # leaving a focus → small release
+    OXTYOCIN_PARENTAL_EXTRA = 0.02     # warmth/approval affiliation
 
     # Hormonal reaction to real input -- new, this revision. §5.1 has
     # always described self-study's dopamine bump as "scaled down
@@ -195,6 +203,7 @@ class Prometheus:
         self.working_memory.focus = self.focus  # §13.y WM consumer hook
         self.somatic_topo = SomaticTopo()
         self.felt_anchors = FeltAnchorStore()
+        self.schema_felt = SchemaFeltBinder(threshold=3)
         self.last_collapse_summary = {"collapsed": 0, "conflicts": 0, "candidates_considered": 0}
         self.last_focus_summary = {}
 
@@ -620,11 +629,13 @@ class Prometheus:
             h = self.bio._hormones
             if reaction_type == "approval":
                 h["dopamine"] = min(1.0, h["dopamine"] + self.PARENTAL_APPROVAL_DOPAMINE)
+                h["oxytocin"] = min(1.0, h.get("oxytocin", 0.5) + self.OXTYOCIN_PARENTAL_EXTRA * 0.7)
             elif reaction_type == "disapproval":
                 h["cortisol"] = min(1.0, h["cortisol"] + self.PARENTAL_DISAPPROVAL_CORTISOL)
             elif reaction_type == "warmth":
                 h["dopamine"] = min(1.0, h["dopamine"] + self.PARENTAL_WARMTH_DOPAMINE)
                 h["cortisol"] = max(0.0, h["cortisol"] - self.PARENTAL_WARMTH_CORTISOL_RELIEF)
+                h["oxytocin"] = min(1.0, h["oxytocin"] + self.OXTYOCIN_PARENTAL_EXTRA)
             elif reaction_type == "concern":
                 h["adrenaline"] = min(1.0, h["adrenaline"] + self.PARENTAL_CONCERN_AROUSAL)
                 h["cortisol"] = min(1.0, h["cortisol"] + self.PARENTAL_CONCERN_CORTISOL)
@@ -718,6 +729,43 @@ class Prometheus:
         )
 
         results = self.archivist.retrieve("context")
+
+
+        # Schema ↔ felt-anchor co-occurrence (implicit; no emotion taxonomy)
+        try:
+            active_schemas = []
+            fid = getattr(self.focus, "focus_id", None)
+            if fid and (
+                str(fid).startswith("epistemic_")
+                or str(fid).startswith("schema_")
+                or (fid in self.archivist.graph and self.archivist.graph.nodes[fid].get("node_type") in ("schema", "epistemic_schema"))
+            ):
+                active_schemas.append(fid)
+            if hasattr(self, "working_memory") and self.working_memory is not None:
+                try:
+                    wm = self.working_memory.get_current_working_memory()
+                    for sid in (wm.get("slots") or []):
+                        if sid in self.archivist.graph:
+                            nt = self.archivist.graph.nodes[sid].get("node_type")
+                            if nt in ("schema", "epistemic_schema") or str(sid).startswith("epistemic_"):
+                                active_schemas.append(sid)
+                except Exception:
+                    pass
+            cur = self.felt_anchors.current()
+            if cur is not None:
+                self.schema_felt.note(active_schemas, cur.anchor_id)
+            # Hormone: stagnant focus → cortisol; force switch → dopamine
+            fs = self.last_focus_summary or {}
+            with self.bio.lock:
+                if fs.get("stagnation_escape"):
+                    self.bio._hormones["cortisol"] = min(
+                        1.0, self.bio._hormones["cortisol"] + self.FOCUS_STAGNANT_CORTISOL
+                    )
+                    self.bio._hormones["dopamine"] = min(
+                        1.0, self.bio._hormones["dopamine"] + self.FOCUS_SWITCH_DOPAMINE
+                    )
+        except Exception:
+            pass
 
         print(
             f"Pulse {self.pulse_count} | Epoch: {self.bio.epoch.value} | "
@@ -841,12 +889,18 @@ class Prometheus:
         # covers both axes (heart_rate + vascular_constriction), so no
         # separate testosterone touch is needed or appropriate.
         with self.bio.lock:
-            self.bio._hormones["dopamine"] = min(
-                1.0, self.bio._hormones["dopamine"] + self.SELF_STUDY_DOPAMINE_BUMP
-            )
-            self.bio._hormones["adrenaline"] = min(
-                1.0, self.bio._hormones["adrenaline"] + self.SELF_STUDY_AROUSAL_BUMP
-            )
+            h = self.bio._hormones
+            h["dopamine"] = min(1.0, h["dopamine"] + self.SELF_STUDY_DOPAMINE_BUMP)
+            h["adrenaline"] = min(1.0, h["adrenaline"] + self.SELF_STUDY_AROUSAL_BUMP)
+            h["cortisol"] = min(1.0, h["cortisol"] + self.SELF_STUDY_CORTISOL_BUMP)
+            if placed_children:
+                h["serotonin"] = min(1.0, h["serotonin"] + self.SELF_STUDY_SEROTONIN_BUMP)
+            try:
+                inten = float(self.synthesizer.get_current_intensity())
+            except Exception:
+                inten = 0.0
+            if inten >= 0.55:
+                h["testosterone"] = min(1.0, h["testosterone"] + self.SELF_STUDY_TESTOSTERONE_BUMP)
 
     def _select_self_study_target(self, hard_cap: int = 3):
         """(a) active/trusted nodes with few children, or (b) emotionally
@@ -1121,6 +1175,11 @@ class Prometheus:
         a cheap on-demand computation, not maintained incremental state."""
         key = self.synthesizer.get_current_basin_key()
         basin_anchors = self._get_unique_anchors(key)
+        # Self-heal duplicate schema names so UI cannot show triple Sweat
+        try:
+            self.reflector.merge_schemas_sharing_name()
+        except Exception:
+            pass
         return self.working_memory.get_working_memory(self.bio.epoch.value, basin_anchors)
 
     def get_narrative_report(self, top_n: int = 10) -> dict:
@@ -1141,7 +1200,16 @@ class Prometheus:
 
     def get_felt_anchor_report(self) -> dict:
         """Linkable felt identities over PAD (coords stay internal)."""
-        return self.felt_anchors.report()
+        rep = self.felt_anchors.report()
+        # Attach reverse binds for UI
+        if isinstance(rep, dict) and "anchors" in rep:
+            for row in rep["anchors"]:
+                row["bound_schemas"] = self.schema_felt.schemas_for_anchor(row["id"])
+        return rep
+
+    def get_schema_felt_report(self) -> dict:
+        """Schema ↔ felt co-occurrence / promotion diagnostic."""
+        return self.schema_felt.report()
 
     def search_graph(self, query: str, limit: int = 40) -> list:
         """Substring search over node ids, names, and definitions.
@@ -1236,7 +1304,11 @@ class Prometheus:
         self.archivist.decay_co_activation()
         merged_epistemic = self.reflector.merge_duplicate_epistemic_schemas()
         named_epistemic = self.reflector.try_name_epistemic_schemas()
+        merged_names = self.reflector.merge_schemas_sharing_name()
+        print(f"Consolidation: merged same-name schemas {merged_names}")
         expired_epistemic = self.reflector.expire_unnamed_epistemic_schemas()
+        bind_summary = self.schema_felt.promote(self.archivist.graph)
+        print(f"Consolidation: schema-felt binds {bind_summary}")
 
         # §13.4, new this session: Graph Collapse & Abstraction Layer.
         # Runs after schema detection ("new schemas can claim members

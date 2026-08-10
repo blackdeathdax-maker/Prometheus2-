@@ -403,6 +403,8 @@ class ReflectorModule:
 
     def try_name_epistemic_schemas(self) -> int:
         """Delayed naming pass: only name when coherence + diversity + candidate."""
+        # Always collapse same-name duplicates first (self-heal lab graphs)
+        self.merge_schemas_sharing_name()
         graph = self.archivist.graph
         named = 0
         for node, data in list(graph.nodes(data=True)):
@@ -451,45 +453,84 @@ class ReflectorModule:
         return named
 
     def merge_schemas_sharing_name(self) -> int:
-        """Collapse multiple named epistemic schemas that share a display name."""
+        """Collapse multiple schema nodes that share the same display name.
+
+        Matches on normalized name even if named flag is inconsistent.
+        Rewires composed-of members to the richest survivor, then removes
+        the duplicates. Safe to call often (no-op when no dups).
+        """
         graph = self.archivist.graph
+        schema_types = {NODE_EPISTEMIC_SCHEMA, NODE_SCHEMA, "epistemic_schema", "schema"}
         by_name = {}
         for node, data in list(graph.nodes(data=True)):
-            if data.get("node_type") != NODE_EPISTEMIC_SCHEMA or not data.get("named"):
+            ntype = data.get("node_type")
+            if ntype not in schema_types and not (
+                str(node).startswith("epistemic_") or str(node).startswith("schema_")
+            ):
                 continue
             name = data.get("name")
-            if not name:
+            if not name or not str(name).strip():
                 continue
-            by_name.setdefault(str(name).strip().casefold(), []).append(node)
+            key = str(name).strip().casefold()
+            by_name.setdefault(key, []).append(node)
+
         merged = 0
         for _key, nodes in by_name.items():
+            # unique ids only
+            nodes = list(dict.fromkeys(nodes))
             if len(nodes) < 2:
                 continue
+
             def richness(nid):
-                d = graph.nodes[nid]
-                members = sum(
-                    1 for _u, _v, ed in graph.out_edges(nid, data=True)
-                    if ed.get("relation_type") == EDGE_COMPOSED_OF
+                d = graph.nodes.get(nid, {})
+                members = 0
+                try:
+                    members = sum(
+                        1 for _u, _v, ed in graph.out_edges(nid, data=True)
+                        if ed.get("relation_type") == EDGE_COMPOSED_OF
+                    )
+                except Exception:
+                    pass
+                return (
+                    members,
+                    float(d.get("activation", 0) or 0),
+                    1 if d.get("named") else 0,
                 )
-                return (members, float(d.get("activation", 0) or 0))
+
             nodes_sorted = sorted(nodes, key=richness, reverse=True)
             keep = nodes_sorted[0]
             for drop in nodes_sorted[1:]:
-                for _u, v, ed in list(graph.out_edges(drop, data=True)):
-                    if ed.get("relation_type") != EDGE_COMPOSED_OF:
-                        continue
-                    already = any(
-                        vv == v and eed.get("relation_type") == EDGE_COMPOSED_OF
-                        for _uu, vv, eed in graph.out_edges(keep, data=True)
-                    )
-                    if not already:
-                        graph.add_edge(
-                            keep, v, relation_type=EDGE_COMPOSED_OF,
-                            source="schema", placement="explicit",
+                if drop not in graph or keep not in graph:
+                    continue
+                # Move membership edges
+                try:
+                    for _u, v, ed in list(graph.out_edges(drop, data=True)):
+                        if ed.get("relation_type") != EDGE_COMPOSED_OF:
+                            continue
+                        already = any(
+                            vv == v and eed.get("relation_type") == EDGE_COMPOSED_OF
+                            for _uu, vv, eed in graph.out_edges(keep, data=True)
                         )
-                if drop in graph:
-                    graph.remove_node(drop)
-                    merged += 1
+                        if not already and v in graph:
+                            graph.add_edge(
+                                keep, v, relation_type=EDGE_COMPOSED_OF,
+                                source="schema", placement="merge",
+                            )
+                    # Re-point any edges that targeted the drop node
+                    for u, _v, ed in list(graph.in_edges(drop, data=True)):
+                        if u == keep:
+                            continue
+                        et = ed.get("relation_type", "associated-with")
+                        if not graph.has_edge(u, keep):
+                            graph.add_edge(u, keep, **{k: v for k, v in ed.items()})
+                except Exception:
+                    pass
+                try:
+                    if drop in graph:
+                        graph.remove_node(drop)
+                        merged += 1
+                except Exception:
+                    pass
         return merged
 
 
