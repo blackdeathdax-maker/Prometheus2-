@@ -724,10 +724,11 @@ if st.session_state.prom is not None:
         if prom is None:
             st.info("Start the system from the sidebar first.")
         else:
-            st.subheader("Raw Somatic Variables (§2.1a, §7)")
+            st.subheader("Body surface (what cognition may sense)")
+            st.caption("heart / breath / tension / sweat / gut / energy / warmth — not hormones.")
             st.json(prom.bio.get_raw_variables())
 
-            st.subheader("Hormonal State")
+            st.subheader("Hormonal State (hidden motor — Debug only, not cognition)")
             st.json({k: round(v, 4) for k, v in prom.bio._hormones.items()})
 
             st.caption(
@@ -742,11 +743,18 @@ if st.session_state.prom is not None:
             st.json(prom.get_somatic_topo_report())
 
             st.subheader("Felt anchors (linkable felt identities)")
-            st.caption("Stable ids over PAD; names only when earned — not basin_0.6_…")
+            st.caption("Stable ids over PAD; body_mean is heart/breath/tension/sweat/gut/energy/warmth only — never hormones.")
             if hasattr(prom, "get_felt_anchor_report"):
                 st.json(prom.get_felt_anchor_report())
             else:
                 st.caption("Felt anchors not wired on this instance.")
+
+            st.subheader("Schema ↔ felt binds")
+            st.caption("Implicit co-occurrence; threshold earns primary_felt_anchor.")
+            if hasattr(prom, "get_schema_felt_report"):
+                st.json(prom.get_schema_felt_report())
+            else:
+                st.caption("Schema-felt binder not wired.")
             st.subheader("Focus / Residuals (§13.y)")
             if hasattr(prom, "get_focus_report"):
                 st.json(prom.get_focus_report())
