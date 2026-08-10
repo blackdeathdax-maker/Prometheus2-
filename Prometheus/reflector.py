@@ -31,7 +31,7 @@ EPISTEMIC_NAME_MIN_COVERAGE = 2  # how many cluster members a parsed is-a parent
 # Schema quality gates (repair pass — sense before promotion)
 EPISTEMIC_MIN_COHERENCE = 0.22          # mean pairwise token/hypernym overlap
 EPISTEMIC_MIN_LEMMA_RATIO = 0.5         # fraction of members that look like lemmas not sentences
-EPISTEMIC_NAME_MIN_FREQ = 2             # times a candidate label appears as member-ish
+EPISTEMIC_NAME_MIN_FREQ = 1             # times a candidate label appears as member-ish
 EPISTEMIC_NAME_MIN_CONTEXTS = 2         # distinct sources or basins before naming
 EPISTEMIC_UNNAMED_MAX_CYCLES = 8        # consolidations unnamed+stagnant → dissolve wrapper
 
@@ -295,14 +295,27 @@ class ReflectorModule:
         if not label or label in (SELF_NODE,):
             return False
         s = str(label).strip()
-        if len(s) > 48:
+        if len(s) > 40:
             return False
-        if " " in s and len(s.split()) > 4:
+        words = s.split()
+        if len(words) > 3:
             return False
         low = s.lower()
         if low.startswith(("i ", "i'", "it was", "it is", "she ", "he ", "they ")):
             return False
-        if s.startswith("epistemic_") or s.startswith("schema_"):
+        if s.startswith("epistemic_") or s.startswith("schema_") or s.startswith("felt_"):
+            return False
+        # WordNet gloss fingerprints — never human schema titles
+        gloss_markers = (
+            "consisting of", "characterized by", "used to", "a person who",
+            "the act of", "the state of", "or pair of", "or distance",
+            "making the", "infusion of", "unbroken expanse", "rolled steel",
+            "ground coffee", "parallel bars",
+        )
+        if any(m in low for m in gloss_markers):
+            return False
+        # Dictionary style: "X of Y" long forms
+        if len(words) >= 3 and words[1] in ("of", "or", "and", "for"):
             return False
         return True
 
@@ -411,11 +424,34 @@ class ReflectorModule:
             candidate = self._name_candidate(members)
             if not candidate:
                 continue
-            data["name"] = _display_name(candidate)
+            data["name"] = candidate  # already lemma-like; do not re-expand
             data["named"] = True
             data["unnamed_cycles"] = 0
             named += 1
+        # Scrub legacy gloss titles that slipped through earlier rules
+        self.scrub_invalid_schema_names()
         return named
+
+    def scrub_invalid_schema_names(self) -> int:
+        """Un-name epistemic schemas whose title fails lemma-like checks.
+        Gloss stays in definition if missing."""
+        graph = self.archivist.graph
+        scrubbed = 0
+        for node, data in list(graph.nodes(data=True)):
+            if data.get("node_type") != NODE_EPISTEMIC_SCHEMA:
+                continue
+            if not data.get("named"):
+                continue
+            name = data.get("name")
+            if name and self._is_lemma_like(str(name)):
+                continue
+            # Demote to unnamed; preserve text as definition
+            if name and not data.get("definition"):
+                data["definition"] = name
+            data["name"] = None
+            data["named"] = False
+            scrubbed += 1
+        return scrubbed
 
     def expire_unnamed_epistemic_schemas(self) -> int:
         """Dissolve stagnant unnamed schema wrappers; members and their edges remain."""
@@ -676,7 +712,7 @@ class ReflectorModule:
                     tier0_cycles=0, activation=data.get("activation", 0.0),
                     valence_coloring=data.get("valence_coloring", 0.0),
                     node_type=NODE_EPISTEMIC_SCHEMA, abstraction_level=1,
-                    name=_display_name(dominant_parent), definition=dominant_parent, named=True, member_count=0,
+                    name=None, definition=dominant_parent, named=False, unnamed_cycles=0, member_count=0,
                 )
             existing_members = {
                 v for _u, v, edata in graph.out_edges(target_id, data=True)
