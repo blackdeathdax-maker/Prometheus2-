@@ -424,13 +424,74 @@ class ReflectorModule:
             candidate = self._name_candidate(members)
             if not candidate:
                 continue
-            data["name"] = candidate  # already lemma-like; do not re-expand
+            # One human name → one epistemic schema
+            taken_by = None
+            want = str(candidate).strip().casefold()
+            for other, odata in list(graph.nodes(data=True)):
+                if other == node:
+                    continue
+                if odata.get("node_type") != NODE_EPISTEMIC_SCHEMA:
+                    continue
+                if not odata.get("named"):
+                    continue
+                oname = odata.get("name")
+                if oname and str(oname).strip().casefold() == want:
+                    taken_by = other
+                    break
+            if taken_by is not None:
+                data["name_blocked_by"] = taken_by
+                continue
+            data["name"] = candidate
             data["named"] = True
             data["unnamed_cycles"] = 0
             named += 1
         # Scrub legacy gloss titles that slipped through earlier rules
         self.scrub_invalid_schema_names()
+        self.merge_schemas_sharing_name()
         return named
+
+    def merge_schemas_sharing_name(self) -> int:
+        """Collapse multiple named epistemic schemas that share a display name."""
+        graph = self.archivist.graph
+        by_name = {}
+        for node, data in list(graph.nodes(data=True)):
+            if data.get("node_type") != NODE_EPISTEMIC_SCHEMA or not data.get("named"):
+                continue
+            name = data.get("name")
+            if not name:
+                continue
+            by_name.setdefault(str(name).strip().casefold(), []).append(node)
+        merged = 0
+        for _key, nodes in by_name.items():
+            if len(nodes) < 2:
+                continue
+            def richness(nid):
+                d = graph.nodes[nid]
+                members = sum(
+                    1 for _u, _v, ed in graph.out_edges(nid, data=True)
+                    if ed.get("relation_type") == EDGE_COMPOSED_OF
+                )
+                return (members, float(d.get("activation", 0) or 0))
+            nodes_sorted = sorted(nodes, key=richness, reverse=True)
+            keep = nodes_sorted[0]
+            for drop in nodes_sorted[1:]:
+                for _u, v, ed in list(graph.out_edges(drop, data=True)):
+                    if ed.get("relation_type") != EDGE_COMPOSED_OF:
+                        continue
+                    already = any(
+                        vv == v and eed.get("relation_type") == EDGE_COMPOSED_OF
+                        for _uu, vv, eed in graph.out_edges(keep, data=True)
+                    )
+                    if not already:
+                        graph.add_edge(
+                            keep, v, relation_type=EDGE_COMPOSED_OF,
+                            source="schema", placement="explicit",
+                        )
+                if drop in graph:
+                    graph.remove_node(drop)
+                    merged += 1
+        return merged
+
 
     def scrub_invalid_schema_names(self) -> int:
         """Un-name epistemic schemas whose title fails lemma-like checks.

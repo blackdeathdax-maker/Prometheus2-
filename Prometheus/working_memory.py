@@ -232,6 +232,27 @@ class WorkingMemoryModule:
     # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
+
+    def _identity_key(self, node_id: str) -> str:
+        """Collapse duplicate labels in WM: same name → same identity."""
+        data = self.archivist.graph.nodes.get(node_id, {})
+        name = data.get("name")
+        if name and str(name).strip():
+            return "name:" + str(name).strip().casefold()
+        return "id:" + str(node_id)
+
+    def _dedupe_slot_ids(self, node_ids):
+        """Keep first occurrence per identity key."""
+        seen = set()
+        out = []
+        for n in node_ids:
+            key = self._identity_key(n)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(n)
+        return out
+
     def get_working_memory(self, epoch_value: str, basin_anchors: Optional[List[str]] = None) -> Dict:
         """
         Returns the current working-memory contents:
@@ -285,8 +306,17 @@ class WorkingMemoryModule:
             scored = [t for t in scored if t[0] not in reserved]
 
         scored.sort(key=lambda t: t[1], reverse=True)
-        remaining_capacity = max(0, capacity - len(slots))
-        slots.extend(n for n, _s in scored[:remaining_capacity])
+        capacity = max(0, int(capacity))
+        for n, _s in scored:
+            if len(slots) >= capacity:
+                break
+            if n in slots:
+                continue
+            if any(self._identity_key(x) == self._identity_key(n) for x in slots):
+                continue
+            slots.append(n)
+
+        slots = self._dedupe_slot_ids(slots)[:capacity]
 
         return {
             "self": SELF_NODE,
