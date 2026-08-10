@@ -188,6 +188,39 @@ if st.session_state.prom is not None:
         if prom is None:
             st.info("Start the system from the sidebar first.")
         else:
+            st.markdown("##### Search nodes & schemas")
+            sq_col, lim_col = st.columns([3, 1])
+            with sq_col:
+                search_q = st.text_input(
+                    "Query",
+                    value="",
+                    key="graph_search_q",
+                    placeholder="substring match on id, name, definition",
+                    label_visibility="collapsed",
+                )
+            with lim_col:
+                search_lim = st.number_input("Max hits", 5, 100, 25, 5, key="graph_search_lim")
+
+            if search_q.strip() and hasattr(prom, "search_graph"):
+                hits = prom.search_graph(search_q.strip(), limit=int(search_lim))
+                st.caption(f"{len(hits)} hit(s)")
+                for i, h in enumerate(hits):
+                    label = h.get("name") or h["id"]
+                    meta = f"{h['kind']} · tier {h['tier']} · act {h['activation']}"
+                    c1, c2 = st.columns([4, 1])
+                    with c1:
+                        st.write(f"**{label}**")
+                        st.caption(f"`{h['id']}` — {meta}")
+                    with c2:
+                        if st.button("Pin", key=f"pin_hit_{i}"):
+                            if prom.pin_search_hit(h["id"]):
+                                st.session_state["graph_pin_id"] = h["id"]
+                                st.success("Pinned")
+                if st.session_state.get("graph_pin_id"):
+                    st.info(f"Pinned for attention: `{st.session_state['graph_pin_id']}`")
+            elif search_q.strip():
+                st.caption("search_graph not available on this instance — update Prometheus.py")
+
             new_node = st.text_input("New Node Name", key="new_node")
             if st.button("Add Node", key="add_btn") and new_node:
                 prom.archivist.store(new_node, source="user")
@@ -219,7 +252,10 @@ if st.session_state.prom is not None:
                 # driving behavior right now, not just historically
                 # high-activation nodes that may no longer be relevant.
                 key = prom.synthesizer.get_current_basin_key()
-                current_anchors = prom.felt_state_anchors.get(key, [])
+                current_anchors = list(prom.felt_state_anchors.get(key, []))
+                pin = st.session_state.get("graph_pin_id")
+                if pin:
+                    current_anchors.append(pin)
                 node_subset = prom.archivist.working_memory_nodes(
                     top_k=focus_size, always_include=current_anchors,
                 )
