@@ -61,11 +61,23 @@ class SynthesizerModule:
         self.load_state()
 
     def _project_axes(self, raw: Dict[str, float]) -> Tuple[float, float, float]:
-        """Composite axis formulas per §2.1a. Exact weighting/normalization
-        not yet finalized (§10 item 10) -- this is a first-pass average."""
-        arousal = max(0.0, min(1.0, (raw.get("heart_rate", 0.5) + raw.get("respiration_rate", 0.5)) / 2))
-        valence = max(-1.0, min(1.0, raw.get("dopaminergic_tone", 0.5) - raw.get("cortisol_load", 0.5)))
-        dominance = max(0.0, min(1.0, (raw.get("vascular_constriction", 0.5) + raw.get("muscle_tension", 0.5)) / 2))
+        """PAD from phenomenological body channels only (§Phase A).
+        Never reads hormone names — only heart/breath/tension/sweat/gut/energy/warmth.
+        """
+        heart = raw.get("heart_rate", 0.5)
+        breath = raw.get("breath", raw.get("respiration_rate", 0.5))
+        sweat = raw.get("sweat_skin", 0.5)
+        tension = raw.get("muscle_tension", 0.5)
+        gut = raw.get("gut", 0.5)
+        energy = raw.get("energy", 0.5)
+        warmth = raw.get("warmth", 0.5)
+
+        # Activated body → arousal
+        arousal = max(0.0, min(1.0, 0.35 * heart + 0.30 * breath + 0.20 * sweat + 0.15 * energy))
+        # Pleasant settled vs distressed gut/cold — valence in [-1, 1]
+        valence = max(-1.0, min(1.0, (0.45 * warmth + 0.35 * energy) - (0.40 * gut + 0.25 * sweat) ))
+        # Stance: energy + inverse overwhelm (tension+gut high → low dominance)
+        dominance = max(0.0, min(1.0, 0.40 * energy + 0.30 * (1.0 - tension) + 0.30 * (1.0 - gut)))
         return arousal, valence, dominance
 
     def _bin_key(self, arousal: float, valence: float, dominance: float) -> Tuple[float, float, float]:

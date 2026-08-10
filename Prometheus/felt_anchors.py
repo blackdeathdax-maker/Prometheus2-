@@ -20,6 +20,12 @@ logger = logging.getLogger(__name__)
 
 BasinKey = Tuple[float, float, float]
 
+# Phenomenological body only — never endocrine keys
+BODY_CHANNELS = frozenset({
+    "heart_rate", "breath", "respiration_rate", "muscle_tension",
+    "sweat_skin", "gut", "energy", "warmth",
+})
+
 
 def _key_tuple(key) -> BasinKey:
     return (float(key[0]), float(key[1]), float(key[2]))
@@ -78,12 +84,16 @@ class FeltAnchorStore:
         if raw_body:
             n = a.body_samples
             for k, v in raw_body.items():
+                if k not in BODY_CHANNELS:
+                    continue
+                # Prefer canonical breath key
+                key = "breath" if k == "respiration_rate" else k
                 try:
                     fv = float(v)
                 except (TypeError, ValueError):
                     continue
-                prev = a.body_mean.get(k, fv)
-                a.body_mean[k] = (prev * n + fv) / (n + 1) if n else fv
+                prev = a.body_mean.get(key, fv)
+                a.body_mean[key] = (prev * n + fv) / (n + 1) if n else fv
             a.body_samples = n + 1
         return aid
 
@@ -141,7 +151,7 @@ class FeltAnchorStore:
                     "revisits": a.revisits,
                     "named": a.named,
                     "name": a.name,
-                    "body_mean": {k: round(v, 3) for k, v in list(a.body_mean.items())[:6]},
+                    "body_mean": {k: round(v, 3) for k, v in a.body_mean.items()},
                 }
                 for a in rows
             ],
