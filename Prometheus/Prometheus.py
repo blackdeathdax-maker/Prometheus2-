@@ -1143,6 +1143,48 @@ class Prometheus:
         """Linkable felt identities over PAD (coords stay internal)."""
         return self.felt_anchors.report()
 
+    def search_graph(self, query: str, limit: int = 40) -> list:
+        """Substring search over node ids, names, and definitions.
+        Returns list of dicts for UI: id, name, kind, tier, activation.
+        """
+        q = (query or "").strip().lower()
+        if not q:
+            return []
+        graph = self.archivist.graph
+        hits = []
+        for n, d in list(graph.nodes(data=True)):
+            nid = str(n)
+            name = str(d.get("name") or "")
+            definition = str(d.get("definition") or "")
+            blob = f"{nid} {name} {definition}".lower()
+            if q not in blob:
+                continue
+            is_schema = bool(
+                d.get("is_schema")
+                or d.get("node_type") in ("schema", "epistemic_schema")
+                or nid.startswith("epistemic_")
+                or nid.startswith("schema_")
+            )
+            hits.append({
+                "id": nid,
+                "name": name or None,
+                "kind": "schema" if is_schema else "node",
+                "tier": d.get("tier", 0),
+                "activation": round(float(d.get("activation", 0.0) or 0.0), 3),
+                "named": bool(d.get("named")),
+            })
+        hits.sort(key=lambda h: (-h["activation"], h["id"]))
+        return hits[: max(1, int(limit))]
+
+    def pin_search_hit(self, node_id: str) -> bool:
+        """Boost residual / activation so search can steer attention."""
+        if not node_id or node_id not in self.archivist.graph:
+            return False
+        self.archivist.bump_activation(node_id)
+        if hasattr(self, "focus") and self.focus is not None:
+            self.focus.boost_residual(node_id, amount=2.0)
+        return True
+
     def _run_consolidation(self):
         """
         Everything the spec pins to the Consolidation clock, in one place
