@@ -146,31 +146,50 @@ class BioSystem:
 
     def get_raw_variables(self) -> Dict[str, float]:
         """
-        Hidden-layer only. Exposes the spec-named raw somatic variables
-        (§7 core.py responsibility row) that synthesizer.py projects onto
-        the arousal/valence/dominance axes (§2.1a). This is the ONE
-        legitimate consumer of this method -- prometheus.py and every
-        other module must go through synthesizer.py's output instead.
+        Phase A translation layer: endocrine → phenomenological body only.
 
-        These are derived from the underlying endocrine hormones rather
-        than tracked as separate raw fields, since BioSystem models an
-        endocrine layer rather than direct vitals. The mapping is a
-        deliberate, documented approximation:
-          - heart_rate        ~ adrenaline (sympathetic drive)
-          - respiration_rate  ~ cortisol   (stress-linked respiration)
-          - dopaminergic_tone = dopamine
-          - cortisol_load     = cortisol
-          - vascular_constriction ~ adrenaline (vasoconstrictive)
-          - muscle_tension     ~ testosterone (correlates with tension/dominance)
+        Returns body channels the mind may sense. Never returns hormone
+        names. All fast + slow hormones participate in the mapping so the
+        pseudo-body moves; cognition must not know which gland did what.
+
+        Channels (0..1-ish):
+          heart_rate, breath, muscle_tension, sweat_skin, gut,
+          energy, warmth
         """
         h = self._hormones
+        adr = h["adrenaline"]
+        cor = h["cortisol"]
+        dop = h["dopamine"]
+        ser = h["serotonin"]
+        oxy = h["oxytocin"]
+        tes = h["testosterone"]
+        est = h["estrogen"]
+        thy = h["thyroxine"]
+
+        def clamp(x: float) -> float:
+            return max(0.0, min(1.0, float(x)))
+
+        # Fast sympathetic / stress → heart, breath, sweat, gut unease
+        heart_rate = clamp(0.55 * adr + 0.25 * cor + 0.10 * dop + 0.10 * thy)
+        breath = clamp(0.40 * cor + 0.35 * adr + 0.15 * (1.0 - ser) + 0.10 * thy)
+        sweat_skin = clamp(0.45 * adr + 0.35 * cor + 0.20 * thy)
+        gut = clamp(0.40 * cor + 0.20 * adr + 0.25 * (1.0 - ser) + 0.15 * (1.0 - oxy))
+
+        # Tone / stance / affiliation (slow + fast mix)
+        muscle_tension = clamp(0.35 * tes + 0.30 * cor + 0.20 * adr + 0.15 * (1.0 - oxy))
+        energy = clamp(0.30 * thy + 0.25 * dop + 0.20 * ser + 0.15 * adr + 0.10 * est)
+        warmth = clamp(0.45 * oxy + 0.25 * ser + 0.15 * dop + 0.15 * (1.0 - cor))
+
         return {
-            "heart_rate": h["adrenaline"],
-            "respiration_rate": h["cortisol"],
-            "dopaminergic_tone": h["dopamine"],
-            "cortisol_load": h["cortisol"],
-            "vascular_constriction": h["adrenaline"],
-            "muscle_tension": h["testosterone"],
+            "heart_rate": heart_rate,
+            "breath": breath,
+            "muscle_tension": muscle_tension,
+            "sweat_skin": sweat_skin,
+            "gut": gut,
+            "energy": energy,
+            "warmth": warmth,
+            # Aliases so older synthesizer paths keep working during transition
+            "respiration_rate": breath,
         }
 
     def decay_fast(self, rate: float = 0.5):
