@@ -750,7 +750,7 @@ if st.session_state.prom is not None:
                 st.caption("Felt anchors not wired on this instance.")
 
             st.subheader("Schema ↔ felt binds")
-            st.caption("Implicit co-occurrence; threshold earns primary_felt_anchor.")
+            st.caption("Phase B: schema ↔ felt place by recurrence; focus rehydrates absorbed children.")
             if hasattr(prom, "get_schema_felt_report"):
                 st.json(prom.get_schema_felt_report())
             else:
