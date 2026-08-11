@@ -238,21 +238,26 @@ class ReflectorModule:
                 node_type=NODE_SCHEMA,
                 named=False,
                 name=None,
-                basin=felt_state,
+                basin=felt_state,  # felt place label when known — not a hormone
                 relation_types=sorted(relation_set),
+                somatic=True,  # Phase B: experience schema, not WordNet cluster
+                activation=0.5,
             )
-            # composed-of (§6A, this revision), not associated-with: this
-            # is a permanent structural fact about what the schema is made
-            # of, not a tentative co-occurrence placement -- keeping it
-            # distinct also keeps it out of _trust_score's corroboration
-            # count (TRUST_BEARING_EDGE_TYPES is categorical-only) and out
-            # of archivist.reparenting_candidates()'s associated-with scan.
-            graph.add_edge(schema_id, felt_state if felt_state in graph else SELF_NODE,
-                            relation_type=EDGE_COMPOSED_OF, source="schema", placement="explicit",
-                            created_at=datetime.now().isoformat())
+            # Members = event nodes that earned this pattern (experience)
             for en in event_nodes:
-                graph.add_edge(schema_id, en, relation_type=EDGE_COMPOSED_OF, source="schema",
-                                placement="explicit", created_at=datetime.now().isoformat())
+                if en in graph:
+                    graph.add_edge(
+                        schema_id, en, relation_type=EDGE_COMPOSED_OF,
+                        source="schema", placement="explicit",
+                        created_at=datetime.now().isoformat(),
+                    )
+            # Soft link to SELF: this is about the agent's lived relations
+            if SELF_NODE in graph:
+                graph.add_edge(
+                    SELF_NODE, schema_id, relation_type="associated-with",
+                    source="schema", placement="somatic",
+                    created_at=datetime.now().isoformat(),
+                )
             created.append(schema_id)
 
         # No self.archivist.save() here (§4C) -- detect_schemas() is one

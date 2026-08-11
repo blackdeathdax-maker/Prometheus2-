@@ -735,12 +735,16 @@ class Prometheus:
         try:
             active_schemas = []
             fid = getattr(self.focus, "focus_id", None)
-            if fid and (
-                str(fid).startswith("epistemic_")
-                or str(fid).startswith("schema_")
-                or (fid in self.archivist.graph and self.archivist.graph.nodes[fid].get("node_type") in ("schema", "epistemic_schema"))
-            ):
-                active_schemas.append(fid)
+            if fid and fid in self.archivist.graph:
+                nd = self.archivist.graph.nodes[fid]
+                if (
+                    str(fid).startswith("epistemic_")
+                    or str(fid).startswith("schema_")
+                    or nd.get("is_schema")
+                    or nd.get("somatic")
+                    or nd.get("node_type") in ("schema", "epistemic_schema")
+                ):
+                    active_schemas.append(fid)
             if hasattr(self, "working_memory") and self.working_memory is not None:
                 try:
                     wm = self.working_memory.get_current_working_memory()
@@ -754,6 +758,14 @@ class Prometheus:
             cur = self.felt_anchors.current()
             if cur is not None:
                 self.schema_felt.note(active_schemas, cur.anchor_id)
+            # Phase B: if focus is a collapsed parent, rehydrate a little detail
+            fid = getattr(self.focus, "focus_id", None)
+            if fid and fid in self.archivist.graph:
+                abs_list = self.archivist.graph.nodes[fid].get("absorbed") or []
+                if abs_list:
+                    n_reh = self.archivist.rehydrate_for_parent(fid, max_children=2)
+                    if n_reh:
+                        print(f"Rehydrate on focus {fid}: {n_reh} child(ren)")
             # Hormone: stagnant focus → cortisol; force switch → dopamine
             fs = self.last_focus_summary or {}
             with self.bio.lock:
@@ -1282,6 +1294,17 @@ class Prometheus:
         trust_summary = self.archivist.run_consolidation_pass()
         reparented = self.association.run_reparenting_pass()
         new_schemas = self.reflector.detect_schemas()
+        # Phase B: new somatic schemas start co-occurrence with current felt place
+        if new_schemas:
+            cur = self.felt_anchors.current() if hasattr(self, "felt_anchors") else None
+            if cur is not None:
+                self.schema_felt.note(new_schemas, cur.anchor_id)
+                # Pre-credit so bind can form sooner for lived emotion structure
+                for sid in new_schemas:
+                    self.schema_felt.cooccur[sid][cur.anchor_id] = max(
+                        self.schema_felt.cooccur[sid][cur.anchor_id],
+                        self.schema_felt.threshold - 1,
+                    )
         self._evaluate_pending_regulation()
         # Activation decay (§11 pull-forward, this revision) -- same
         # Consolidation clock as basin/trust/schema/efficacy evaluation,

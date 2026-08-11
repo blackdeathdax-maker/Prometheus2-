@@ -995,6 +995,31 @@ class ArchivistModule:
 
         return True
 
+    def rehydrate_for_parent(self, parent_id: str, max_children: int = 2) -> int:
+        """Phase B: bring back a few absorbed children under an active parent.
+        Preserves small-cortex defaults; only expands what focus needs.
+        """
+        if parent_id not in self.graph:
+            return 0
+        absorbed = list(self.graph.nodes[parent_id].get("absorbed") or [])
+        if not absorbed:
+            return 0
+        # Prefer most recently absorbed
+        def sort_key(r):
+            return r.get("absorbed_pulse") or r.get("absorbed_at") or ""
+        absorbed_sorted = sorted(absorbed, key=sort_key, reverse=True)
+        n = 0
+        for rec in absorbed_sorted[: max(0, int(max_children))]:
+            cid = rec.get("id")
+            if not cid:
+                continue
+            if cid in self.graph:
+                continue
+            if self.rehydrate(cid, parent_id):
+                n += 1
+        return n
+
+
     def working_memory_nodes(self, top_k: int = 40, always_include: Optional[List[str]] = None,
                               max_relational_neighbors: int = 20) -> set:
         """Returns the set of node ids that should count as 'in focus' --

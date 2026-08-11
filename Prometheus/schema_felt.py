@@ -40,6 +40,7 @@ class SchemaFeltBinder:
 
     def promote(self, graph) -> Dict[str, int]:
         """Write primary_felt_anchor onto schemas that crossed threshold.
+        Also stamps a soft grounds-in attribute (no hormone names).
         Returns counts for logging."""
         promoted = 0
         updated = 0
@@ -56,7 +57,8 @@ class SchemaFeltBinder:
             prev = data.get("primary_felt_anchor")
             data["felt_cooccur"] = dict(anchors)
             data["primary_felt_anchor"] = best_a
-            data["felt_bind_count"] = best_c
+            data["felt_bind_count"] = int(best_c)
+            data["grounds_in"] = best_a  # linkable felt place, not a chemical
             self.anchor_schemas[best_a].add(sid)
             updated += 1
             if prev != best_a:
