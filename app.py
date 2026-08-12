@@ -163,17 +163,21 @@ if st.session_state.prom is not None:
     with pf_col1:
         if st.button("Approval", key="pf_approval"):
             result = prom.give_parental_reaction("approval")
-            st.sidebar.success(f"Approval given ({len(result['anchors_colored'])} node(s) colored)")
+            names = ", ".join(result.get("anchors_colored") or []) or "(none)"
+            st.sidebar.success(f"Approval → {names}")
         if st.button("Warmth", key="pf_warmth"):
             result = prom.give_parental_reaction("warmth")
-            st.sidebar.success(f"Warmth given ({len(result['anchors_colored'])} node(s) colored)")
+            names = ", ".join(result.get("anchors_colored") or []) or "(none)"
+            st.sidebar.success(f"Warmth → {names}")
     with pf_col2:
         if st.button("Disapproval", key="pf_disapproval"):
             result = prom.give_parental_reaction("disapproval")
-            st.sidebar.success(f"Disapproval given ({len(result['anchors_colored'])} node(s) colored)")
+            names = ", ".join(result.get("anchors_colored") or []) or "(none)"
+            st.sidebar.success(f"Disapproval → {names}")
         if st.button("Concern", key="pf_concern"):
             result = prom.give_parental_reaction("concern")
-            st.sidebar.success(f"Concern given ({len(result['anchors_colored'])} node(s) colored)")
+            names = ", ".join(result.get("anchors_colored") or []) or "(none)"
+            st.sidebar.success(f"Concern → {names}")
 
     # Tabbed layout per §4B: Graph / State / Reflection / Working Memory / Debug
     tab_graph, tab_state, tab_reflection, tab_working_memory, tab_debug = st.tabs(
@@ -531,13 +535,35 @@ if st.session_state.prom is not None:
 
             with st.expander("Valence Coloring / Parental Feedback (§13.2, diagnostic)"):
                 st.caption(
-                    "Real accumulated coloring, so the mirror-neuron-style "
-                    "learning is directly checkable. A node's coloring only "
+                    "Parental buttons tint **at most 3** targets: current focus, "
+                    "then recent user topics — not the whole basin history. "
+                    "Sidebar shows exact node ids after each press. "
+                    "Real accumulated coloring; a node's coloring only "
                     "ever moves when it was the current felt-state anchor at "
                     "the moment a Parental Feedback button was clicked -- "
                     "nothing here is a hand-assigned valence lookup, it's "
                     "purely a record of repeated co-occurrence."
                 )
+                if getattr(prom, "last_parental_feedback", None):
+                    lpf = prom.last_parental_feedback
+                    st.info(
+                        f"Last parental: **{lpf.get('reaction')}** @ pulse {lpf.get('pulse')} → "
+                        + (", ".join(lpf.get("anchors_colored") or []) or "(none)")
+                    )
+                st.subheader("Parental marks (what was actually colored)")
+                if hasattr(prom, "parental_coloring_report"):
+                    pcr = prom.parental_coloring_report()
+                    if pcr.get("last_feedback"):
+                        st.caption(
+                            f"Last: **{pcr['last_feedback'].get('reaction')}** on "
+                            f"`{pcr['last_feedback'].get('anchors_colored')}` @ pulse "
+                            f"{pcr['last_feedback'].get('pulse')}"
+                        )
+                    st.caption(f"Nodes with parental/valence mark: {pcr.get('marked_nodes', 0)}")
+                    if pcr.get("top"):
+                        st.json(pcr["top"][:12])
+                    else:
+                        st.caption("None yet — use sidebar parental buttons while focus is on a topic.")
                 coloring_report = prom.reflector.valence_coloring_report()
                 st.metric("Total colored nodes", coloring_report["total_colored_nodes"])
                 col1, col2 = st.columns(2)
