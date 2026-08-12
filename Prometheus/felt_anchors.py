@@ -156,23 +156,64 @@ class FeltAnchorStore:
                 for a in rows
             ],
         }
-"""
-Integration sketch (Prometheus.py):
 
-  from .felt_anchors import FeltAnchorStore
-  # __init__:
-  self.felt_anchors = FeltAnchorStore()
 
-  # pulse after synthesizer.update_from_core:
-  self.felt_anchors.observe(
-      self.synthesizer.get_current_basin_key(),
-      raw_body=self.bio.get_raw_variables(),
-  )
+    def save_state(self, path: str) -> None:
+        import json
+        import os
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            data = {
+                "current_id": self.current_id,
+                "anchors": {
+                    aid: {
+                        "anchor_id": a.anchor_id,
+                        "basin_key": list(a.basin_key),
+                        "dwell": a.dwell,
+                        "revisits": a.revisits,
+                        "named": a.named,
+                        "name": a.name,
+                        "created_at": a.created_at,
+                        "last_seen_at": a.last_seen_at,
+                        "body_mean": dict(a.body_mean),
+                        "body_samples": a.body_samples,
+                    }
+                    for aid, a in self.anchors.items()
+                },
+            }
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2, default=str)
+        except OSError as e:
+            logger.warning("FeltAnchorStore.save_state failed: %s", e)
 
-  # _ingest after placing a short term (optional naming):
-  if len(text.split()) <= 3:
-      self.felt_anchors.try_name_current(text.strip())
-
-  def get_felt_anchor_report(self) -> dict:
-      return self.felt_anchors.report()
-"""
+    def load_state(self, path: str) -> None:
+        import json
+        import os
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            self.anchors.clear()
+            self.by_basin.clear()
+            for aid, row in (data.get("anchors") or {}).items():
+                key = tuple(float(x) for x in row["basin_key"])
+                a = FeltAnchor(
+                    anchor_id=row.get("anchor_id") or aid,
+                    basin_key=key,
+                    dwell=float(row.get("dwell") or 0),
+                    revisits=int(row.get("revisits") or 0),
+                    named=bool(row.get("named")),
+                    name=row.get("name"),
+                    created_at=row.get("created_at") or datetime.now().isoformat(),
+                    last_seen_at=row.get("last_seen_at") or datetime.now().isoformat(),
+                    body_mean=dict(row.get("body_mean") or {}),
+                    body_samples=int(row.get("body_samples") or 0),
+                )
+                self.anchors[a.anchor_id] = a
+                self.by_basin[key] = a.anchor_id
+            self.current_id = data.get("current_id")
+            if self.current_id and self.current_id not in self.anchors:
+                self.current_id = None
+        except Exception as e:
+            logger.warning("FeltAnchorStore.load_state failed: %s", e)

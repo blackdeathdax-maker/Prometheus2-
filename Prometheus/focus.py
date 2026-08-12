@@ -672,3 +672,64 @@ class FocusModule:
             "force_switch_armed": self._force_switch,
             "last_tick": dict(self.last_tick_summary),
         }
+
+
+    def save_state(self, path: str) -> None:
+        """Persist residuals + sticky focus so restart does not wipe attention."""
+        import json, os
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            thread = None
+            if self.thread is not None:
+                thread = {
+                    "target_id": self.thread.target_id,
+                    "kind": self.thread.kind,
+                    "score": self.thread.score,
+                    "created_pulse": self.thread.created_pulse,
+                    "last_seen_pulse": self.thread.last_seen_pulse,
+                    "source_mix": dict(self.thread.source_mix or {}),
+                }
+            data = {
+                "residuals": dict(self.residuals),
+                "r_pred": dict(self.r_pred),
+                "r_par": dict(self.r_par),
+                "last_error": dict(self.last_error),
+                "cooldown_until": {k: int(v) for k, v in self._cooldown_until.items()},
+                "thread": thread,
+                "stagnation_events": int(self._stagnation_events),
+                "hard_age_events": int(self._hard_age_events),
+            }
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2, default=str)
+        except OSError as e:
+            import logging
+            logging.getLogger(__name__).warning("FocusModule.save_state failed: %s", e)
+
+    def load_state(self, path: str) -> None:
+        import json, os
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            self.residuals = {k: float(v) for k, v in (data.get("residuals") or {}).items()}
+            self.r_pred = {k: float(v) for k, v in (data.get("r_pred") or {}).items()}
+            self.r_par = {k: float(v) for k, v in (data.get("r_par") or {}).items()}
+            self.last_error = {k: float(v) for k, v in (data.get("last_error") or {}).items()}
+            self._cooldown_until = {k: int(v) for k, v in (data.get("cooldown_until") or {}).items()}
+            self._stagnation_events = int(data.get("stagnation_events") or 0)
+            self._hard_age_events = int(data.get("hard_age_events") or 0)
+            th = data.get("thread")
+            if th and th.get("target_id"):
+                self.thread = FocusThread(
+                    target_id=th["target_id"],
+                    kind=th.get("kind") or "node",
+                    score=float(th.get("score") or 0),
+                    created_pulse=int(th.get("created_pulse") or 0),
+                    last_seen_pulse=int(th.get("last_seen_pulse") or 0),
+                    source_mix=dict(th.get("source_mix") or {}),
+                )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("FocusModule.load_state failed: %s", e)
+

@@ -131,27 +131,52 @@ class SomaticTopo:
             "top_basins_by_dwell": basins,
             "top_transitions": edges,
         }
-"""
-Integration (Prometheus.py):
 
-  from .somatic_topo import SomaticTopo
-  # __init__:
-  self.somatic_topo = SomaticTopo()
+    def save_state(self, path: str) -> None:
+        import json
+        import os
+        import logging
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            data = {
+                "prev_key": list(self.prev_key) if self.prev_key else None,
+                "dwell": {f"{k[0]}|{k[1]}|{k[2]}": v for k, v in self.dwell.items()},
+                "transitions": {
+                    f"{a[0]}|{a[1]}|{a[2]}=>{b[0]}|{b[1]}|{b[2]}": w
+                    for (a, b), w in self.transitions.items()
+                },
+                "total_records": self.total_records,
+                "total_moves": self.total_moves,
+            }
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2)
+        except OSError as e:
+            logging.getLogger(__name__).warning("SomaticTopo.save_state failed: %s", e)
 
-  # pulse(), after synthesizer.update_from_core(...):
-  self.somatic_topo.record(self.synthesizer.get_current_basin_key())
-
-  # _run_consolidation(), after consolidate_basins():
-  topo_summary = self.somatic_topo.consolidate()
-  print(f"Consolidation: somatic topo {topo_summary}")
-
-  def get_somatic_topo_report(self) -> dict:
-      return self.somatic_topo.report()
-
-app.py Debug (below raw somatic JSON):
-
-  st.subheader("Somatic topography (basin map)")
-  st.caption("Basins and transitions — not raw hormone gauges.")
-  if hasattr(prom, "get_somatic_topo_report"):
-      st.json(prom.get_somatic_topo_report())
-"""
+    def load_state(self, path: str) -> None:
+        import json
+        import os
+        import logging
+        from collections import defaultdict
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            self.dwell = defaultdict(float)
+            for ks, v in (data.get("dwell") or {}).items():
+                parts = ks.split("|")
+                key = (float(parts[0]), float(parts[1]), float(parts[2]))
+                self.dwell[key] = float(v)
+            self.transitions = defaultdict(float)
+            for ks, w in (data.get("transitions") or {}).items():
+                left, right = ks.split("=>")
+                a = tuple(float(x) for x in left.split("|"))
+                b = tuple(float(x) for x in right.split("|"))
+                self.transitions[(a, b)] = float(w)
+            pk = data.get("prev_key")
+            self.prev_key = tuple(float(x) for x in pk) if pk else None
+            self.total_records = int(data.get("total_records") or 0)
+            self.total_moves = int(data.get("total_moves") or 0)
+        except Exception as e:
+            logging.getLogger(__name__).warning("SomaticTopo.load_state failed: %s", e)

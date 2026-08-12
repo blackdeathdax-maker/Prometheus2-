@@ -33,9 +33,15 @@ class Prometheus:
     """
 
     # Fatigue state-cycling thresholds with hysteresis margins (spec §5).
-    T1 = 0.4
-    T2 = 0.8
+    # --- Sleep pressure / micro-day cycle (replaces pure T1/T2 sawtooth) ---
+    # Soft threshold band (no urgency → sleep sooner). Hard max always forces sleep.
+    SLEEP_SOFT_MIN = 0.35          # low-urgency ceiling (was near T1)
+    SLEEP_HARD_MAX = 0.92          # mandatory sleep
+    SLEEP_WAKE_BELOW = 0.22        # exit sleep climate when pressure under this (scaled by debt)
     HYSTERESIS = 0.05
+    # Legacy aliases so Debug sliders / old docs still map
+    T1 = 0.35
+    T2 = 0.75
 
     # Fatigue growth (per tick, scaled by urgency) and per-state recovery
     # rates. Consolidation recovers more than Pruning -- it's the
@@ -48,6 +54,10 @@ class Prometheus:
     FATIGUE_GROWTH_RATE = 0.2
     FATIGUE_RECOVERY_CONSOLIDATION = 0.5
     FATIGUE_RECOVERY_PRUNING = 0.7
+    FATIGUE_RECOVERY_SLEEP = 0.55          # per-pulse pressure drop in sleep climate
+    FATIGUE_URGENCY_GROWTH_MULT = 1.75     # high urgency accelerates pressure
+    MICRO_DAY_PULSES = 60                  # lab micro-day length (~hour/16 at 1s ticks)
+    SLEEP_FRACTION_DEFAULT = 0.33          # target share of micro-day in sleep climate
 
     # Regulation spike threshold (§4.1) and dampening cap (§4.4). Not yet
     # numerically tuned per spec §10 item 8 -- placeholders, documented.
@@ -213,8 +223,13 @@ class Prometheus:
         # second structure, see _self_study()'s Childhood-gating block.
 
         self.pulse_count = 0
-        self.fatigue = 0.0
-        self.state = "Learning"  # Learning, Consolidation, Pruning
+        self.fatigue = 0.0  # sleep pressure (continuous)
+        self.state = "Learning"  # Learning | Consolidation | Sleep
+        self.sleep_stage = "none"  # none | digest | reorganize | homeostatic | wake_prep
+        self.sleep_debt = 0.0      # excess pressure carried into sleep (lengthens recovery)
+        self.micro_day_pulse = 0
+        self._last_urgency = 0.0
+        self.load_extended_state()  # restore focus/felt/topo/runtime if present
 
         # Per-basin anchor nodes accumulated as input is ingested under a
         # given felt state (§4.2's "stable felt-state -> node anchor
@@ -708,6 +723,16 @@ class Prometheus:
                 self._ingest(text, source)
             else:
                 self._self_study()
+        elif self.state == "Sleep":
+            # Usability: never hard-mute — drain one queued input under sleep bias
+            if self._input_queue:
+                text, source = self._input_queue.pop(0)
+                self._ingest(text, source)
+            # no self_study during sleep climate
+        elif self.state == "Consolidation":
+            if self._input_queue:
+                text, source = self._input_queue.pop(0)
+                self._ingest(text, source)
 
         self.chronos.record_pulse(
             somatic, bias,
@@ -781,7 +806,7 @@ class Prometheus:
 
         print(
             f"Pulse {self.pulse_count} | Epoch: {self.bio.epoch.value} | "
-            f"State: {self.state} | Bias: {bias} | Fatigue: {self.fatigue:.2f} | "
+            f"State: {self.state}/{getattr(self,'sleep_stage','')} | Bias: {bias} | Pressure: {self.fatigue:.2f} | "
             f"Felt: {self.synthesizer.get_current_felt_state()} | "
             f"Focus: {self.focus.focus_id}"
         )
@@ -1127,57 +1152,141 @@ class Prometheus:
     # ------------------------------------------------------------------
     # Fatigue / state cycling
     # ------------------------------------------------------------------
+    def _compute_urgency(self) -> float:
+        """Organic urgency in [0,1]: pending input, focus residuals, prediction heat."""
+        u = 0.0
+        if getattr(self, "_input_queue", None):
+            u = max(u, min(1.0, 0.25 * len(self._input_queue)))
+        try:
+            fid = getattr(self.focus, "focus_id", None)
+            if fid:
+                act = float(self.focus.residuals.get(fid, 0.0) or 0.0)
+                pred = float(self.focus.r_pred.get(fid, 0.0) or 0.0)
+                u = max(u, min(1.0, (act + pred) / 12.0))
+            if self.focus.residuals:
+                top = max(self.focus.residuals.values())
+                u = max(u, min(1.0, float(top) / 15.0))
+        except Exception:
+            pass
+        self._last_urgency = u
+        return u
+
+    def _sleep_threshold(self, urgency: float) -> float:
+        """Low urgency → lower ceiling (sleep sooner). High urgency → can push higher."""
+        soft = float(getattr(self, "SLEEP_SOFT_MIN", self.T1))
+        hard = float(getattr(self, "SLEEP_HARD_MAX", 0.92))
+        # T2 slider maps near "high push" band for lab control
+        high = min(hard, max(soft + 0.05, float(self.T2)))
+        return soft + (high - soft) * max(0.0, min(1.0, urgency))
+
     def _update_fatigue(self):
-        """Fatigue growth (§5) previously read somatic.urgency directly --
-        the raw SomaticReadout returned by bio.step(), i.e. hidden-layer
-        output that bypasses synthesizer.py entirely. Every other
-        decision point in this file (regulation §4.1, executive bias) was
-        already careful to route only through
-        synthesizer.get_current_intensity(); fatigue was the one
-        exception, in real violation of the Core Emergence Principle
-        despite this file's own docstring/comments elsewhere insisting on
-        it. Fixed to use the same synthesized intensity signal (arousal
-        component of the current basin key, §2.1a) as everything else --
-        no raw hidden-layer read anywhere in this method now."""
+        """Continuous sleep pressure. Intensity + work raise it; urgency accelerates growth."""
         intensity = self.synthesizer.get_current_intensity()
-        self.fatigue = min(1.0, self.fatigue + intensity * self.FATIGUE_GROWTH_RATE)
+        urgency = self._compute_urgency()
+        growth = float(self.FATIGUE_GROWTH_RATE)
+        if urgency > 0.35:
+            growth *= 1.0 + (self.FATIGUE_URGENCY_GROWTH_MULT - 1.0) * urgency
+            # Hidden body cost of pushing (mind only sees body later)
+            try:
+                with self.bio.lock:
+                    self.bio._hormones["cortisol"] = min(
+                        1.0, self.bio._hormones.get("cortisol", 0.4) + 0.01 * urgency
+                    )
+                    self.bio._hormones["adrenaline"] = min(
+                        1.0, self.bio._hormones.get("adrenaline", 0.5) + 0.008 * urgency
+                    )
+            except Exception:
+                pass
+        # Micro-day baseline drift: slight pressure even when quiet (circadian-ish)
+        self.micro_day_pulse = (int(self.micro_day_pulse) + 1) % max(8, int(self.MICRO_DAY_PULSES))
+        baseline = 0.02 * (self.micro_day_pulse / max(1, self.MICRO_DAY_PULSES))
+        if self.state != "Sleep":
+            self.fatigue = min(1.0, self.fatigue + intensity * growth + baseline * 0.05)
+        else:
+            # Sleep recovers; debt lengthens effective recovery need
+            rec = float(self.FATIGUE_RECOVERY_SLEEP)
+            self.fatigue = max(0.0, self.fatigue * rec - 0.01 * (1.0 - min(1.0, self.sleep_debt)))
+
+    def _enter_sleep(self):
+        self.state = "Sleep"
+        self.sleep_stage = "digest"
+        self.sleep_debt = max(0.0, self.fatigue - float(getattr(self, "SLEEP_SOFT_MIN", self.T1)))
+        print(f"Sleep climate enter (pressure={self.fatigue:.3f}, debt={self.sleep_debt:.3f}, urgency={self._last_urgency:.2f})")
+
+    def _run_sleep_pulse(self):
+        """Multi-step sleep: digest → reorganize → homeostatic → wake_prep. Not prune-only."""
+        stage = self.sleep_stage or "digest"
+        if stage == "digest":
+            # Consolidation-class work: schemas, binds, checkpoint
+            self._run_consolidation()
+            self.fatigue *= float(self.FATIGUE_RECOVERY_CONSOLIDATION)
+            self.sleep_stage = "reorganize"
+        elif stage == "reorganize":
+            # Collapse already runs inside consolidation; light extra prune of tier-0
+            try:
+                pruned = self.archivist.prune()
+                if pruned:
+                    print(f"Sleep reorganize: pruned {pruned} stale Tier-0 node(s).")
+            except Exception as e:
+                print(f"Sleep prune: {e}")
+            self.fatigue *= float(self.FATIGUE_RECOVERY_PRUNING)
+            self.sleep_stage = "homeostatic"
+        elif stage == "homeostatic":
+            # Downscale residuals / focus heat; body recovery nudge
+            try:
+                self.focus.decay_residuals(consolidation=True)
+            except Exception:
+                pass
+            try:
+                self.bio.decay_fast(rate=0.35)
+            except Exception:
+                pass
+            self.fatigue = max(0.0, self.fatigue * float(self.FATIGUE_RECOVERY_SLEEP) - 0.03)
+            self.sleep_stage = "wake_prep"
+        else:
+            # wake_prep: soft exit if pressure low enough
+            self.fatigue = max(0.0, self.fatigue * float(self.FATIGUE_RECOVERY_SLEEP))
+            wake_bar = float(getattr(self, "SLEEP_WAKE_BELOW", 0.22))
+            # Higher debt → need lower pressure to wake (longer sleep)
+            wake_bar = max(0.08, wake_bar - 0.1 * min(1.0, self.sleep_debt))
+            if self.fatigue <= wake_bar + float(self.HYSTERESIS):
+                self.state = "Learning"
+                self.sleep_stage = "none"
+                self.sleep_debt *= 0.5
+                print(f"Sleep climate exit → Learning (pressure={self.fatigue:.3f})")
+            else:
+                # Loop: another digest pass if still heavily indebted
+                self.sleep_stage = "digest"
 
     def _cycle_state(self):
-        """Hysteresis-banded state cycling (§5 stability requirement)."""
+        """Sleep-pressure state machine: Learning ↔ Consolidation ↔ Sleep climate."""
+        urgency = self._last_urgency if self._last_urgency else self._compute_urgency()
+        thresh = self._sleep_threshold(urgency)
+        soft = float(getattr(self, "SLEEP_SOFT_MIN", self.T1))
+        hard = float(getattr(self, "SLEEP_HARD_MAX", 0.92))
+
         if self.state == "Learning":
-            if self.fatigue >= self.T1:
+            # Soft: prefer evening consolidation before full sleep
+            if self.fatigue >= soft and self.fatigue < thresh:
                 self.state = "Consolidation"
+            elif self.fatigue >= thresh or self.fatigue >= hard:
+                self._enter_sleep()
         elif self.state == "Consolidation":
-            if self.fatigue >= self.T2:
-                self.state = "Pruning"
-            elif self.fatigue < self.T1 - self.HYSTERESIS:
+            if self.fatigue >= thresh or self.fatigue >= hard:
+                self._enter_sleep()
+            elif self.fatigue < soft - float(self.HYSTERESIS):
                 self.state = "Learning"
+        elif self.state == "Sleep":
+            pass  # handled below
         elif self.state == "Pruning":
-            if self.fatigue < self.T2 - self.HYSTERESIS:
-                self.state = "Consolidation"
+            # Migrate legacy state name
+            self._enter_sleep()
 
         if self.state == "Consolidation":
             self._run_consolidation()
-            # §5: "fatigue must have its own recovery curve (drops during
-            # Consolidation) so the system self-cycles rather than
-            # ratcheting into permanent Pruning." This was named as a
-            # requirement in the design but never implemented -- Consolidation
-            # applied zero recovery, while Pruning (the costlier, more
-            # effortful state) recovered 30%. That inversion created a
-            # stable Consolidation<->Pruning oscillation that never dropped
-            # back below the Learning re-entry threshold, so Learning
-            # (and therefore all graph growth) became unreachable after
-            # the first few ticks. Consolidation should recover more than
-            # Pruning, since it's the restorative state, not the costly one.
-            # Rate is an undecided tuning placeholder (§10) -- exposing
-            # this via a debug-tab slider is the planned next step rather
-            # than guessing a "correct" number here.
-            self.fatigue *= self.FATIGUE_RECOVERY_CONSOLIDATION
-        elif self.state == "Pruning":
-            pruned = self.archivist.prune()
-            if pruned:
-                print(f"Pruning: removed {pruned} stale Tier-0 node(s).")
-            self.fatigue *= self.FATIGUE_RECOVERY_PRUNING  # Recovery (§5: "fatigue must have its own recovery curve")
+            self.fatigue *= float(self.FATIGUE_RECOVERY_CONSOLIDATION)
+        elif self.state == "Sleep":
+            self._run_sleep_pulse()
 
     def get_current_working_memory(self) -> dict:
         """§14 convenience wrapper -- supplies the current epoch and basin
@@ -1392,10 +1501,8 @@ class Prometheus:
         # individually (see the "No self.save() here" comments in
         # archivist.py, reflector.py, and hormonal.py's step()). This is
         # the one clock persistence is gated to.
-        self.archivist.save()
-        self.bio.save_state()
-        self.synthesizer.save_state()
-        self.self_narrative.save()
+        # Full checkpoint — only intentional reset should wipe the mind
+        self.save_full_checkpoint()
 
         if trust_summary.get("promotions") or trust_summary.get("demotions"):
             print(f"Consolidation trust pass: {trust_summary}")
@@ -1550,6 +1657,123 @@ class Prometheus:
             self.pulse()
         print("Run complete.")
 
+
+    # Phase persistence: full mind checkpoint (wipe only via reset_persistent_memory)
+    @staticmethod
+    def _data_dir() -> str:
+        import os
+        return os.environ.get(
+            "PROMETHEUS_DATA_DIR",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
+        )
+
+    def _runtime_path(self) -> str:
+        import os
+        return os.path.join(self._data_dir(), "runtime_state.json")
+
+    def _focus_path(self) -> str:
+        import os
+        return os.path.join(self._data_dir(), "focus_state.json")
+
+    def _felt_path(self) -> str:
+        import os
+        return os.path.join(self._data_dir(), "felt_anchors.json")
+
+    def _schema_felt_path(self) -> str:
+        import os
+        return os.path.join(self._data_dir(), "schema_felt.json")
+
+    def _topo_path(self) -> str:
+        import os
+        return os.path.join(self._data_dir(), "somatic_topo.json")
+
+    def save_runtime_state(self) -> None:
+        """pulse_count / fatigue / mode — so restart continues the clock."""
+        import json, os
+        try:
+            os.makedirs(self._data_dir(), exist_ok=True)
+            data = {
+                "pulse_count": int(self.pulse_count),
+                "fatigue": float(self.fatigue),
+                "state": self.state,
+                "sleep_stage": getattr(self, "sleep_stage", "none"),
+                "sleep_debt": float(getattr(self, "sleep_debt", 0.0)),
+                "micro_day_pulse": int(getattr(self, "micro_day_pulse", 0)),
+            }
+            with open(self._runtime_path(), "w") as f:
+                json.dump(data, f, indent=2)
+        except OSError as e:
+            print(f"save_runtime_state failed: {e}")
+
+    def load_runtime_state(self) -> None:
+        import json, os
+        path = self._runtime_path()
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            self.pulse_count = int(data.get("pulse_count") or 0)
+            self.fatigue = float(data.get("fatigue") or 0.0)
+            st = data.get("state") or "Learning"
+            if st == "Pruning":
+                st = "Sleep"
+            if st in ("Learning", "Consolidation", "Sleep"):
+                self.state = st
+            self.sleep_stage = data.get("sleep_stage") or "none"
+            self.sleep_debt = float(data.get("sleep_debt") or 0.0)
+            self.micro_day_pulse = int(data.get("micro_day_pulse") or 0)
+        except Exception as e:
+            print(f"load_runtime_state failed: {e}")
+
+    def save_full_checkpoint(self) -> None:
+        """Single intentional-surviving checkpoint: graph + body + attention + felt."""
+        self.archivist.save()
+        self.bio.save_state()
+        self.synthesizer.save_state()
+        try:
+            self.self_narrative.save()
+        except Exception:
+            pass
+        try:
+            self.focus.save_state(self._focus_path())
+        except Exception as e:
+            print(f"focus save failed: {e}")
+        try:
+            self.felt_anchors.save_state(self._felt_path())
+        except Exception as e:
+            print(f"felt save failed: {e}")
+        try:
+            self.schema_felt.save_state(self._schema_felt_path())
+        except Exception as e:
+            print(f"schema_felt save failed: {e}")
+        try:
+            self.somatic_topo.save_state(self._topo_path())
+        except Exception as e:
+            print(f"topo save failed: {e}")
+        self.save_runtime_state()
+
+    def load_extended_state(self) -> None:
+        """Called from __init__ after modules exist — restore non-graph mind state."""
+        try:
+            self.focus.load_state(self._focus_path())
+        except Exception as e:
+            print(f"focus load failed: {e}")
+        try:
+            self.felt_anchors.load_state(self._felt_path())
+        except Exception as e:
+            print(f"felt load failed: {e}")
+        try:
+            self.schema_felt.load_state(self._schema_felt_path())
+        except Exception as e:
+            print(f"schema_felt load failed: {e}")
+        try:
+            self.somatic_topo.load_state(self._topo_path())
+        except Exception as e:
+            print(f"topo load failed: {e}")
+        self.load_runtime_state()
+
+
     @staticmethod
     def reset_persistent_memory():
         """Deletes every module's on-disk checkpoint (§4C): the knowledge
@@ -1561,16 +1785,26 @@ class Prometheus:
         effect, since __init__ only loads from disk once, at creation.
         Safe to call even if some/all files don't exist yet. Returns the
         list of paths actually removed, for a confirmation message."""
-        from .archivist import EPISTEMIC_GRAPH_PATH
+        import os
+        from .archivist import EPISTEMIC_GRAPH_PATH, CO_ACTIVATION_PATH
         from .chronos import CHRONOS_LOG_PATH
         from .hormonal import BIOSYSTEM_STATE_PATH
         from .synthesizer import BASIN_STATE_PATH
         from .self_narrative import NARRATIVE_STATE_PATH
 
+        data_dir = Prometheus._data_dir()
+        extra = [
+            os.path.join(data_dir, "runtime_state.json"),
+            os.path.join(data_dir, "focus_state.json"),
+            os.path.join(data_dir, "felt_anchors.json"),
+            os.path.join(data_dir, "schema_felt.json"),
+            os.path.join(data_dir, "somatic_topo.json"),
+            CO_ACTIVATION_PATH,
+        ]
         removed = []
         for path in (EPISTEMIC_GRAPH_PATH, CHRONOS_LOG_PATH, BIOSYSTEM_STATE_PATH, BASIN_STATE_PATH,
-                     NARRATIVE_STATE_PATH):
-            if os.path.exists(path):
+                     NARRATIVE_STATE_PATH, *extra):
+            if path and os.path.exists(path):
                 os.remove(path)
                 removed.append(path)
         return removed
