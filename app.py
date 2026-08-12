@@ -24,7 +24,7 @@ if st.sidebar.button("Start System", disabled=st.session_state.prom is not None)
     st.session_state.prom = Prometheus()
     st.sidebar.success("System started")
 
-with st.sidebar.expander("Reset Persistent Memory"):
+with st.sidebar.expander("Reset Persistent Memory (intentional wipe only)"):
     st.caption(
         "Deletes every on-disk checkpoint (§4C): the knowledge graph, "
         "chronos's rolling log, hormonal's slow-layer baseline + epoch, "
@@ -117,7 +117,7 @@ if st.session_state.prom is not None:
         st.sidebar.caption(
             f"{'⏸ Paused' if paused else '▶ Running'} · "
             f"pulse {prom.pulse_count} · {prom.state} · "
-            f"fatigue {prom.fatigue:.3f}"
+            f"pressure {prom.fatigue:.3f} {prom.state}"
         )
         if not has_autorefresh:
             # Heavier on the server; install streamlit-autorefresh when possible.
@@ -289,13 +289,19 @@ if st.session_state.prom is not None:
             )
 
             # Fatigue shown as an abstracted level, not a raw number (§4B).
-            if prom.fatigue < Prometheus.T1:
+            soft = getattr(prom, "SLEEP_SOFT_MIN", Prometheus.T1)
+            hard = getattr(prom, "SLEEP_HARD_MAX", 0.92)
+            if prom.state == "Sleep":
+                fatigue_level = f"Sleep ({getattr(prom, 'sleep_stage', '?')})"
+            elif prom.fatigue < soft:
                 fatigue_level = "Low"
-            elif prom.fatigue < Prometheus.T2:
+            elif prom.fatigue < getattr(prom, "T2", 0.75):
                 fatigue_level = "Medium"
             else:
-                fatigue_level = "High"
-            st.metric("Fatigue", fatigue_level)
+                fatigue_level = "High / push"
+            st.metric("Sleep pressure", f"{prom.fatigue:.2f} ({fatigue_level})")
+            if hasattr(prom, "_last_urgency"):
+                st.caption(f"Urgency {getattr(prom, '_last_urgency', 0):.2f} · debt {getattr(prom, 'sleep_debt', 0):.2f} · micro-day {getattr(prom, 'micro_day_pulse', 0)}/{getattr(prom, 'MICRO_DAY_PULSES', 60)}")
 
             # No visible progress meter toward the next epoch transition, per
             # §4B: showing one would turn an earned milestone into a bar to
@@ -785,7 +791,7 @@ if st.session_state.prom is not None:
                 unsafe_allow_html=True,
             )
 
-            with st.expander("Fatigue / State Cycling (§5)"):
+            with st.expander("Sleep pressure / cycle"):
                 prom.T1 = st.slider("T1 (Learning \u2192 Consolidation)", 0.0, 1.0, value=prom.T1, step=0.01)
                 prom.T2 = st.slider("T2 (Consolidation \u2192 Pruning)", 0.0, 1.0, value=prom.T2, step=0.01)
                 prom.HYSTERESIS = st.slider("Hysteresis margin", 0.0, 0.3, value=prom.HYSTERESIS, step=0.01)
