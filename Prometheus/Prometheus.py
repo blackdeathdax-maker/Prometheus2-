@@ -474,11 +474,40 @@ class Prometheus:
             anchors = self.felt_state_anchors.get(basin_key, [])
             anchor = anchors[-1] if anchors else None
 
-        result = self.association.place_node(text, definition="", source=source, context_node=anchor)
+        # User-taught hierarchy/part-of via chat ("yellow is a color")
+        taught = None
+        if source == "user":
+            try:
+                taught = self.sensory.parse_explicit_relation(text)
+            except Exception:
+                taught = None
+        if taught:
+            child, parent, etype = taught
+            taught_result = self.association.teach_relation(
+                child, parent, relation_type=etype, source=source,
+            )
+            if taught_result:
+                print(f"User edge: {child} —{etype}→ {parent}")
+                result = {
+                    "term": taught_result["child"],
+                    "created": True,
+                    "taught": taught_result,
+                }
+            else:
+                result = self.association.place_node(text, definition="", source=source, context_node=anchor)
+        else:
+            result = self.association.place_node(text, definition="", source=source, context_node=anchor)
+        if not isinstance(result, dict):
+            result = {"term": result}
         node = result.get("term")
         if node:
             self.archivist.bump_activation(node)
             self.focus.boost_residual(node)
+            if isinstance(result, dict) and result.get("taught"):
+                p = result["taught"].get("parent")
+                if p:
+                    self.archivist.bump_activation(p)
+                    self.focus.boost_residual(p)
             # Felt-anchor naming: short lemma-like user words while in a basin
             if source == "user" and len(text.split()) <= 3:
                 self.felt_anchors.try_name_current(text.strip())
@@ -662,26 +691,96 @@ class Prometheus:
             "concern": -self.VALENCE_COLORING_STEP * 0.5,
         }[reaction_type]
 
-        key = self.synthesizer.get_current_basin_key()
-        unique_anchors = self._get_unique_anchors(key)
-        for n in unique_anchors:
+        # Narrow targets: parental signal is about *what was just in mind*,
+        # not the entire basin history window (that painted dozens of nodes).
+        targets = self._parental_targets(max_n=1)
+        for n in targets:
             self.archivist.nudge_valence_coloring(n, coloring_delta, cap=self.VALENCE_COLORING_CAP)
-            # A reaction landing on a node is itself a form of touch --
-            # feeds the same activation/working-memory signal as any
-            # other interaction with it (§11 pull-forward).
+            # Stamp explicit parental tag so UI can show *why* it is colored
+            data = self.archivist.graph.nodes.get(n)
+            if data is not None:
+                hist = data.setdefault("parental_history", [])
+                hist.append({
+                    "reaction": reaction_type,
+                    "delta": coloring_delta,
+                    "pulse": int(self.pulse_count),
+                })
+                # keep short
+                if len(hist) > 8:
+                    del hist[:-8]
+                data["last_parental_reaction"] = reaction_type
             self.archivist.bump_activation(n)
             self.focus.boost_residual(n)
-            # Disapproval / concern stick more; approval mildly satisfies via smaller residual.
             if reaction_type in ("disapproval", "concern"):
                 self.focus.add_parental_residual(n, 1.0)
             elif reaction_type in ("approval", "warmth"):
                 self.focus.add_parental_residual(n, 0.3)
 
-        return {"reaction": reaction_type, "anchors_colored": unique_anchors}
+        self.last_parental_feedback = {
+            "reaction": reaction_type,
+            "anchors_colored": list(targets),
+            "pulse": int(self.pulse_count),
+        }
+        return self.last_parental_feedback
 
-    # ------------------------------------------------------------------
-    # Main tick
-    # ------------------------------------------------------------------
+    def _parental_targets(self, max_n: int = 1) -> list:
+        """Parental signal hits what is in mind now — not a basin-wide paint.
+
+        Priority: sticky focus → single most recent user-ingested node.
+        Default max_n=1 so approval/disapproval is legible.
+        """
+        out = []
+        seen = set()
+
+        def add(n):
+            if not n or n in seen:
+                return
+            if n in ("SELF", "OTHER"):
+                return
+            if n not in self.archivist.graph:
+                return
+            data = self.archivist.graph.nodes.get(n) or {}
+            # Skip pure schema wrappers unless they are the focus
+            seen.add(n)
+            out.append(n)
+
+        fid = getattr(self.focus, "focus_id", None)
+        add(fid)
+        if len(out) < max_n:
+            try:
+                for n in reversed(list(self._global_protected_anchors)):
+                    add(n)
+                    if len(out) >= max_n:
+                        break
+            except Exception:
+                pass
+        return out[:max_n]
+
+    def parental_coloring_report(self, top_n: int = 25) -> dict:
+        """What parental reactions have actually marked — for UI transparency."""
+        rows = []
+        for n, d in self.archivist.graph.nodes(data=True):
+            hist = d.get("parental_history") or []
+            if not hist and not d.get("last_parental_reaction"):
+                vc = d.get("valence_coloring")
+                if vc is None or abs(float(vc or 0)) < 1e-6:
+                    continue
+            rows.append({
+                "id": n,
+                "name": d.get("name") or n,
+                "last_reaction": d.get("last_parental_reaction"),
+                "valence_coloring": round(float(d.get("valence_coloring") or 0), 4),
+                "history": list(hist)[-3:] if hist else [],
+            })
+        rows.sort(key=lambda r: -abs(r["valence_coloring"]))
+        last = getattr(self, "last_parental_feedback", None)
+        return {
+            "last_feedback": last,
+            "marked_nodes": len(rows),
+            "top": rows[:top_n],
+        }
+
+
     def pulse(self):
         self.pulse_count += 1
         somatic = self.bio.step()

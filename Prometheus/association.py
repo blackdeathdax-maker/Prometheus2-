@@ -45,6 +45,32 @@ class AssociationEngine:
     # §2.3 hierarchy placement -- the main entry point for ingesting a new
     # term with its definition/context.
     # ------------------------------------------------------------------
+
+    def teach_relation(self, child: str, parent: str, relation_type: str = "is-a", source: str = "user"):
+        """Explicit user-taught edge: ensure both nodes exist, link child→parent.
+        Returns dict with node ids and edge type.
+        """
+        child = (child or "").strip().lower()
+        parent = (parent or "").strip().lower()
+        if not child or not parent or child == parent:
+            return None
+        # place without definition to avoid recursive hierarchy parse noise
+        self.place_node(child, definition="", source=source, context_node=None)
+        self.place_node(parent, definition="", source=source, context_node=None)
+        # Direction: child is-a parent  =>  edge child → parent (or parent→child?)
+        # Existing hierarchy from parse_hierarchy links parent→term when
+        # term is defined as "a parent". For explicit "yellow is a color",
+        # semantic is yellow —is-a→ color. Match is-a direction as child→parent.
+        self.archivist.link(
+            child, parent, relation_type, source=source, placement="explicit",
+        )
+        # mark user-linked for WM
+        for n in (child, parent):
+            if n in self.archivist.graph:
+                self.archivist.graph.nodes[n]["user_linked"] = True
+                self.archivist.graph.nodes[n]["source"] = source
+        return {"child": child, "parent": parent, "relation_type": relation_type}
+
     def place_node(self, term: str, definition: str = "", source: str = "user",
                     context_node: Optional[str] = None,
                     max_parent_children: Optional[int] = None) -> Dict:

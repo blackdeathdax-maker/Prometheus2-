@@ -138,13 +138,55 @@ class SensoryModule:
 
         return None
 
-    # ------------------------------------------------------------------
-    # §2.1b relational edge candidates (extended beyond the original
-    # single-relation version to cover all four edge types the spec
-    # defines). Returns a list because a single sentence can trigger more
-    # than one candidate (spec's own example: "I shouldn't have done that"
-    # flags both `responsible-for` and `violates`).
-    # ------------------------------------------------------------------
+    def parse_explicit_relation(self, text: str):
+        """User-taught structure: 'yellow is a color' -> (yellow, color, is-a).
+
+        Returns (child, parent, edge_type) or None. Clear subject-relation-object
+        phrasing only — does not invent ontology.
+        """
+        if not text or not isinstance(text, str):
+            return None
+        raw = text.strip().rstrip(".")
+        if len(raw) > 120:
+            return None
+        low = raw.lower()
+        if any(x in low for x in ("shouldn't", "should not", "i feel", "i'm ", "i am ")):
+            return None
+
+        patterns = [
+            (r"^(.+?)\s+is\s+part\s+of\s+(.+)$", "part-of"),
+            (r"^(.+?)\s+are\s+part\s+of\s+(.+)$", "part-of"),
+            (r"^(.+?)\s+is\s+a\s+kind\s+of\s+(.+)$", "is-a"),
+            (r"^(.+?)\s+is\s+a\s+type\s+of\s+(.+)$", "is-a"),
+            (r"^(.+?)\s+is\s+an?\s+(.+)$", "is-a"),
+            (r"^(.+?)\s+are\s+(.+)$", "is-a"),
+        ]
+        for pat, edge in patterns:
+            m = re.match(pat, raw, re.IGNORECASE)
+            if not m:
+                continue
+            child = m.group(1).strip().strip('"').strip("'")
+            parent = m.group(2).strip().strip('"').strip("'")
+            parent = _first_noun_phrase(parent)
+            # strip leading articles on parent
+            for art in ("a ", "an ", "the "):
+                if parent.lower().startswith(art):
+                    parent = parent[len(art):]
+                    break
+            if not child or not parent:
+                continue
+            if len(child) > 40 or len(parent) > 40:
+                continue
+            if " " in child and len(child.split()) > 4:
+                continue
+            child_n = child.lower()
+            parent_n = parent.lower()
+            if child_n == parent_n:
+                continue
+            return (child_n, parent_n, edge)
+        return None
+
+
     def detect_relational(self, text: str) -> List[str]:
         """§2.1b keyword intake — expanded trigger lists (still no LLM).
         A single sentence may flag multiple families. Keep patterns

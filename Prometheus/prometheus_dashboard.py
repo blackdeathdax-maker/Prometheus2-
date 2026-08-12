@@ -123,6 +123,8 @@ def render_graph_html(archivist, node_subset: Optional[set] = None,
         visual = _node_visual(node, data)
         label = data.get("name") or node
         title_bits = [f"tier: {data.get('tier', 0)}", f"source: {data.get('source', 'unknown')}",
+                      (f"parental: {data.get('last_parental_reaction')}" if data.get("last_parental_reaction") else None),
+                      (f"valence_coloring: {data.get('valence_coloring')}" if data.get("valence_coloring") is not None else None),
                       f"activation: {data.get('activation', 0.0):.2f}"]
         if data.get("is_schema"):
             title_bits.append(f"named: {data.get('named', False)}")
