@@ -187,6 +187,75 @@ class SensoryModule:
         return None
 
 
+
+    def parse_self_attribute(self, text: str):
+        """Self-reflection: 'I am X' / 'I have X' → attribute for SELF link.
+
+        Returns (kind, attribute_lemma, edge_hint) or None.
+          kind: 'identity' | 'composition'
+          edge_hint: 'associated-with' | 'composed-of'
+        Skips futures/modals (going to, have to, am going).
+        """
+        if not text or not isinstance(text, str):
+            return None
+        raw = text.strip().rstrip(".!")
+        if len(raw) > 100:
+            return None
+        low = raw.lower().strip()
+
+        # Block non-reflective shells
+        block = (
+            "i am going", "i'm going", "i am gonna", "i'm gonna",
+            "i have to", "i've to", "i have been", "i've been",
+            "i am going to", "i'm going to",
+        )
+        if any(low.startswith(b) or b in low[:24] for b in block):
+            return None
+
+        import re as _re
+        # I am / I'm / I am a / I'm a
+        m = _re.match(
+            r"^(?:i\s+am|i'm|im)\s+(?:a\s+|an\s+|the\s+)?(.+)$",
+            low,
+            _re.IGNORECASE,
+        )
+        if m:
+            attr = m.group(1).strip()
+            # strip trailing clauses
+            for stop in (" when ", " because ", " if ", " and i ", ",", " that "):
+                if stop in attr:
+                    attr = attr.split(stop, 1)[0].strip()
+            if not attr or len(attr) > 40:
+                return None
+            if attr.split()[0] in ("not", "no"):
+                # "I am not X" still reflective — keep X without not
+                parts = attr.split(None, 1)
+                if len(parts) < 2:
+                    return None
+                attr = parts[1]
+            return ("identity", attr, "associated-with")
+
+        # I have / I've + noun phrase (psychological composition)
+        m = _re.match(
+            r"^(?:i\s+have|i've|ive)\s+(?:a\s+|an\s+|the\s+)?(.+)$",
+            low,
+            _re.IGNORECASE,
+        )
+        if m:
+            attr = m.group(1).strip()
+            for stop in (" when ", " because ", " if ", " and i ", ",", " that "):
+                if stop in attr:
+                    attr = attr.split(stop, 1)[0].strip()
+            if not attr or len(attr) > 40:
+                return None
+            # reject pure auxiliaries leftovers
+            if attr.split()[0] in ("to", "been", "done", "got"):
+                return None
+            return ("composition", attr, "composed-of")
+
+        return None
+
+
     def detect_relational(self, text: str) -> List[str]:
         """§2.1b keyword intake — expanded trigger lists (still no LLM).
         A single sentence may flag multiple families. Keep patterns

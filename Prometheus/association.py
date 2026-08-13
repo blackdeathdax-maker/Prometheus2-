@@ -71,6 +71,30 @@ class AssociationEngine:
                 self.archivist.graph.nodes[n]["source"] = source
         return {"child": child, "parent": parent, "relation_type": relation_type}
 
+
+    def link_self_attribute(self, attribute: str, edge_type: str = "associated-with", source: str = "user"):
+        """SELF reflection: place attribute node and link SELF → attribute.
+        identity → associated-with; composition → composed-of when possible.
+        """
+        from .archivist import SELF_NODE
+        attr = (attribute or "").strip().lower()
+        if not attr:
+            return None
+        # shorten multiword slightly for node id stability
+        term = attr
+        self.place_node(term, definition="", source=source, context_node=SELF_NODE)
+        if SELF_NODE not in self.archivist.graph:
+            self.archivist.store(SELF_NODE, source="system")
+        rel = edge_type if edge_type in ("associated-with", "composed-of", "part-of") else "associated-with"
+        self.archivist.link(SELF_NODE, term, rel, source=source, placement="explicit")
+        if term in self.archivist.graph:
+            self.archivist.graph.nodes[term]["user_linked"] = True
+            self.archivist.graph.nodes[term]["self_attribute"] = True
+            self.archivist.graph.nodes[term]["self_attr_kind"] = (
+                "composition" if rel == "composed-of" else "identity"
+            )
+        return {"self": SELF_NODE, "attribute": term, "relation_type": rel}
+
     def place_node(self, term: str, definition: str = "", source: str = "user",
                     context_node: Optional[str] = None,
                     max_parent_children: Optional[int] = None) -> Dict:

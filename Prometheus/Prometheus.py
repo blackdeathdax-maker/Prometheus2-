@@ -506,7 +506,30 @@ class Prometheus:
             else:
                 result = self.association.place_node(text, definition="", source=source, context_node=anchor)
         else:
-            result = self.association.place_node(text, definition="", source=source, context_node=anchor)
+            self_attr = None
+            if source == "user":
+                try:
+                    self_attr = self.sensory.parse_self_attribute(text)
+                except Exception:
+                    self_attr = None
+            if self_attr:
+                _kind, attr, edge_hint = self_attr
+                linked = self.association.link_self_attribute(
+                    attr, edge_type=edge_hint, source=source,
+                )
+                if linked:
+                    print(f"Self attribute ({_kind}): SELF —{edge_hint}→ {attr}")
+                    result = {
+                        "term": linked["attribute"],
+                        "created": True,
+                        "self_attribute": linked,
+                    }
+                    if hasattr(self, "modulators"):
+                        self.modulators.pulse("user_input", amount=0.06)
+                else:
+                    result = self.association.place_node(text, definition="", source=source, context_node=anchor)
+            else:
+                result = self.association.place_node(text, definition="", source=source, context_node=anchor)
         if not isinstance(result, dict):
             result = {"term": result}
         node = result.get("term")
