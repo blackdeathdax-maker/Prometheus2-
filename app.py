@@ -822,6 +822,12 @@ if st.session_state.prom is not None:
             st.subheader("Focus / Residuals (§13.y)")
             if hasattr(prom, "get_focus_report"):
                 st.json(prom.get_focus_report())
+
+                st.subheader("Long-term interest themes")
+                st.caption("Orientation across sleep — biases curiosity; earned from focus/narrative/parental recurrence.")
+                if hasattr(prom, "get_long_term_interest_report"):
+                    st.json(prom.get_long_term_interest_report())
+
             else:
                 st.caption("Focus module not wired on this instance.")
 
