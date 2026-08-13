@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 BasinKey = Tuple[float, float, float]
 
 # Phenomenological body only — never endocrine keys
+MIN_BASIN_DISTANCE = 0.22  # PAD L2 — new anchors must be this far from existing
+REFINE_DWELL = 3.0         # or revisit enough to refine in place
+
 BODY_CHANNELS = frozenset({
     "heart_rate", "breath", "respiration_rate", "muscle_tension",
     "sweat_skin", "gut", "energy", "warmth",
@@ -68,13 +71,33 @@ class FeltAnchorStore:
         self.by_basin: Dict[BasinKey, str] = {}
         self.current_id: Optional[str] = None
 
+    def _pad_dist(self, a: BasinKey, b: BasinKey) -> float:
+        return (
+            (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2
+        ) ** 0.5
+
+    def _nearest_anchor(self, key: BasinKey):
+        best_id, best_d = None, 1e9
+        for aid, a in self.anchors.items():
+            d = self._pad_dist(key, a.basin_key)
+            if d < best_d:
+                best_d, best_id = d, aid
+        return best_id, best_d
+
     def observe(self, basin_key, raw_body: Optional[Dict[str, float]] = None) -> Optional[str]:
+        """Map continuous PAD to sparse anchors — refuse near-duplicates."""
         key = _key_tuple(basin_key)
         aid = self.by_basin.get(key)
         if aid is None:
-            aid = _anchor_id(key)
-            self.anchors[aid] = FeltAnchor(anchor_id=aid, basin_key=key)
-            self.by_basin[key] = aid
+            near_id, near_d = self._nearest_anchor(key)
+            if near_id is not None and near_d < MIN_BASIN_DISTANCE:
+                # Snap to existing place — basins stay further apart
+                aid = near_id
+                self.by_basin[key] = aid  # alias this grid cell to the anchor
+            else:
+                aid = _anchor_id(key)
+                self.anchors[aid] = FeltAnchor(anchor_id=aid, basin_key=key)
+                self.by_basin[key] = aid
         a = self.anchors[aid]
         if self.current_id != aid:
             a.revisits += 1

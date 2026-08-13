@@ -144,13 +144,13 @@ class BioSystem:
         """Blind external access -- already-composited somatic values."""
         return self.somatic
 
-    def get_raw_variables(self) -> Dict[str, float]:
+    def get_raw_variables(self, fast_body_delta: Dict[str, float] = None) -> Dict[str, float]:
         """
         Phase A translation layer: endocrine → phenomenological body only.
 
         Returns body channels the mind may sense. Never returns hormone
-        names. All fast + slow hormones participate in the mapping so the
-        pseudo-body moves; cognition must not know which gland did what.
+        names. Medium/slow hormones set climate; optional fast_body_delta
+        (from neuromodulators) adds short gusts — still body only.
 
         Channels (0..1-ish):
           heart_rate, breath, muscle_tension, sweat_skin, gut,
@@ -180,7 +180,7 @@ class BioSystem:
         energy = clamp(0.30 * thy + 0.25 * dop + 0.20 * ser + 0.15 * adr + 0.10 * est)
         warmth = clamp(0.45 * oxy + 0.25 * ser + 0.15 * dop + 0.15 * (1.0 - cor))
 
-        return {
+        body = {
             "heart_rate": heart_rate,
             "breath": breath,
             "muscle_tension": muscle_tension,
@@ -188,9 +188,13 @@ class BioSystem:
             "gut": gut,
             "energy": energy,
             "warmth": warmth,
-            # Aliases so older synthesizer paths keep working during transition
-            "respiration_rate": breath,
         }
+        if fast_body_delta:
+            for k, dv in fast_body_delta.items():
+                if k in body:
+                    body[k] = clamp(body[k] + float(dv))
+        body["respiration_rate"] = body["breath"]
+        return body
 
     def decay_fast(self, rate: float = 0.5):
         """

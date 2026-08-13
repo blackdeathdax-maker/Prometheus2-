@@ -138,6 +138,7 @@ class FocusModule:
         self._hard_age_events: int = 0
         # node_id -> pulse when cooldown expires
         self._cooldown_until: Dict[str, int] = {}
+        self.switch_cost_mult: float = 1.0  # from FastModulators.settle/alert
         # schema_id -> {family: consecutive pulses still missing while focused}
         self._missing_streak: Dict[str, Dict[str, int]] = {}
 
@@ -341,7 +342,7 @@ class FocusModule:
 
         age = pulse - current.created_pulse
         residency_met = age >= self.MIN_FOCUS_RESIDENCY
-        margin_needed = max(abs(cur_score) * self.FOCUS_SWITCH_MARGIN, 0.5)
+        margin_needed = max(abs(cur_score) * (self.FOCUS_SWITCH_MARGIN * getattr(self, "switch_cost_mult", 1.0)), 0.5)
         challenger_wins = best_id != current.target_id and best_score > cur_score + margin_needed
 
         # Stagnation escape: cold activation + long age → allow switch without margin

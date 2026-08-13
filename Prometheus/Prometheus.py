@@ -15,6 +15,7 @@ from .self_narrative import NarrativeModule
 from .focus import FocusModule
 from .somatic_topo import SomaticTopo
 from .felt_anchors import FeltAnchorStore
+from .modulators import FastModulators
 from .schema_felt import SchemaFeltBinder
 from .sensory import SensoryModule
 from .association import AssociationEngine
@@ -213,6 +214,7 @@ class Prometheus:
         self.working_memory.focus = self.focus  # §13.y WM consumer hook
         self.somatic_topo = SomaticTopo()
         self.felt_anchors = FeltAnchorStore()
+        self.modulators = FastModulators()
         self.schema_felt = SchemaFeltBinder(threshold=3)
         self.last_collapse_summary = {"collapsed": 0, "conflicts": 0, "candidates_considered": 0}
         self.last_focus_summary = {}
@@ -467,6 +469,8 @@ class Prometheus:
         association.place_node() directly, bypassing this method
         entirely. Corrected here rather than left misleading."""
         self.sensory.ingest(text)
+        if source == "user" and hasattr(self, "modulators"):
+            self.modulators.pulse("user_input", amount=0.08)
         basin_key = self.synthesizer.get_current_basin_key()
         felt_state = self.synthesizer.get_current_felt_state()
         anchor = None
@@ -693,6 +697,10 @@ class Prometheus:
 
         # Narrow targets: parental signal is about *what was just in mind*,
         # not the entire basin history window (that painted dozens of nodes).
+        if hasattr(self, "modulators"):
+            self.modulators.pulse(reaction_type if reaction_type in ("approval", "disapproval") else (
+                "approval" if reaction_type == "warmth" else "disapproval"
+            ), amount=0.12)
         targets = self._parental_targets(max_n=1)
         for n in targets:
             self.archivist.nudge_valence_coloring(n, coloring_delta, cap=self.VALENCE_COLORING_CAP)
@@ -785,18 +793,27 @@ class Prometheus:
         self.pulse_count += 1
         somatic = self.bio.step()
 
+        # Fast neuromodulators (necessities): decay, medium bias, body gusts
+        if hasattr(self, "modulators"):
+            self.modulators.decay_toward_baseline()
+            try:
+                self.modulators.apply_medium_bias(self.bio._hormones)
+            except Exception:
+                pass
+            fast_delta = self.modulators.body_delta()
+        else:
+            fast_delta = None
+
+        # Body surface = medium/slow hormones + fast gusts (still no chemical names)
+        body = self.bio.get_raw_variables(fast_body_delta=fast_delta)
+
         # synthesizer must run first, before anything that conditions a
-        # decision on its output (regulation trigger, executive bias) --
-        # previously this ran *after* those checks, which meant they were
-        # either reading last tick's synthesized state or (as fixed here)
-        # reading raw hidden-layer data directly. Per the Core Emergence
-        # Principle, prometheus.py and executive.py must only condition on
-        # synthesizer.py's output, never on `somatic` directly.
-        self.synthesizer.update_from_core(self.bio.get_raw_variables())
+        # decision on its output (regulation trigger, executive bias).
+        self.synthesizer.update_from_core(body)
         self.somatic_topo.record(self.synthesizer.get_current_basin_key())
         self.felt_anchors.observe(
             self.synthesizer.get_current_basin_key(),
-            raw_body=self.bio.get_raw_variables(),
+            raw_body=body,
         )
         intensity = self.synthesizer.get_current_intensity()
 
@@ -846,6 +863,8 @@ class Prometheus:
         # §13.y: residual decay + prediction error + sticky focus selection
         key = self.synthesizer.get_current_basin_key()
         basin_anchors = set(self._get_unique_anchors(key))
+        if hasattr(self, "modulators"):
+            self.focus.switch_cost_mult = self.modulators.switch_cost_mult()
         self.last_focus_summary = self.focus.tick(
             self.archivist.graph,
             pulse=self.pulse_count,
@@ -1119,6 +1138,17 @@ class Prometheus:
                 and n not in self._barren_self_study_targets
             )
 
+        # Curiosity narrowing: prefer focus neighborhood over whole graph
+        local = self.focus_neighborhood_ids(cap=48)
+        pin = None
+        try:
+            # session pin is app-side; residual-top is engine-side
+            if self.focus.residuals:
+                pin = max(self.focus.residuals.items(), key=lambda t: t[1])[0]
+                local.add(pin)
+        except Exception:
+            pass
+
         working_candidates = [
             n for n, d in list(graph.nodes(data=True))
             if d.get("tier", 0) >= TIER_WORKING and has_room(n, d)
@@ -1132,6 +1162,14 @@ class Prometheus:
             n for n, d in list(graph.nodes(data=True))
             if d.get("tier", 0) < TIER_WORKING and d.get("source") != "self_generated" and has_room(n, d)
         ]
+
+        # Soft gate: if focus neighborhood has room, study there first (less random)
+        if local:
+            loc_w = [n for n in working_candidates if n in local]
+            loc_p = [n for n in provisional_candidates if n in local]
+            if loc_w or loc_p:
+                working_candidates = loc_w or working_candidates
+                provisional_candidates = loc_p or provisional_candidates
 
         # §14: Childhood hard-gate, unless the dead-end proxy fires.
         if epoch_value == "Childhood":
@@ -1244,6 +1282,14 @@ class Prometheus:
             weights = [self.archivist.graph.nodes[n].get("activation", 0.0) + 0.1 for n in pool]
         if boost_set:
             weights = [w * 3.0 if n in boost_set else w for n, w in zip(pool, weights)]
+        try:
+            local = self.focus_neighborhood_ids(cap=48)
+            weights = [w * 4.0 if n in local else w for n, w in zip(pool, weights)]
+            fid = getattr(self.focus, "focus_id", None)
+            if fid:
+                weights = [w * 2.5 if n == fid else w for n, w in zip(pool, weights)]
+        except Exception:
+            pass
         # §13.y: sticky focus / residual neighbourhood bias
         weights = [w * self.focus.self_study_weight(n) for n, w in zip(pool, weights)]
         return random.choices(pool, weights=weights, k=1)[0]
@@ -1310,6 +1356,8 @@ class Prometheus:
         self.state = "Sleep"
         self.sleep_stage = "digest"
         self.sleep_debt = max(0.0, self.fatigue - float(getattr(self, "SLEEP_SOFT_MIN", self.T1)))
+        if hasattr(self, "modulators"):
+            self.modulators.pulse("sleep_enter", amount=0.15)
         print(f"Sleep climate enter (pressure={self.fatigue:.3f}, debt={self.sleep_debt:.3f}, urgency={self._last_urgency:.2f})")
 
     def _run_sleep_pulse(self):
@@ -1352,6 +1400,8 @@ class Prometheus:
                 self.state = "Learning"
                 self.sleep_stage = "none"
                 self.sleep_debt *= 0.5
+                if hasattr(self, "modulators"):
+                    self.modulators.pulse("sleep_exit", amount=0.1)
                 print(f"Sleep climate exit → Learning (pressure={self.fatigue:.3f})")
             else:
                 # Loop: another digest pass if still heavily indebted
@@ -1431,6 +1481,63 @@ class Prometheus:
         """Schema ↔ felt co-occurrence / promotion diagnostic."""
         return self.schema_felt.report()
 
+
+    def node_neighborhood(self, node_id: str, max_each: int = 20) -> dict:
+        """Parents/children for search expand — list only, not full graph render."""
+        graph = self.archivist.graph
+        if not node_id or node_id not in graph:
+            return {"id": node_id, "parents": [], "children": [], "related": []}
+        parents, children, related = [], [], []
+        # Out edges from node = often child→parent for is-a, or parent→child for composed-of
+        for _, v, data in graph.out_edges(node_id, data=True):
+            rel = data.get("relation_type") or "associated-with"
+            row = {"id": str(v), "relation": rel, "name": graph.nodes[v].get("name")}
+            if rel in ("is-a", "part-of"):
+                parents.append(row)  # yellow is-a color → color is parent-ish endpoint
+            elif rel in ("composed-of", "member-of"):
+                children.append(row)
+            else:
+                related.append(row)
+        for u, _, data in graph.in_edges(node_id, data=True):
+            rel = data.get("relation_type") or "associated-with"
+            row = {"id": str(u), "relation": rel, "name": graph.nodes[u].get("name")}
+            if rel in ("is-a", "part-of"):
+                # incoming is-a means u is-a node → u is child
+                children.append(row)
+            elif rel in ("composed-of",):
+                parents.append(row)
+            else:
+                related.append(row)
+        return {
+            "id": node_id,
+            "parents": parents[:max_each],
+            "children": children[:max_each],
+            "related": related[:max_each],
+            "parent_count": len(parents),
+            "child_count": len(children),
+            "related_count": len(related),
+        }
+
+    def focus_neighborhood_ids(self, radius: int = 1, cap: int = 40) -> set:
+        """Nodes near sticky focus — curiosity should live here first."""
+        fid = getattr(self.focus, "focus_id", None)
+        graph = self.archivist.graph
+        out = set()
+        if fid and fid in graph:
+            out.add(fid)
+            for _, v in graph.out_edges(fid):
+                out.add(v)
+            for u, _ in graph.in_edges(fid):
+                out.add(u)
+            # residual neighborhood
+            try:
+                for n, val in sorted(self.focus.residuals.items(), key=lambda t: -t[1])[:cap]:
+                    if val >= getattr(self.focus, "RESIDUAL_FLOOR", 0.05):
+                        out.add(n)
+            except Exception:
+                pass
+        return out
+
     def search_graph(self, query: str, limit: int = 40) -> list:
         """Substring search over node ids, names, and definitions.
         Returns list of dicts for UI: id, name, kind, tier, activation.
@@ -1463,6 +1570,20 @@ class Prometheus:
             })
         hits.sort(key=lambda h: (-h["activation"], h["id"]))
         return hits[: max(1, int(limit))]
+
+
+    def _mod_boost_residual(self, node_id: str, amount: float = None) -> None:
+        if not hasattr(self, "focus") or self.focus is None:
+            return
+        amt = amount if amount is not None else getattr(self.focus, "RESIDUAL_BOOST", 1.0)
+        if hasattr(self, "modulators"):
+            amt = float(amt) * float(self.modulators.residual_gain())
+        self.focus.boost_residual(node_id, amount=amt)
+
+    def get_modulator_report(self) -> dict:
+        if hasattr(self, "modulators"):
+            return self.modulators.report()
+        return {}
 
     def pin_search_hit(self, node_id: str) -> bool:
         """Boost residual / activation so search can steer attention."""
@@ -1850,6 +1971,11 @@ class Prometheus:
             self.somatic_topo.save_state(self._topo_path())
         except Exception as e:
             print(f"topo save failed: {e}")
+        if hasattr(self, "modulators"):
+            try:
+                self.modulators.save_state()
+            except Exception as e:
+                print(f"modulators save failed: {e}")
         self.save_runtime_state()
 
     def load_extended_state(self) -> None:
@@ -1870,6 +1996,11 @@ class Prometheus:
             self.somatic_topo.load_state(self._topo_path())
         except Exception as e:
             print(f"topo load failed: {e}")
+        if hasattr(self, "modulators"):
+            try:
+                self.modulators.load_state()
+            except Exception as e:
+                print(f"modulators load failed: {e}")
         self.load_runtime_state()
 
 
@@ -1898,6 +2029,7 @@ class Prometheus:
             os.path.join(data_dir, "felt_anchors.json"),
             os.path.join(data_dir, "schema_felt.json"),
             os.path.join(data_dir, "somatic_topo.json"),
+            os.path.join(data_dir, "modulators_state.json"),
             CO_ACTIVATION_PATH,
         ]
         removed = []
