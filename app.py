@@ -207,11 +207,11 @@ if st.session_state.prom is not None:
 
             if search_q.strip() and hasattr(prom, "search_graph"):
                 hits = prom.search_graph(search_q.strip(), limit=int(search_lim))
-                st.caption(f"{len(hits)} hit(s)")
+                st.caption(f"{len(hits)} hit(s) — expand lists neighbors without drawing the full graph")
                 for i, h in enumerate(hits):
                     label = h.get("name") or h["id"]
                     meta = f"{h['kind']} · tier {h['tier']} · act {h['activation']}"
-                    c1, c2 = st.columns([4, 1])
+                    c1, c2, c3 = st.columns([3, 1, 1])
                     with c1:
                         st.write(f"**{label}**")
                         st.caption(f"`{h['id']}` — {meta}")
@@ -220,6 +220,34 @@ if st.session_state.prom is not None:
                             if prom.pin_search_hit(h["id"]):
                                 st.session_state["graph_pin_id"] = h["id"]
                                 st.success("Pinned")
+                    with c3:
+                        if st.button("Expand", key=f"exp_hit_{i}"):
+                            st.session_state["search_expand_id"] = h["id"]
+                    if st.session_state.get("search_expand_id") == h["id"] and hasattr(prom, "node_neighborhood"):
+                        nb = prom.node_neighborhood(h["id"], max_each=15)
+                        with st.expander(f"Neighbors of `{h['id']}` (lists only)", expanded=True):
+                            st.caption(
+                                f"parents {nb.get('parent_count', 0)} · "
+                                f"children {nb.get('child_count', 0)} · "
+                                f"related {nb.get('related_count', 0)} (showing up to 15 each)"
+                            )
+                            if nb.get("parents"):
+                                st.markdown("**Parents / is-a targets**")
+                                for row in nb["parents"]:
+                                    nm = row.get("name") or row["id"]
+                                    st.write(f"- `{row['id']}` ({nm}) · {row.get('relation')}")
+                            if nb.get("children"):
+                                st.markdown("**Children / inbound**")
+                                for row in nb["children"]:
+                                    nm = row.get("name") or row["id"]
+                                    st.write(f"- `{row['id']}` ({nm}) · {row.get('relation')}")
+                            if nb.get("related"):
+                                st.markdown("**Other edges**")
+                                for row in nb["related"]:
+                                    nm = row.get("name") or row["id"]
+                                    st.write(f"- `{row['id']}` ({nm}) · {row.get('relation')}")
+                            if not (nb.get("parents") or nb.get("children") or nb.get("related")):
+                                st.caption("No edges yet.")
                 if st.session_state.get("graph_pin_id"):
                     st.info(f"Pinned for attention: `{st.session_state['graph_pin_id']}`")
             elif search_q.strip():
@@ -760,6 +788,10 @@ if st.session_state.prom is not None:
             st.caption("heart / breath / tension / sweat / gut / energy / warmth — not hormones.")
             st.json(prom.bio.get_raw_variables())
 
+            st.subheader("Fast modulators (hidden — Debug only)")
+            if hasattr(prom, "get_modulator_report"):
+                st.caption("Salience / encode / alert / settle → gates + body gusts; mind does not see these names.")
+                st.json(prom.get_modulator_report())
             st.subheader("Hormonal State (hidden motor — Debug only, not cognition)")
             st.json({k: round(v, 4) for k, v in prom.bio._hormones.items()})
 
