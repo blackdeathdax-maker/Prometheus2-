@@ -16,6 +16,7 @@ from .focus import FocusModule
 from .somatic_topo import SomaticTopo
 from .felt_anchors import FeltAnchorStore
 from .modulators import FastModulators
+from .long_term_interest import LongTermInterest
 from .schema_felt import SchemaFeltBinder
 from .sensory import SensoryModule
 from .association import AssociationEngine
@@ -210,11 +211,16 @@ class Prometheus:
         self.stimulus = SyntheticStimulusEngine(self.bio, self.archivist, self.reflector)
         self.working_memory = WorkingMemoryModule(self.archivist, self.synthesizer)
         self.self_narrative = NarrativeModule(self.archivist, self.synthesizer)
+        try:
+            self.self_narrative.load()
+        except Exception:
+            pass
         self.focus = FocusModule()
         self.working_memory.focus = self.focus  # §13.y WM consumer hook
         self.somatic_topo = SomaticTopo()
         self.felt_anchors = FeltAnchorStore()
         self.modulators = FastModulators()
+        self.long_term_interest = LongTermInterest()
         self.schema_felt = SchemaFeltBinder(threshold=3)
         self.last_collapse_summary = {"collapsed": 0, "conflicts": 0, "candidates_considered": 0}
         self.last_focus_summary = {}
@@ -1290,6 +1296,14 @@ class Prometheus:
                 weights = [w * 2.5 if n == fid else w for n, w in zip(pool, weights)]
         except Exception:
             pass
+        try:
+            if hasattr(self, "long_term_interest"):
+                weights = [
+                    w * self.long_term_interest.curiosity_multiplier(n)
+                    for n, w in zip(pool, weights)
+                ]
+        except Exception:
+            pass
         # §13.y: sticky focus / residual neighbourhood bias
         weights = [w * self.focus.self_study_weight(n) for n, w in zip(pool, weights)]
         return random.choices(pool, weights=weights, k=1)[0]
@@ -1536,6 +1550,11 @@ class Prometheus:
                         out.add(n)
             except Exception:
                 pass
+        # Long-term themes orient neighborhood without global lottery
+        if hasattr(self, "long_term_interest"):
+            for tid in list(self.long_term_interest.theme_ids())[: max(8, cap // 4)]:
+                if tid in graph:
+                    out.add(tid)
         return out
 
     def search_graph(self, query: str, limit: int = 40) -> list:
@@ -1579,6 +1598,11 @@ class Prometheus:
         if hasattr(self, "modulators"):
             amt = float(amt) * float(self.modulators.residual_gain())
         self.focus.boost_residual(node_id, amount=amt)
+
+    def get_long_term_interest_report(self) -> dict:
+        if hasattr(self, "long_term_interest"):
+            return self.long_term_interest.report()
+        return {}
 
     def get_modulator_report(self) -> dict:
         if hasattr(self, "modulators"):
@@ -1742,6 +1766,40 @@ class Prometheus:
         print(f"Consolidation: §13.4 collapse {collapse_summary}")
         if narrative_summary.get("created") or narrative_summary.get("absorbed") or narrative_summary.get("pruned"):
             print(f"Consolidation: Self-Narrative {narrative_summary}")
+
+        # Long-term interest: promote recurring focus/narrative/parental into themes
+        if hasattr(self, "long_term_interest"):
+            residual_totals = {}
+            try:
+                residual_totals = {k: float(v) for k, v in self.focus.top_residuals(30)}
+            except Exception:
+                residual_totals = {}
+            parental_nodes = []
+            try:
+                for n, d in self.archivist.graph.nodes(data=True):
+                    if d.get("last_parental_reaction"):
+                        parental_nodes.append(n)
+            except Exception:
+                pass
+            felt_bound = []
+            try:
+                for n, d in self.archivist.graph.nodes(data=True):
+                    if d.get("primary_felt_anchor"):
+                        felt_bound.append(n)
+            except Exception:
+                pass
+            lti_summary = self.long_term_interest.promote(
+                focus_id=getattr(self.focus, "focus_id", None),
+                residual_totals=residual_totals,
+                narrative_elements=getattr(self.self_narrative, "elements", {}),
+                parental_nodes=parental_nodes[:20],
+                felt_bound_schemas=felt_bound[:30],
+            )
+            print(f"Consolidation: long-term interest {lti_summary}")
+            try:
+                self.long_term_interest.save()
+            except Exception as e:
+                print(f"LTI save failed: {e}")
 
     # ------------------------------------------------------------------
     # §4 Regulation
@@ -1976,6 +2034,11 @@ class Prometheus:
                 self.modulators.save_state()
             except Exception as e:
                 print(f"modulators save failed: {e}")
+        if hasattr(self, "long_term_interest"):
+            try:
+                self.long_term_interest.save()
+            except Exception as e:
+                print(f"LTI save failed: {e}")
         self.save_runtime_state()
 
     def load_extended_state(self) -> None:
@@ -2030,6 +2093,7 @@ class Prometheus:
             os.path.join(data_dir, "schema_felt.json"),
             os.path.join(data_dir, "somatic_topo.json"),
             os.path.join(data_dir, "modulators_state.json"),
+            os.path.join(data_dir, "long_term_interest.json"),
             CO_ACTIVATION_PATH,
         ]
         removed = []
