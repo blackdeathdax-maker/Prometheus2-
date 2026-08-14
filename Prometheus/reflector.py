@@ -6,7 +6,7 @@ from typing import Dict, List, Optional
 
 import networkx as nx
 
-from .archivist import SELF_NODE, TIER_PROVISIONAL, TIER_WORKING
+from .archivist import SELF_NODE, TIER_PROVISIONAL, TIER_WORKING, TIER_TRUSTED
 from .edge_types import (
     RELATIONAL_EDGE_TYPES, EDGE_COMPOSED_OF, EDGE_IS_A, NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA,
 )
@@ -836,6 +836,257 @@ class ReflectorModule:
             graph.remove_node(node)
             collapsed += 1
         return collapsed
+
+    # ------------------------------------------------------------------
+    # Hierarchical stacking (Tier 2+) and schema promotion — new
+    # ------------------------------------------------------------------
+    # Tier 1 = schemas whose members are ordinary nodes (abstraction_level=1).
+    # Tier 2 = schemas whose members are themselves schemas (or a mix with
+    # majority schema members). Higher levels follow the same rule.
+    # Deterministic: connected components over co-activation among schema
+    # nodes, plus shared dominant parent when available. Naming still
+    # earned (never invented).
+    TIER2_MIN_SCHEMA_MEMBERS = 2
+    SCHEMA_PROMOTE_MIN_MEMBERS = 4
+    SCHEMA_PROMOTE_MIN_COHERENCE = 0.30
+    SCHEMA_PROMOTE_MIN_CYCLES = 3   # consolidations as named+stable before Trusted
+
+    def detect_epistemic_tier2(self) -> List[str]:
+        """Form higher-abstraction schemas from co-active Tier-1 (or higher)
+        epistemic schemas. Returns newly created higher-level schema ids.
+
+        A Tier-2 schema is created when >= TIER2_MIN_SCHEMA_MEMBERS existing
+        epistemic schemas co-activate (via the same stabilized co-activation
+        pairs already used for Tier 1) and pass coherence. Members of the
+        new schema are the lower schemas themselves (composed-of), not their
+        leaf nodes — stacking, not flattening.
+        """
+        graph = self.archivist.graph
+        schema_ids = [
+            n for n, d in graph.nodes(data=True)
+            if d.get("node_type") == NODE_EPISTEMIC_SCHEMA
+            and int(d.get("abstraction_level", 1) or 1) >= 1
+            and d.get("tier", TIER_PROVISIONAL) >= TIER_WORKING
+        ]
+        if len(schema_ids) < self.TIER2_MIN_SCHEMA_MEMBERS:
+            return []
+
+        pairs = self.archivist.stabilized_co_activation_pairs()
+        # Restrict co-activation graph to schema nodes only
+        schema_set = set(schema_ids)
+        schema_pairs = [(a, b) for a, b in pairs if a in schema_set and b in schema_set]
+        if not schema_pairs:
+            # Fallback: schemas that share a dominant parent or overlapping
+            # member neighborhoods count as weakly co-located
+            parent_groups: Dict[str, List[str]] = {}
+            for sid in schema_ids:
+                parent = graph.nodes[sid].get("candidate_parent") or graph.nodes[sid].get("definition")
+                if parent:
+                    parent_groups.setdefault(str(parent), []).append(sid)
+            created = []
+            for parent, group in parent_groups.items():
+                if len(group) < self.TIER2_MIN_SCHEMA_MEMBERS:
+                    continue
+                created.extend(self._form_tier2_schema(group, dominant_parent=parent))
+            return created
+
+        co_graph = nx.Graph()
+        co_graph.add_edges_from(schema_pairs)
+        created = []
+        for component in nx.connected_components(co_graph):
+            members = sorted(component)
+            if len(members) < self.TIER2_MIN_SCHEMA_MEMBERS:
+                continue
+            # Coherence among schema members: use their names/definitions
+            coh = self.cluster_coherence(members)
+            if coh < self.EPISTEMIC_MIN_COHERENCE * 0.7:  # slightly softer for meta-clusters
+                continue
+            dominant_parent, _cov = self._dominant_parent(
+                # expand one level of leaves for parent detection
+                self._expand_schema_members(members)
+            )
+            created.extend(self._form_tier2_schema(members, dominant_parent=dominant_parent))
+        return created
+
+    def _expand_schema_members(self, schema_ids: List[str]) -> List[str]:
+        """One level of composed-of leaves under the given schemas."""
+        graph = self.archivist.graph
+        leaves = []
+        for sid in schema_ids:
+            for _u, v, ed in graph.out_edges(sid, data=True):
+                if ed.get("relation_type") == EDGE_COMPOSED_OF:
+                    leaves.append(v)
+        return leaves
+
+    def _form_tier2_schema(self, member_schemas: List[str], dominant_parent: Optional[str] = None) -> List[str]:
+        """Create or grow one higher-level epistemic schema whose members
+        are the given lower schemas. Sets abstraction_level = max(child)+1.
+        """
+        graph = self.archivist.graph
+        if len(member_schemas) < self.TIER2_MIN_SCHEMA_MEMBERS:
+            return []
+
+        levels = [
+            int(graph.nodes.get(m, {}).get("abstraction_level", 1) or 1)
+            for m in member_schemas if m in graph
+        ]
+        if not levels:
+            return []
+        new_level = max(levels) + 1
+        # Cap stacking depth to avoid runaway towers in early runs
+        if new_level > 4:
+            return []
+
+        if dominant_parent:
+            cluster_id = f"epistemic_L{new_level}_of_{_slug_id_fragment(str(dominant_parent))}"
+        else:
+            digest = hashlib.sha1("|".join(sorted(member_schemas)).encode()).hexdigest()[:8]
+            cluster_id = f"epistemic_L{new_level}_{digest}"
+
+        if cluster_id in graph:
+            existing = {
+                v for _u, v, ed in graph.out_edges(cluster_id, data=True)
+                if ed.get("relation_type") == EDGE_COMPOSED_OF
+            }
+            added = 0
+            for m in member_schemas:
+                if m not in existing and m in graph:
+                    graph.add_edge(
+                        cluster_id, m, relation_type=EDGE_COMPOSED_OF,
+                        source="schema", placement="explicit",
+                        created_at=datetime.now().isoformat(),
+                    )
+                    added += 1
+            if added:
+                graph.nodes[cluster_id]["member_count"] = len(existing) + added
+                graph.nodes[cluster_id]["last_reinforced"] = datetime.now()
+            return []
+
+        graph.add_node(
+            cluster_id,
+            source="schema",
+            tier=TIER_WORKING,
+            last_reinforced=datetime.now(),
+            regulatory_efficacy=0.5,
+            tier0_cycles=0,
+            activation=0.0,
+            valence_coloring=0.0,
+            node_type=NODE_EPISTEMIC_SCHEMA,
+            abstraction_level=new_level,
+            member_count=len(member_schemas),
+            name=None,
+            named=False,
+            unnamed_cycles=0,
+            candidate_parent=dominant_parent,
+            definition=dominant_parent,
+            is_meta_schema=True,
+        )
+        for m in member_schemas:
+            if m in graph:
+                graph.add_edge(
+                    cluster_id, m, relation_type=EDGE_COMPOSED_OF,
+                    source="schema", placement="explicit",
+                    created_at=datetime.now().isoformat(),
+                )
+        return [cluster_id]
+
+    def promote_stable_schemas(self) -> Dict[str, int]:
+        """Promote named, coherent, sufficiently large epistemic schemas
+        from Working → Trusted, and reinforce hierarchy edges to their
+        dominant parent when one exists. Returns counts.
+        """
+        graph = self.archivist.graph
+        promoted = 0
+        parent_linked = 0
+        for node, data in list(graph.nodes(data=True)):
+            if data.get("node_type") != NODE_EPISTEMIC_SCHEMA:
+                continue
+            if data.get("tier", TIER_PROVISIONAL) >= TIER_TRUSTED:
+                # still try parent link
+                pass
+            else:
+                members = [
+                    v for _u, v, ed in graph.out_edges(node, data=True)
+                    if ed.get("relation_type") == EDGE_COMPOSED_OF
+                ]
+                named = bool(data.get("named"))
+                coh = float(data.get("last_coherence") or self.cluster_coherence(members) if members else 0)
+                stable_cycles = int(data.get("stable_named_cycles", 0))
+                if named:
+                    data["stable_named_cycles"] = stable_cycles + 1
+                    stable_cycles += 1
+                else:
+                    data["stable_named_cycles"] = 0
+                    continue
+
+                if (
+                    len(members) >= self.SCHEMA_PROMOTE_MIN_MEMBERS
+                    and coh >= self.SCHEMA_PROMOTE_MIN_COHERENCE
+                    and stable_cycles >= self.SCHEMA_PROMOTE_MIN_CYCLES
+                ):
+                    data["tier"] = TIER_TRUSTED
+                    data["last_reinforced"] = datetime.now()
+                    promoted += 1
+
+            # Stack under dominant parent if missing is-a / associated link
+            parent = data.get("candidate_parent") or data.get("definition")
+            if parent and parent in graph:
+                has_up = any(
+                    ed.get("relation_type") in (EDGE_IS_A, "associated-with", EDGE_COMPOSED_OF)
+                    for _u, v, ed in graph.out_edges(node, data=True)
+                    if v == parent
+                ) or any(
+                    ed.get("relation_type") == EDGE_IS_A
+                    for u, _v, ed in graph.in_edges(node, data=True)
+                    if u == parent
+                )
+                if not has_up:
+                    # schema is-a parent concept when parent covers it
+                    graph.add_edge(
+                        node, parent, relation_type=EDGE_IS_A,
+                        source="schema", placement="explicit",
+                        created_at=datetime.now().isoformat(),
+                    )
+                    parent_linked += 1
+        return {"promoted_to_trusted": promoted, "parent_links_added": parent_linked}
+
+    def hierarchy_report(self, top_n: int = 15) -> Dict:
+        """Diagnostic: abstraction levels, named/trusted counts, sample stack."""
+        graph = self.archivist.graph
+        by_level: Dict[int, int] = {}
+        named = trusted = total = 0
+        samples = []
+        for n, d in graph.nodes(data=True):
+            if d.get("node_type") != NODE_EPISTEMIC_SCHEMA:
+                continue
+            total += 1
+            lvl = int(d.get("abstraction_level", 1) or 1)
+            by_level[lvl] = by_level.get(lvl, 0) + 1
+            if d.get("named"):
+                named += 1
+            if d.get("tier", 0) >= TIER_TRUSTED:
+                trusted += 1
+            members = [
+                v for _u, v, ed in graph.out_edges(n, data=True)
+                if ed.get("relation_type") == EDGE_COMPOSED_OF
+            ]
+            samples.append({
+                "id": n,
+                "level": lvl,
+                "named": bool(d.get("named")),
+                "name": d.get("name"),
+                "tier": d.get("tier"),
+                "members": len(members),
+                "parent": d.get("candidate_parent") or d.get("definition"),
+            })
+        samples.sort(key=lambda r: (-r["level"], -r["members"]))
+        return {
+            "total_epistemic_schemas": total,
+            "by_abstraction_level": dict(sorted(by_level.items())),
+            "named": named,
+            "trusted": trusted,
+            "top": samples[:top_n],
+        }
 
     @staticmethod
     def _epistemic_cluster_id(members: List[str], dominant_parent: Optional[str] = None) -> str:
