@@ -26,6 +26,10 @@ try:
     from .others import OthersRegistry
 except ImportError:
     OthersRegistry = None  # optional until others.py is deployed
+try:
+    from .goals import GoalModule
+except ImportError:
+    GoalModule = None
 
 
 
@@ -229,6 +233,7 @@ class Prometheus:
         self.long_term_interest = LongTermInterest()
         self.schema_felt = SchemaFeltBinder(threshold=3)
         self.others = OthersRegistry(self.archivist) if OthersRegistry is not None else None
+        self.goals = GoalModule() if GoalModule is not None else None
         self.last_collapse_summary = {"collapsed": 0, "conflicts": 0, "candidates_considered": 0}
         self.last_focus_summary = {}
         self.last_hierarchy_summary = {}
@@ -958,6 +963,29 @@ class Prometheus:
             pulse=self.pulse_count,
             basin_anchor_set=basin_anchors,
         )
+        # Explicit commitments (contentful substrate)
+        if getattr(self, "goals", None) is not None:
+            try:
+                fid = self.focus.focus_id
+                self.goals.observe_focus(fid, self.pulse_count)
+                fs = self.last_focus_summary or {}
+                summary = self.goals.tick(
+                    pulse=self.pulse_count,
+                    focus_id=fid,
+                    residual_fn=lambda n: self.focus.total_residual(n),
+                    stagnation=bool(fs.get("stagnation_escape")),
+                    force_switch=bool(fs.get("force_switch") or fs.get("hard_age_escape")),
+                    graph=self.archivist.graph,
+                )
+                # Inject commitment residual into focus store
+                for tid in self.goals.active_target_ids():
+                    boost = self.goals.commitment_boost(tid)
+                    if boost > 0:
+                        self.focus.boost_residual(tid, amount=min(1.2, boost * 0.35))
+                if summary.get("satisfied") or summary.get("failed"):
+                    print(f"Goals: {summary}")
+            except Exception as e:
+                logger.warning("goals tick failed: %s", e)
 
         results = self.archivist.retrieve("context")
 
@@ -1749,7 +1777,13 @@ class Prometheus:
             amt = float(amt) * float(self.modulators.residual_gain())
         self.focus.boost_residual(node_id, amount=amt)
 
+    def get_goals_report(self) -> dict:
+        if getattr(self, "goals", None) is not None:
+            return self.goals.report()
+        return {}
+
     def get_others_report(self) -> dict:
+
         if hasattr(self, "others"):
             return self.others.report()
         return {}
@@ -1945,6 +1979,11 @@ class Prometheus:
             logger.warning("Could not compute working-memory protection set for collapse pass: %s", e)
         # §13.y: current sticky focus never collapses while active
         protected_nodes |= self.focus.protected_ids()
+        if getattr(self, "goals", None) is not None:
+            try:
+                protected_nodes |= set(self.goals.active_target_ids())
+            except Exception:
+                pass
 
         # §13.y Piece D: update schema expected_families before collapse densifies parents
         n_exp = self.focus.update_expected_families(self.archivist.graph)
@@ -2313,11 +2352,16 @@ class Prometheus:
                 self.long_term_interest.save()
             except Exception as e:
                 print(f"LTI save failed: {e}")
-        if hasattr(self, "others"):
+        if hasattr(self, "others") and self.others is not None:
             try:
                 self.others.save_state(self._others_path())
             except Exception as e:
                 print(f"others save failed: {e}")
+        if getattr(self, "goals", None) is not None:
+            try:
+                self.goals.save()
+            except Exception as e:
+                print(f"goals save failed: {e}")
         self.save_runtime_state()
 
     def load_extended_state(self) -> None:
@@ -2343,11 +2387,16 @@ class Prometheus:
                 self.modulators.load_state()
             except Exception as e:
                 print(f"modulators load failed: {e}")
-        if hasattr(self, "others"):
+        if hasattr(self, "others") and self.others is not None:
             try:
                 self.others.load_state(self._others_path())
             except Exception as e:
                 print(f"others load failed: {e}")
+        if getattr(self, "goals", None) is not None:
+            try:
+                self.goals.load()
+            except Exception as e:
+                print(f"goals load failed: {e}")
         self.load_runtime_state()
 
 
