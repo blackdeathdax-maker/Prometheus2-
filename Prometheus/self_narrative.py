@@ -339,7 +339,12 @@ class NarrativeModule:
             "formed_at": now,
             "last_reinforced_at": now,
             "absorbed_from": [],
+            "predecessors": [],   # narrative chain: earlier related elements
+            "successors": [],     # narrative chain: later related elements
         }
+        # Attempt light chaining: link to recent high-weight elements that
+        # share a node or are the same type (deterministic co-occurrence).
+        self._try_chain(eid)
         return True
 
     def _evict_lowest_weight(self):
@@ -591,6 +596,135 @@ class NarrativeModule:
             ],
         }
 
+
+    # ------------------------------------------------------------------
+    # Narrative chaining + retrieval (new)
+    # ------------------------------------------------------------------
+    CHAIN_MAX_LINKS = 4          # max predecessors/successors per element
+    CHAIN_MIN_WEIGHT = 1.5       # only chain to elements above this weight
+    CHAIN_RECENCY_WINDOW = 12    # only consider elements reinforced recently (pass count proxy via weight)
+
+    def _try_chain(self, new_eid: str) -> None:
+        """Link a newly created/reinforced element to a few related prior
+        elements that share linked_nodes or element_type. Deterministic,
+        no embeddings. Builds short autobiographical chains.
+        """
+        if new_eid not in self.elements:
+            return
+        new_el = self.elements[new_eid]
+        new_nodes = set(new_el["linked_nodes"])
+        candidates = []
+        for eid, el in self.elements.items():
+            if eid == new_eid:
+                continue
+            if el.get("weight", 0) < self.CHAIN_MIN_WEIGHT:
+                continue
+            shared = new_nodes.intersection(el.get("linked_nodes") or [])
+            type_match = 1.0 if el.get("element_type") == new_el.get("element_type") else 0.0
+            score = len(shared) * 2.0 + type_match + min(el["weight"], 5.0) * 0.15
+            if score >= 1.0:
+                candidates.append((score, eid))
+        candidates.sort(key=lambda t: -t[0])
+        for _score, pred_id in candidates[: self.CHAIN_MAX_LINKS]:
+            pred = self.elements.get(pred_id)
+            if not pred:
+                continue
+            # bidirectional soft links (lists, capped)
+            if new_eid not in pred.get("successors", []):
+                pred.setdefault("successors", []).append(new_eid)
+                pred["successors"] = pred["successors"][-self.CHAIN_MAX_LINKS:]
+            if pred_id not in new_el.get("predecessors", []):
+                new_el.setdefault("predecessors", []).append(pred_id)
+                new_el["predecessors"] = new_el["predecessors"][-self.CHAIN_MAX_LINKS:]
+
+    def retrieve_for_focus(
+        self,
+        focus_id: Optional[str] = None,
+        basin_anchors: Optional[List[str]] = None,
+        top_k: int = 5,
+    ) -> List[dict]:
+        """Return the most relevant narrative elements for current focus /
+        basin anchors. Used by focus residual seeding and LTI promotion.
+        Ranking = weight * (1 + shared_nodes + chain_bonus).
+        """
+        seed_nodes = set()
+        if focus_id:
+            seed_nodes.add(focus_id)
+        for n in basin_anchors or []:
+            seed_nodes.add(n)
+        if not seed_nodes and not self.elements:
+            return []
+
+        scored = []
+        for eid, el in self.elements.items():
+            w = float(el.get("weight") or 0)
+            if w < 0.5:
+                continue
+            linked = set(el.get("linked_nodes") or [])
+            shared = len(linked & seed_nodes)
+            # chain bonus: if any predecessor/successor also touches seed
+            chain_hit = 0
+            for other_id in (el.get("predecessors") or []) + (el.get("successors") or []):
+                other = self.elements.get(other_id)
+                if other and set(other.get("linked_nodes") or []) & seed_nodes:
+                    chain_hit += 1
+            score = w * (1.0 + shared * 1.5 + min(chain_hit, 3) * 0.4)
+            if score <= 0:
+                continue
+            scored.append((score, {
+                "element_id": eid,
+                "element_type": el.get("element_type"),
+                "linked_nodes": list(linked),
+                "weight": round(w, 3),
+                "score": round(score, 3),
+                "predecessors": list(el.get("predecessors") or []),
+                "successors": list(el.get("successors") or []),
+            }))
+        scored.sort(key=lambda t: -t[0])
+        return [row for _s, row in scored[:top_k]]
+
+    def retrieval_node_ids(
+        self,
+        focus_id: Optional[str] = None,
+        basin_anchors: Optional[List[str]] = None,
+        top_k: int = 8,
+    ) -> List[str]:
+        """Flattened unique graph node ids from retrieve_for_focus, for
+        easy merge into focus residual boosts or LTI promotion."""
+        rows = self.retrieve_for_focus(focus_id, basin_anchors, top_k=top_k)
+        out = []
+        seen = set()
+        for row in rows:
+            for n in row.get("linked_nodes") or []:
+                if n not in seen and n in self.archivist.graph:
+                    seen.add(n)
+                    out.append(n)
+        return out
+
+    def chain_report(self, top_n: int = 10) -> dict:
+        """Diagnostic: elements that participate in chains."""
+        chained = [
+            el for el in self.elements.values()
+            if el.get("predecessors") or el.get("successors")
+        ]
+        chained.sort(key=lambda e: -float(e.get("weight") or 0))
+        return {
+            "chained_count": len(chained),
+            "total_elements": len(self.elements),
+            "top": [
+                {
+                    "element_id": el["element_id"],
+                    "type": el.get("element_type"),
+                    "weight": round(float(el.get("weight") or 0), 3),
+                    "predecessors": el.get("predecessors") or [],
+                    "successors": el.get("successors") or [],
+                    "linked_nodes": el.get("linked_nodes") or [],
+                }
+                for el in chained[:top_n]
+            ],
+        }
+
+
     # ------------------------------------------------------------------
     # Persistence (§16.8) -- same JSON-per-module pattern as archivist.py/
     # synthesizer.py/chronos.py, checkpointed once at end-of-Consolidation
@@ -624,6 +758,10 @@ class NarrativeModule:
             with open(NARRATIVE_STATE_PATH, "r") as f:
                 data = json.load(f)
             self.elements = data.get("elements", {})
+            # Migration: older saves lack chain fields
+            for el in self.elements.values():
+                el.setdefault("predecessors", [])
+                el.setdefault("successors", [])
             for k_str, v in data.get("relational_recurrence", {}).items():
                 target, rels = k_str.split("||")
                 rel_set = frozenset(rels.split("|")) if rels else frozenset()

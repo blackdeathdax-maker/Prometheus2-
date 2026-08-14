@@ -48,8 +48,14 @@ class LongTermInterest:
         narrative_elements: Optional[dict] = None,
         parental_nodes: Optional[List[str]] = None,
         felt_bound_schemas: Optional[List[str]] = None,
+        narrative_retrieval_nodes: Optional[List[str]] = None,
     ) -> dict:
-        """Consolidation-time: short-term heat → long-term theme weight."""
+        """Consolidation-time: short-term heat → long-term theme weight.
+
+        narrative_retrieval_nodes: optional ranked nodes from
+        NarrativeModule.retrieval_node_ids() — get a stronger, focus-
+        conditioned boost so autobiographical chains feed LTI.
+        """
         residual_totals = residual_totals or {}
         promoted = 0
         reinforced = 0
@@ -79,6 +85,12 @@ class LongTermInterest:
                     continue
                 for n in el.get("linked_nodes") or []:
                     bump(n, self.BOOST_FROM_NARRATIVE * min(1.0, w / 5.0))
+
+        # Focus-conditioned narrative retrieval (chained elements) — stronger
+        for i, n in enumerate(narrative_retrieval_nodes or []):
+            # earlier ranks get slightly more boost
+            rank_scale = max(0.4, 1.0 - i * 0.08)
+            bump(n, self.BOOST_FROM_NARRATIVE * 1.4 * rank_scale)
 
         for n in parental_nodes or []:
             bump(n, self.BOOST_FROM_PARENTAL)
