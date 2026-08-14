@@ -25,15 +25,15 @@ SCHEMA_STABILIZATION_THRESHOLD = 3
 
 # §13.3, new: epistemic (knowledge-cluster) schema formation. Same
 # tuning-placeholder status as everything else in this design (§10).
-EPISTEMIC_MIN_CLUSTER_SIZE = 3
+EPISTEMIC_MIN_CLUSTER_SIZE = 4
 EPISTEMIC_NAME_MIN_COVERAGE = 2  # how many cluster members a parsed is-a parent must cover before it's recognized as earning the cluster's name (§13.3.1)
 
 # Schema quality gates (repair pass — sense before promotion)
-EPISTEMIC_MIN_COHERENCE = 0.22          # mean pairwise token/hypernym overlap
-EPISTEMIC_MIN_LEMMA_RATIO = 0.5         # fraction of members that look like lemmas not sentences
+EPISTEMIC_MIN_COHERENCE = 0.35          # mean pairwise token/hypernym overlap
+EPISTEMIC_MIN_LEMMA_RATIO = 0.65         # fraction of members that look like lemmas not sentences
 EPISTEMIC_NAME_MIN_FREQ = 1             # times a candidate label appears as member-ish
-EPISTEMIC_NAME_MIN_CONTEXTS = 2         # distinct sources or basins before naming
-EPISTEMIC_UNNAMED_MAX_CYCLES = 8        # consolidations unnamed+stagnant → dissolve wrapper
+EPISTEMIC_NAME_MIN_CONTEXTS = 3         # distinct sources or basins before naming
+EPISTEMIC_UNNAMED_MAX_CYCLES = 5        # consolidations unnamed+stagnant → dissolve wrapper
 
 # §13 naming hygiene: graph node *ids* must stay short/stable; human-readable
 # glosses live on attributes (name / definition), not in the id string.
@@ -300,13 +300,15 @@ class ReflectorModule:
         if not label or label in (SELF_NODE,):
             return False
         s = str(label).strip()
-        if len(s) > 40:
+        if len(s) > 28:
             return False
         words = s.split()
-        if len(words) > 3:
+        if len(words) > 2:
             return False
         low = s.lower()
-        if low.startswith(("i ", "i'", "it was", "it is", "she ", "he ", "they ")):
+        if low.startswith(("i ", "i'", "it was", "it is", "she ", "he ", "they ",
+                            "we ", "you ", "this ", "that ", "there ", "because ",
+                            "when ", "what ", "how ", "why ")):
             return False
         if s.startswith("epistemic_") or s.startswith("schema_") or s.startswith("felt_"):
             return False
@@ -593,6 +595,36 @@ class ReflectorModule:
         return dissolved
 
 
+    def prune_garbage_epistemic_schemas(self) -> int:
+        """Remove low-quality epistemic schemas: low coherence, low lemma ratio,
+        or majority sentence-like members. Members are left intact.
+        """
+        graph = self.archivist.graph
+        removed = 0
+        for node in list(graph.nodes()):
+            data = graph.nodes.get(node, {})
+            if data.get("node_type") != NODE_EPISTEMIC_SCHEMA:
+                continue
+            members = [
+                v for _u, v, ed in graph.out_edges(node, data=True)
+                if ed.get("relation_type") == EDGE_COMPOSED_OF
+            ]
+            if not members:
+                graph.remove_node(node)
+                removed += 1
+                continue
+            coh = self.cluster_coherence(members)
+            lr = self.lemma_ratio(members)
+            bad = (
+                (not data.get("named") and coh < self.EPISTEMIC_MIN_COHERENCE * 0.85)
+                or lr < self.EPISTEMIC_MIN_LEMMA_RATIO * 0.9
+                or len(members) < 2
+            )
+            if bad:
+                graph.remove_node(node)
+                removed += 1
+        return removed
+
     def detect_epistemic_clusters(self) -> List[str]:
         """
         Groups nodes whose co-activation has stabilized (archivist.
@@ -685,6 +717,17 @@ class ReflectorModule:
             if coh < self.EPISTEMIC_MIN_COHERENCE:
                 continue
             if lr < self.EPISTEMIC_MIN_LEMMA_RATIO:
+                continue
+            # Reject clusters dominated by long / self_generated sentence nodes
+            sentenceish = 0
+            for m in members:
+                md = graph.nodes.get(m, {})
+                lab = str(m)
+                if md.get("source") == "self_generated" and len(lab.split()) > 2:
+                    sentenceish += 1
+                elif len(lab) > 40 or len(lab.split()) > 4:
+                    sentenceish += 1
+            if sentenceish / max(1, len(members)) > 0.4:
                 continue
 
             cluster_id = self._epistemic_cluster_id(members, dominant_parent)

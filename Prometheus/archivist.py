@@ -81,7 +81,7 @@ ACTIVATION_CAP = 10.0
 # Consolidation, same clock as everything else, same shape as activation
 # decay and basin dwell-time decay -- "one clock, not several."
 CO_ACTIVATION_DECAY_RATE = 0.6
-CO_ACTIVATION_STABILIZATION_THRESHOLD = 3  # same tuning-placeholder category as §10 everywhere else
+CO_ACTIVATION_STABILIZATION_THRESHOLD = 5  # stricter: fewer garbage clusters from casual co-touch
 CO_ACTIVATION_PRUNE_FLOOR = 0.2  # below this after decay, drop the pair entirely -- same shape as synthesizer.py's basin DESTABILIZATION_FLOOR
 
 # §13.4 Graph Collapse & Abstraction Layer -- starter placeholders per
