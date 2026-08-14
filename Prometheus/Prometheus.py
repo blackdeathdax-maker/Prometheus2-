@@ -18,6 +18,7 @@ from .felt_anchors import FeltAnchorStore
 from .modulators import FastModulators
 from .long_term_interest import LongTermInterest
 from .schema_felt import SchemaFeltBinder
+from .others import OthersRegistry
 from .sensory import SensoryModule
 from .association import AssociationEngine
 from .stimulus import SyntheticStimulusEngine
@@ -222,8 +223,11 @@ class Prometheus:
         self.modulators = FastModulators()
         self.long_term_interest = LongTermInterest()
         self.schema_felt = SchemaFeltBinder(threshold=3)
+        self.others = OthersRegistry(self.archivist)
         self.last_collapse_summary = {"collapsed": 0, "conflicts": 0, "candidates_considered": 0}
         self.last_focus_summary = {}
+        self.last_hierarchy_summary = {}
+        self.last_tier2_created = []
 
         # Barren self-study targets that fell out of dead-end detection's
         # proxy check (§14.6 item 2) need the same tracking self-study's
@@ -559,9 +563,20 @@ class Prometheus:
         if node and source in ("user", "dictionary"):
             self.association.try_name_schemas(node, current_felt_state=felt_state)
 
+        # Named others (multi-entity social layer)
+        other_ids = []
+        if hasattr(self, "others") and source in ("user", "dictionary"):
+            try:
+                other_ids = self.others.process_text(text, pulse=self.pulse_count)
+            except Exception as e:
+                logger.warning("others.process_text failed: %s", e)
+
         relations = self.sensory.detect_relational(text)
-        if relations:
-            self.association.link_relational(node, relations, source=source, felt_state=felt_state)
+        if relations and node:
+            self.association.link_relational(
+                node, relations, source=source, felt_state=felt_state,
+                other_ids=other_ids or None,
+            )
 
         if felt_state != "Unformed" and node:
             self.chronos.record_felt_state_link(basin_key, node)
@@ -839,6 +854,12 @@ class Prometheus:
         # synthesizer must run first, before anything that conditions a
         # decision on its output (regulation trigger, executive bias).
         self.synthesizer.update_from_core(body)
+        # Mixed-affect conflict → fast modulators (alert up, settle down)
+        if hasattr(self, "modulators") and hasattr(self.synthesizer, "get_conflict_score"):
+            try:
+                self.modulators.apply_conflict(self.synthesizer.get_conflict_score())
+            except Exception as e:
+                logger.warning("apply_conflict failed: %s", e)
         self.somatic_topo.record(self.synthesizer.get_current_basin_key())
         self.felt_anchors.observe(
             self.synthesizer.get_current_basin_key(),
@@ -1622,6 +1643,34 @@ class Prometheus:
             amt = float(amt) * float(self.modulators.residual_gain())
         self.focus.boost_residual(node_id, amount=amt)
 
+    def get_others_report(self) -> dict:
+        if hasattr(self, "others"):
+            return self.others.report()
+        return {}
+
+    def get_hierarchy_report(self) -> dict:
+        if hasattr(self, "last_hierarchy_summary") and self.last_hierarchy_summary:
+            return self.last_hierarchy_summary
+        if hasattr(self.reflector, "hierarchy_report"):
+            try:
+                return self.reflector.hierarchy_report()
+            except Exception:
+                pass
+        return {}
+
+    def get_conflict_report(self) -> dict:
+        out = {"conflict_score": 0.0, "secondary_felt": "None"}
+        try:
+            if hasattr(self.synthesizer, "get_conflict_score"):
+                out["conflict_score"] = round(float(self.synthesizer.get_conflict_score()), 3)
+            if hasattr(self.synthesizer, "get_secondary_felt_state"):
+                out["secondary_felt"] = self.synthesizer.get_secondary_felt_state()
+            if hasattr(self, "modulators") and hasattr(self.modulators, "report"):
+                out["modulators"] = self.modulators.report()
+        except Exception:
+            pass
+        return out
+
     def get_long_term_interest_report(self) -> dict:
         if hasattr(self, "long_term_interest"):
             return self.long_term_interest.report()
@@ -1706,6 +1755,24 @@ class Prometheus:
         merged_names = self.reflector.merge_schemas_sharing_name()
         print(f"Consolidation: merged same-name schemas {merged_names}")
         expired_epistemic = self.reflector.expire_unnamed_epistemic_schemas()
+
+        # Hierarchical stacking (Tier 2+) + promotion to Trusted
+        new_tier2 = []
+        promo = {}
+        try:
+            if hasattr(self.reflector, "detect_epistemic_tier2"):
+                new_tier2 = self.reflector.detect_epistemic_tier2()
+                self.last_tier2_created = list(new_tier2)
+                if new_tier2:
+                    print(f"Consolidation: tier-2+ schemas created {len(new_tier2)} {new_tier2[:5]}")
+            if hasattr(self.reflector, "promote_stable_schemas"):
+                promo = self.reflector.promote_stable_schemas()
+                print(f"Consolidation: schema promotion {promo}")
+            if hasattr(self.reflector, "hierarchy_report"):
+                self.last_hierarchy_summary = self.reflector.hierarchy_report(top_n=8)
+        except Exception as e:
+            logger.warning("Tier-2 / promote_stable_schemas failed: %s", e)
+
         bind_summary = self.schema_felt.promote(self.archivist.graph)
         print(f"Consolidation: schema-felt binds {bind_summary}")
 
@@ -1791,6 +1858,7 @@ class Prometheus:
             print(f"Consolidation: Self-Narrative {narrative_summary}")
 
         # Long-term interest: promote recurring focus/narrative/parental into themes
+        # + focus-conditioned narrative retrieval (chained autobiographical nodes)
         if hasattr(self, "long_term_interest"):
             residual_totals = {}
             try:
@@ -1811,14 +1879,53 @@ class Prometheus:
                         felt_bound.append(n)
             except Exception:
                 pass
-            lti_summary = self.long_term_interest.promote(
-                focus_id=getattr(self.focus, "focus_id", None),
+
+            focus_id = None
+            try:
+                if self.focus.thread is not None:
+                    focus_id = self.focus.thread.target_id
+                else:
+                    focus_id = getattr(self.focus, "focus_id", None)
+            except Exception:
+                focus_id = None
+
+            basin_key = self.synthesizer.get_current_basin_key()
+            anchors = list(self.felt_state_anchors.get(basin_key, []) or [])
+            retr_nodes = []
+            try:
+                if hasattr(self.self_narrative, "retrieval_node_ids"):
+                    retr_nodes = self.self_narrative.retrieval_node_ids(
+                        focus_id=focus_id, basin_anchors=anchors, top_k=8,
+                    )
+            except Exception as e:
+                logger.warning("narrative retrieval_node_ids failed: %s", e)
+
+            # Seed light focus residuals from autobiographical retrieval
+            for nid in retr_nodes[:4]:
+                try:
+                    self.focus.boost_residual(nid, amount=0.4)
+                except Exception:
+                    pass
+
+            lti_kwargs = dict(
+                focus_id=focus_id,
                 residual_totals=residual_totals,
                 narrative_elements=getattr(self.self_narrative, "elements", {}),
                 parental_nodes=parental_nodes[:20],
                 felt_bound_schemas=felt_bound[:30],
             )
-            print(f"Consolidation: long-term interest {lti_summary}")
+            # Only pass if the installed LTI supports the new arg
+            try:
+                import inspect
+                if "narrative_retrieval_nodes" in inspect.signature(
+                    self.long_term_interest.promote
+                ).parameters:
+                    lti_kwargs["narrative_retrieval_nodes"] = retr_nodes
+            except Exception:
+                pass
+
+            lti_summary = self.long_term_interest.promote(**lti_kwargs)
+            print(f"Consolidation: long-term interest {lti_summary} (narrative_retr={len(retr_nodes)})")
             try:
                 self.long_term_interest.save()
             except Exception as e:
@@ -1988,6 +2095,10 @@ class Prometheus:
         import os
         return os.path.join(self._data_dir(), "somatic_topo.json")
 
+    def _others_path(self) -> str:
+        import os
+        return os.path.join(self._data_dir(), "others_state.json")
+
     def save_runtime_state(self) -> None:
         """pulse_count / fatigue / mode — so restart continues the clock."""
         import json, os
@@ -2062,6 +2173,11 @@ class Prometheus:
                 self.long_term_interest.save()
             except Exception as e:
                 print(f"LTI save failed: {e}")
+        if hasattr(self, "others"):
+            try:
+                self.others.save_state(self._others_path())
+            except Exception as e:
+                print(f"others save failed: {e}")
         self.save_runtime_state()
 
     def load_extended_state(self) -> None:
@@ -2087,6 +2203,11 @@ class Prometheus:
                 self.modulators.load_state()
             except Exception as e:
                 print(f"modulators load failed: {e}")
+        if hasattr(self, "others"):
+            try:
+                self.others.load_state(self._others_path())
+            except Exception as e:
+                print(f"others load failed: {e}")
         self.load_runtime_state()
 
 
