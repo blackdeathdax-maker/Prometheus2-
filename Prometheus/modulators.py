@@ -8,6 +8,10 @@ Timescale stack:
 
 Opacity: cognition never reads these names. Effects appear as
 focus/encode gates and small body-channel gusts only.
+
+Extended: conflict / ambivalence from synthesizer.get_conflict_score()
+raises alert + salience and lowers settle (harder to stay locked on one
+focus while two basins compete).
 """
 from __future__ import annotations
 
@@ -48,9 +52,15 @@ class FastModulators:
     # Cap total body gust so map stays readable
     BODY_GUST_CAP = 0.18
 
+    # Conflict (ambivalence) influence — tuned as placeholders
+    CONFLICT_ALERT_GAIN = 0.35
+    CONFLICT_SALIENCE_GAIN = 0.25
+    CONFLICT_SETTLE_PENALTY = 0.40
+
     def __init__(self):
         self.levels: Dict[str, float] = dict(self.BASELINE)
         self.last_body_delta: Dict[str, float] = {}
+        self._last_conflict = 0.0
         self.load_state()
 
     def decay_toward_baseline(self) -> None:
@@ -71,6 +81,7 @@ class FastModulators:
             "sleep_exit": {"alert": 0.3, "salience": 0.2},
             "novelty": {"alert": 0.7, "salience": 0.5},
             "self_study_hit": {"encode": 0.35, "salience": 0.25},
+            "conflict": {"alert": 0.9, "salience": 0.6, "settle": -0.7},  # mixed affect
         }
         mix = table.get(event)
         if not mix:
@@ -79,6 +90,24 @@ class FastModulators:
             if k not in self.levels:
                 continue
             self.levels[k] = _clamp(self.levels[k] + w * amount)
+
+    def apply_conflict(self, conflict_score: float) -> None:
+        """Continuous ambivalence signal from synthesizer.get_conflict_score().
+        Raises alert + salience, lowers settle. Safe boundary input only.
+        """
+        c = _clamp(conflict_score)
+        self._last_conflict = c
+        if c < 0.08:
+            return
+        self.levels["alert"] = _clamp(
+            self.levels["alert"] + self.CONFLICT_ALERT_GAIN * c
+        )
+        self.levels["salience"] = _clamp(
+            self.levels["salience"] + self.CONFLICT_SALIENCE_GAIN * c
+        )
+        self.levels["settle"] = _clamp(
+            self.levels["settle"] - self.CONFLICT_SETTLE_PENALTY * c
+        )
 
     def apply_medium_bias(self, hormones: Optional[Dict[str, float]] = None) -> None:
         """Medium climate slightly biases fast baselines (not the reverse)."""
@@ -112,14 +141,16 @@ class FastModulators:
         e = self.levels.get("encode", 0.4)
         a = self.levels.get("alert", 0.3)
         t = self.levels.get("settle", 0.45)
+        # Conflict adds a little gut/tension texture
+        c = self._last_conflict
         raw = {
-            "heart_rate": 0.55 * a + 0.20 * s - 0.15 * t,
-            "breath": 0.50 * a + 0.15 * s - 0.20 * t,
-            "muscle_tension": 0.45 * a + 0.25 * s - 0.25 * t,
-            "sweat_skin": 0.40 * a + 0.20 * s,
-            "gut": 0.35 * a - 0.15 * t + 0.10 * s,
-            "energy": 0.35 * s + 0.25 * e - 0.15 * a,
-            "warmth": 0.30 * t + 0.20 * e - 0.15 * a,
+            "heart_rate": 0.55 * a + 0.20 * s - 0.15 * t + 0.15 * c,
+            "breath": 0.50 * a + 0.15 * s - 0.20 * t + 0.10 * c,
+            "muscle_tension": 0.45 * a + 0.25 * s - 0.25 * t + 0.20 * c,
+            "sweat_skin": 0.40 * a + 0.20 * s + 0.10 * c,
+            "gut": 0.35 * a - 0.15 * t + 0.10 * s + 0.25 * c,
+            "energy": 0.35 * s + 0.25 * e - 0.15 * a - 0.10 * c,
+            "warmth": 0.30 * t + 0.20 * e - 0.15 * a - 0.10 * c,
         }
         # center around 0 and cap magnitude
         out = {}
@@ -136,6 +167,7 @@ class FastModulators:
             "residual_gain": round(self.residual_gain(), 3),
             "encode_gain": round(self.encode_gain(), 3),
             "switch_cost_mult": round(self.switch_cost_mult(), 3),
+            "last_conflict": round(self._last_conflict, 3),
             "last_body_delta": {k: round(v, 3) for k, v in self.last_body_delta.items()},
         }
 

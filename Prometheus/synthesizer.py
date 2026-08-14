@@ -1,8 +1,9 @@
 from collections import defaultdict
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 import json
 import logging
 import os
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,13 @@ class SynthesizerModule:
     named Felt State. The basin map itself only changes during
     Consolidation (consolidate_basins); the per-tick lookup against it is
     cheap and live every tick, per spec.
+
+    Extended for mixed / competing affect:
+      - primary basin = nearest stabilized (or current key if unformed)
+      - secondary basin = next-nearest stabilized within a distance window
+      - conflict_score in [0, 1] when primary and secondary pull in opposing
+        valence or dominance directions. This is a legitimate boundary
+        output (already-synthesized), safe for modulators / focus / WM.
     """
 
     # Grid resolution for the dwell-time histogram. Not yet tuned per spec
@@ -49,15 +57,36 @@ class SynthesizerModule:
     # not just "untuned," it was structurally wrong.
     DESTABILIZATION_FLOOR = 0.2
 
+    # Mixed-affect / competing-basin parameters (new).
+    # Max PAD L2 distance for a second basin to count as "active competitor".
+    SECONDARY_MAX_DIST = 0.55
+    # Minimum dwell density ratio (secondary / primary) to be considered real.
+    SECONDARY_MIN_RATIO = 0.25
+    # How strongly opposing valence vs dominance contribute to conflict.
+    CONFLICT_VALENCE_WEIGHT = 0.65
+    CONFLICT_DOMINANCE_WEIGHT = 0.35
+
     def __init__(self):
         self.GRID_RESOLUTION = SynthesizerModule.GRID_RESOLUTION
         self.STABILIZATION_THRESHOLD = SynthesizerModule.STABILIZATION_THRESHOLD
         self.DECAY_RATE = SynthesizerModule.DECAY_RATE
         self.DESTABILIZATION_FLOOR = SynthesizerModule.DESTABILIZATION_FLOOR
+        self.SECONDARY_MAX_DIST = SynthesizerModule.SECONDARY_MAX_DIST
+        self.SECONDARY_MIN_RATIO = SynthesizerModule.SECONDARY_MIN_RATIO
+        self.CONFLICT_VALENCE_WEIGHT = SynthesizerModule.CONFLICT_VALENCE_WEIGHT
+        self.CONFLICT_DOMINANCE_WEIGHT = SynthesizerModule.CONFLICT_DOMINANCE_WEIGHT
+
         self.basin_grid = defaultdict(float)
         self.stabilized_basins: Dict[Tuple[float, float, float], str] = {}
         self.current_felt_state = "Unformed"
         self._current_key: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+        # Mixed-affect live state (recomputed every update_from_core)
+        self._primary_key: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._secondary_key: Optional[Tuple[float, float, float]] = None
+        self._secondary_felt_state: str = "None"
+        self._conflict_score: float = 0.0
+
         self.load_state()
 
     def _project_axes(self, raw: Dict[str, float]) -> Tuple[float, float, float]:
@@ -75,21 +104,65 @@ class SynthesizerModule:
         # Activated body → arousal
         arousal = max(0.0, min(1.0, 0.35 * heart + 0.30 * breath + 0.20 * sweat + 0.15 * energy))
         # Pleasant settled vs distressed gut/cold — valence in [-1, 1]
-        valence = max(-1.0, min(1.0, (0.45 * warmth + 0.35 * energy) - (0.40 * gut + 0.25 * sweat) ))
+        valence = max(-1.0, min(1.0, (0.45 * warmth + 0.35 * energy) - (0.40 * gut + 0.25 * sweat)))
         # Stance: energy + inverse overwhelm (tension+gut high → low dominance)
         dominance = max(0.0, min(1.0, 0.40 * energy + 0.30 * (1.0 - tension) + 0.30 * (1.0 - gut)))
         return arousal, valence, dominance
 
     def _bin_key(self, arousal: float, valence: float, dominance: float) -> Tuple[float, float, float]:
-        # Previously hardcoded round(x, 1) regardless of GRID_RESOLUTION's
-        # value -- the constant existed but changing it did nothing. Now
-        # actually drives the rounding, so it's a real tunable (§10 item 11)
-        # rather than a placeholder that only looked like one.
         return (
             round(arousal, self.GRID_RESOLUTION),
             round(valence, self.GRID_RESOLUTION),
             round(dominance, self.GRID_RESOLUTION),
         )
+
+    def _pad_dist(self, a: Tuple[float, float, float], b: Tuple[float, float, float]) -> float:
+        return math.sqrt(
+            (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2
+        )
+
+    def _find_competitors(self, key: Tuple[float, float, float]):
+        """Return (primary_key, secondary_key_or_None, conflict_score).
+
+        Primary = nearest stabilized basin (or the live key itself if none).
+        Secondary = next-nearest stabilized basin within SECONDARY_MAX_DIST
+        that has meaningful dwell relative to primary.
+        Conflict rises when primary and secondary disagree on valence sign
+        or dominance polarity.
+        """
+        if not self.stabilized_basins:
+            return key, None, 0.0
+
+        ranked: List[Tuple[float, Tuple[float, float, float]]] = []
+        for sk in self.stabilized_basins:
+            ranked.append((self._pad_dist(key, sk), sk))
+        ranked.sort(key=lambda t: t[0])
+
+        primary = ranked[0][1]
+        secondary = None
+        conflict = 0.0
+
+        if len(ranked) >= 2:
+            d2, cand = ranked[1]
+            if d2 <= self.SECONDARY_MAX_DIST:
+                prim_dwell = self.basin_grid.get(primary, 1.0)
+                sec_dwell = self.basin_grid.get(cand, 0.0)
+                if prim_dwell > 0 and (sec_dwell / prim_dwell) >= self.SECONDARY_MIN_RATIO:
+                    secondary = cand
+                    # Opposing valence (sign disagreement) + dominance spread
+                    v_diff = abs(primary[1] - secondary[1])  # valence in [-1,1]
+                    d_diff = abs(primary[2] - secondary[2])  # dominance in [0,1]
+                    # Extra boost when signs of valence actually oppose
+                    sign_oppose = 1.0 if (primary[1] * secondary[1] < 0) else 0.4
+                    conflict = min(1.0, (
+                        self.CONFLICT_VALENCE_WEIGHT * v_diff * sign_oppose
+                        + self.CONFLICT_DOMINANCE_WEIGHT * d_diff
+                    ))
+                    # Scale by how close the competitor is (nearer = more conflict)
+                    proximity = 1.0 - (d2 / max(1e-6, self.SECONDARY_MAX_DIST))
+                    conflict = min(1.0, conflict * (0.5 + 0.5 * proximity))
+
+        return primary, secondary, conflict
 
     def update_from_core(self, raw_variables: Dict[str, float]):
         """
@@ -103,6 +176,20 @@ class SynthesizerModule:
         # Live, cheap lookup against the already-stabilized map (§2.1a).
         self.current_felt_state = self.stabilized_basins.get(key, "Unformed")
 
+        # Mixed-affect: primary / secondary / conflict
+        primary, secondary, conflict = self._find_competitors(key)
+        self._primary_key = primary
+        self._secondary_key = secondary
+        self._secondary_felt_state = (
+            self.stabilized_basins.get(secondary, "None") if secondary else "None"
+        )
+        self._conflict_score = conflict
+
+        # Prefer the named primary basin when the exact key is still Unformed
+        # but a nearby stabilized basin exists (smooths early Childhood).
+        if self.current_felt_state == "Unformed" and primary in self.stabilized_basins:
+            self.current_felt_state = self.stabilized_basins[primary]
+
     def get_current_felt_state(self) -> str:
         return self.current_felt_state
 
@@ -114,6 +201,19 @@ class SynthesizerModule:
         core.py raw-variable leak (§ Core Emergence Principle): it's the
         already-synthesized composite key, not a hidden-layer value."""
         return self._current_key
+
+    def get_primary_basin_key(self) -> Tuple[float, float, float]:
+        return self._primary_key
+
+    def get_secondary_basin_key(self) -> Optional[Tuple[float, float, float]]:
+        return self._secondary_key
+
+    def get_secondary_felt_state(self) -> str:
+        return self._secondary_felt_state
+
+    def get_conflict_score(self) -> float:
+        """0..1 ambivalence / competing-affect signal. Safe boundary output."""
+        return self._conflict_score
 
     def get_current_intensity(self) -> float:
         """Legitimate, boundary-crossing continuous signal for anything
@@ -165,16 +265,7 @@ class SynthesizerModule:
         )
 
     # ------------------------------------------------------------------
-    # Persistence (§4C). Previously entirely missing -- the whole
-    # emotional web (basin_grid, stabilized_basins) lived purely in
-    # memory and reset to empty on every fresh SynthesizerModule()
-    # instantiation, meaning basin-formation progress never survived an
-    # app restart, and a genuine "reset memory" action had no dedicated
-    # target for this module (it just happened by accident on restart,
-    # while archivist.py/hormonal.py's data would silently persist and
-    # get out of sync with a "reset" emotional web). Same JSON-file
-    # pattern as archivist.py/hormonal.py/chronos.py. Checkpointed once,
-    # at the end of Consolidation, by prometheus.py -- not on every tick.
+    # Persistence (§4C).
     # ------------------------------------------------------------------
     @staticmethod
     def _key_to_str(key: Tuple[float, float, float]) -> str:
