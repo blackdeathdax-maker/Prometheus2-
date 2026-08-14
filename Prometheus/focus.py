@@ -53,13 +53,15 @@ TRACKED_EXPECTATION_FAMILIES = frozenset({
 })
 
 # Relative weight on prediction error contribution by family.
-# Unfillable families (no producer yet) must not dominate focus forever.
+# Updated: ROLE and CAUSAL now have deterministic producers in sensory.py
+# + association.link_relational, so they can carry real weight instead of
+# being permanently down-weighted as "almost no producer".
 EXPECTATION_FAMILY_WEIGHT = {
     FAMILY_HIERARCHY: 1.0,
     FAMILY_MEMBERSHIP: 1.0,
-    FAMILY_SOCIAL_NORM: 0.45,  # only if relational intake fires
-    FAMILY_ROLE: 0.25,         # thin write path
-    FAMILY_CAUSAL: 0.15,       # almost no producer yet
+    FAMILY_SOCIAL_NORM: 0.55,  # relational intake + parental feedback
+    FAMILY_ROLE: 0.50,         # agent/patient/instrument patterns now written
+    FAMILY_CAUSAL: 0.45,       # causes/prevents/enables/results-in patterns now written
 }
 
 

@@ -6,6 +6,8 @@ from .core import Message
 from .edge_types import (
     EDGE_IS_A, EDGE_PART_OF, EDGE_VIOLATES, EDGE_RESPONSIBLE_FOR,
     EDGE_TEMPORAL_CONTRAST, EDGE_CONCERNS_OTHER,
+    EDGE_CAUSES, EDGE_RESULTS_IN, EDGE_PREVENTS, EDGE_ENABLES,
+    EDGE_AGENT, EDGE_PATIENT, EDGE_INSTRUMENT,
 )
 
 logger = logging.getLogger(__name__)
@@ -312,6 +314,47 @@ class SensoryModule:
             text,
         ):
             found.append(EDGE_CONCERNS_OTHER)
+
+        # --- CAUSAL family (new producers for focus prediction error) ---
+        # Deterministic keyword patterns only; no NLP model.
+        causal_causes = (
+            " because ", " caused ", " causes ", " resulting in ",
+            " led to ", " leads to ", " made me ", " made him ", " made her ",
+            " as a result ", " therefore ", " so i ", " so he ", " so she ",
+            " due to ", " owing to ",
+        )
+        if any(m in text for m in causal_causes):
+            found.append(EDGE_CAUSES)
+
+        causal_prevents = (
+            " prevented ", " prevents ", " stopped me from ", " kept me from ",
+            " blocked ", " avoided ", " so that i wouldn't ", " so i wouldn't ",
+        )
+        if any(m in text for m in causal_prevents):
+            found.append(EDGE_PREVENTS)
+
+        causal_enables = (
+            " allowed me ", " enabled ", " made it possible ", " let me ",
+            " helped me ", " so i could ", " so that i could ",
+        )
+        if any(m in text for m in causal_enables):
+            found.append(EDGE_ENABLES)
+
+        # results-in is often co-fired with causes; keep distinct for family coverage
+        if " resulted in " in text or " results in " in text or " ended up " in text:
+            found.append(EDGE_RESULTS_IN)
+
+        # --- ROLE family (agent / patient / instrument) ---
+        # Conservative patterns that indicate participant roles in an event.
+        # These feed the ROLE family that focus.py already tracks.
+        if re.search(r"\b(i|he|she|they|we)\s+(did|made|caused|chose|decided|broke|hurt|said|told)\b", text):
+            found.append(EDGE_AGENT)
+        if re.search(r"\b(was|were|got|gotten)\s+(hurt|broken|told|asked|forced|made to)\b", text):
+            found.append(EDGE_PATIENT)
+        if re.search(r"\b(with|using|by means of)\s+(a |an |the )?[a-z]+\b", text) and any(
+            w in text for w in ("tool", "knife", "key", "phone", "car", "hand", "weapon", "instrument")
+        ):
+            found.append(EDGE_INSTRUMENT)
 
         # Dedup while preserving order
         seen = set()
