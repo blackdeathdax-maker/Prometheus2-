@@ -1094,12 +1094,60 @@ class ArchivistModule:
         anchor). Deliberately pairwise-within-the-event, not all-pairs
         across the whole graph -- this is what keeps it sparse. Silently
         ignores nodes not actually in the graph (defensive; callers
-        shouldn't need to pre-filter)."""
+        shouldn't need to pre-filter).
+
+        Also lifts co-activation one level: if two+ of the touched nodes
+        are members of different epistemic/somatic schemas, those schemas
+        receive a co-activation bump (schema–schema fuel for Tier-2).
+        """
         real_nodes = [n for n in nodes if n in self.graph]
         if len(real_nodes) < 2:
             return
-        for a, b in combinations(sorted(set(real_nodes)), 2):
+        unique = sorted(set(real_nodes))
+        for a, b in combinations(unique, 2):
             self.co_activation[(a, b)] += 1
+        # Schema–schema lift
+        self.record_schema_co_activation(unique)
+
+    def schemas_covering(self, node_id: str) -> List[str]:
+        """Return schema node ids that claim `node_id` via composed-of (in-edge)."""
+        if node_id not in self.graph:
+            return []
+        out = []
+        for u, _v, ed in self.graph.in_edges(node_id, data=True):
+            if ed.get("relation_type") != EDGE_COMPOSED_OF:
+                continue
+            nd = self.graph.nodes.get(u, {})
+            if nd.get("node_type") in (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA) or nd.get("is_schema"):
+                out.append(u)
+        return out
+
+    def record_schema_co_activation(self, leaf_nodes: List[str], amount: float = 1.0) -> int:
+        """When leaf nodes co-occur, bump co-activation between the schemas
+        that cover them. Returns number of schema pairs bumped.
+
+        Pure structural lift — no new clustering library, no LLM. Gives
+        detect_epistemic_tier2() stabilized pairs among schema nodes so
+        hierarchical stacking is not starved.
+        """
+        schema_set = set()
+        for leaf in leaf_nodes:
+            for sid in self.schemas_covering(leaf):
+                schema_set.add(sid)
+        # Also treat any schema ids already in the leaf list as schemas
+        for n in leaf_nodes:
+            nd = self.graph.nodes.get(n, {})
+            if nd.get("node_type") in (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA) or nd.get("is_schema"):
+                schema_set.add(n)
+        schemas = sorted(schema_set)
+        if len(schemas) < 2:
+            return 0
+        pairs = 0
+        for a, b in combinations(schemas, 2):
+            key = (a, b) if a < b else (b, a)
+            self.co_activation[key] = self.co_activation.get(key, 0) + amount
+            pairs += 1
+        return pairs
 
     def decay_co_activation(self):
         """Consolidation-gated (same clock as activation decay, basin

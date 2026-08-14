@@ -989,6 +989,15 @@ class Prometheus:
             cur = self.felt_anchors.current()
             if cur is not None:
                 self.schema_felt.note(active_schemas, cur.anchor_id)
+            # Schema–schema co-activation: schemas sharing WM/focus get paired
+            # so Tier-2 stacking has stabilized fuel (not only leaf co-touch).
+            if len(active_schemas) >= 2 and hasattr(self.archivist, "record_schema_co_activation"):
+                try:
+                    self.archivist.record_schema_co_activation(
+                        list(dict.fromkeys(active_schemas)), amount=1.0
+                    )
+                except Exception as e:
+                    logger.warning("schema co-activation (pulse) failed: %s", e)
             # Phase B: if focus is a collapsed parent, rehydrate a little detail
             fid = getattr(self.focus, "focus_id", None)
             if fid and fid in self.archivist.graph:
@@ -1793,6 +1802,32 @@ class Prometheus:
         merged_names = self.reflector.merge_schemas_sharing_name()
         print(f"Consolidation: merged same-name schemas {merged_names}")
         expired_epistemic = self.reflector.expire_unnamed_epistemic_schemas()
+
+        # Schema–schema fuel before Tier-2: schemas that share residual heat
+        # or current focus neighbourhood get a consolidation co-activation bump.
+        try:
+            if hasattr(self.archivist, "record_schema_co_activation"):
+                heat_nodes = []
+                try:
+                    heat_nodes = [k for k, _v in self.focus.top_residuals(20)]
+                except Exception:
+                    heat_nodes = []
+                fid = None
+                try:
+                    fid = self.focus.focus_id
+                except Exception:
+                    pass
+                if fid:
+                    heat_nodes.append(fid)
+                for t in getattr(self.focus, "stack", []) or []:
+                    heat_nodes.append(t.target_id)
+                n_pairs = self.archivist.record_schema_co_activation(
+                    list(dict.fromkeys(heat_nodes)), amount=1.5
+                )
+                if n_pairs:
+                    print(f"Consolidation: schema–schema co-activation pairs bumped {n_pairs}")
+        except Exception as e:
+            logger.warning("schema co-activation (consolidation) failed: %s", e)
 
         # Hierarchical stacking (Tier 2+) + promotion to Trusted
         new_tier2 = []
