@@ -73,6 +73,7 @@ class FocusThread:
     created_pulse: int = 0
     last_seen_pulse: int = 0
     source_mix: Dict[str, float] = field(default_factory=dict)
+    suspended: bool = False  # true while on the stack, not active
 
 
 class FocusModule:
@@ -128,6 +129,13 @@ class FocusModule:
     WM_FOCUS_BONUS = 6.0
     SELF_STUDY_FOCUS_WEIGHT = 4.0
 
+    # Hierarchical focus / means residuals
+    STACK_CAP = 2                    # max suspended goals
+    MEANS_BOOST = 0.35               # residual given to means neighbors of focus
+    MEANS_CAP = 8.0
+    W_MEANS = 0.45                   # weight of means residual in composite score
+    RESUME_MARGIN_SCALE = 0.85       # slightly easier to resume a suspended goal
+
     def __init__(self):
         self.residuals: Dict[str, float] = {}
         self.r_pred: Dict[str, float] = {}
@@ -143,6 +151,10 @@ class FocusModule:
         self.switch_cost_mult: float = 1.0  # from FastModulators.settle/alert
         # schema_id -> {family: consecutive pulses still missing while focused}
         self._missing_streak: Dict[str, Dict[str, int]] = {}
+        # Hierarchical focus: short stack of suspended goals (max STACK_CAP)
+        self.stack: List[FocusThread] = []
+        # Means residual: nodes that historically lead toward a focus target
+        self.r_means: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Piece A — residual store
@@ -180,12 +192,14 @@ class FocusModule:
         self._decay_dict(self.residuals, rate)
         self._decay_dict(self.r_pred, rate)
         self._decay_dict(self.r_par, rate)
+        self._decay_dict(self.r_means, rate)
 
     def total_residual(self, node_id: str) -> float:
         return (
             self.W_ACT * self.residuals.get(node_id, 0.0)
             + self.W_PRED * self.r_pred.get(node_id, 0.0)
             + self.W_PAR * self.r_par.get(node_id, 0.0)
+            + self.W_MEANS * self.r_means.get(node_id, 0.0)
         )
 
     # ------------------------------------------------------------------
@@ -223,6 +237,7 @@ class FocusModule:
         r_act = self.residuals.get(node_id, 0.0)
         r_pred = self.r_pred.get(node_id, 0.0)
         r_par = self.r_par.get(node_id, 0.0)
+        r_means = self.r_means.get(node_id, 0.0)
         r_unc = self.uncertainty_residual(graph, node_id)
         basin_bonus = 5.0 if node_id in basin_anchor_set else 0.0
         data = graph.nodes.get(node_id, {})
@@ -235,6 +250,7 @@ class FocusModule:
             "unc": r_unc,
             "pred": r_pred,
             "par": r_par,
+            "means": r_means,
             "basin": basin_bonus,
             "schema": schema_bonus,
         }
@@ -243,6 +259,7 @@ class FocusModule:
             + r_unc
             + self.W_PRED * r_pred
             + self.W_PAR * r_par
+            + self.W_MEANS * r_means
             + basin_bonus
             + schema_bonus
         )
@@ -254,7 +271,9 @@ class FocusModule:
     def _candidate_ids(self, graph, basin_anchor_set: Set[str]) -> List[str]:
         scored = []
         # Seed from residual keys + basin anchors + current focus
-        seeds = set(self.residuals) | set(self.r_pred) | set(self.r_par) | set(basin_anchor_set)
+        seeds = set(self.residuals) | set(self.r_pred) | set(self.r_par) | set(self.r_means) | set(basin_anchor_set)
+        for t in self.stack:
+            seeds.add(t.target_id)
         if self.thread:
             seeds.add(self.thread.target_id)
         for n in seeds:
@@ -279,6 +298,112 @@ class FocusModule:
                     scored.append((n, s))
         scored.sort(key=lambda t: t[1], reverse=True)
         return [n for n, _ in scored[: self.CANDIDATE_POOL_CAP]]
+
+
+    # ------------------------------------------------------------------
+    # Hierarchical focus stack + means residuals
+    # ------------------------------------------------------------------
+    def boost_means(self, node_id: str, amount: Optional[float] = None) -> None:
+        """Boost a node as a 'means' toward the current focus (how-to path)."""
+        if not node_id or node_id in (SELF_NODE, OTHER_NODE):
+            return
+        amt = self.MEANS_BOOST if amount is None else amount
+        self.r_means[node_id] = min(
+            self.MEANS_CAP,
+            self.r_means.get(node_id, 0.0) + amt,
+        )
+
+    def apply_means_for_focus(self, graph, focus_id: Optional[str] = None) -> int:
+        """Give mild residual to neighbors that look like means toward focus.
+
+        Heuristic (deterministic): in-neighbors and out-neighbors connected by
+        associated-with / causes / enables / responsible-for / composed-of /
+        is-a get a small means boost. Does not invent new structure.
+        """
+        fid = focus_id or self.focus_id
+        if not fid or fid not in graph:
+            return 0
+        means_rels = {
+            "associated-with", "causes", "enables", "results-in",
+            "responsible-for", "composed-of", "is-a", "part-of",
+            "agent", "instrument", "prevents",
+        }
+        n = 0
+        # Nodes that point at focus or that focus points at
+        for u, v, ed in list(graph.in_edges(fid, data=True)) + list(graph.out_edges(fid, data=True)):
+            rel = ed.get("relation_type", "")
+            if rel not in means_rels:
+                continue
+            other = u if v == fid else v
+            if other in (SELF_NODE, OTHER_NODE, fid):
+                continue
+            self.boost_means(other)
+            n += 1
+        return n
+
+    def _push_stack(self, thread: FocusThread) -> None:
+        if thread is None:
+            return
+        # Avoid duplicate targets on the stack
+        self.stack = [t for t in self.stack if t.target_id != thread.target_id]
+        suspended = FocusThread(
+            target_id=thread.target_id,
+            kind=thread.kind,
+            score=thread.score,
+            created_pulse=thread.created_pulse,
+            last_seen_pulse=thread.last_seen_pulse,
+            source_mix=dict(thread.source_mix or {}),
+            suspended=True,
+        )
+        self.stack.append(suspended)
+        if len(self.stack) > self.STACK_CAP:
+            self.stack = self.stack[-self.STACK_CAP:]
+
+    def _try_resume_from_stack(
+        self,
+        graph,
+        pulse: int,
+        basin_anchor_set: Set[str],
+        current_score: float,
+    ) -> Optional[FocusThread]:
+        """Resume a suspended goal if its residual has risen enough."""
+        if not self.stack:
+            return None
+        best = None
+        best_score = -1.0
+        best_mix: Dict[str, float] = {}
+        for t in self.stack:
+            if t.target_id not in graph:
+                continue
+            if self._in_cooldown(t.target_id, pulse):
+                continue
+            s, mix = self.composite_score(graph, t.target_id, basin_anchor_set)
+            if s > best_score:
+                best_score = s
+                best = t
+                best_mix = mix
+        if best is None:
+            return None
+        # Easier margin to resume than to switch to a brand-new target
+        margin = max(abs(current_score) * (self.FOCUS_SWITCH_MARGIN * self.RESUME_MARGIN_SCALE * getattr(self, "switch_cost_mult", 1.0)), 0.4)
+        if best_score > current_score + margin:
+            self.stack = [t for t in self.stack if t.target_id != best.target_id]
+            data = graph.nodes.get(best.target_id, {})
+            kind = (
+                "schema"
+                if (data.get("is_schema") or data.get("node_type") in (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA))
+                else "node"
+            )
+            return FocusThread(
+                target_id=best.target_id,
+                kind=kind,
+                score=best_score,
+                created_pulse=pulse,
+                last_seen_pulse=pulse,
+                source_mix=best_mix,
+                suspended=False,
+            )
+        return None
 
     def select_focus(
         self,
@@ -334,6 +459,7 @@ class FocusModule:
                 last_seen_pulse=pulse,
                 source_mix=best_mix,
             )
+            self.apply_means_for_focus(graph, best_id)
             return self.thread
 
         current = self.thread
@@ -361,6 +487,10 @@ class FocusModule:
                     else "node"
                 )
                 ps, pmix = self.composite_score(graph, pick, basin_anchor_set)
+                # Suspend current goal before forced switch
+                if current is not None and current.target_id != pick:
+                    self._push_stack(current)
+                    self._start_cooldown(current.target_id, pulse)
                 self.thread = FocusThread(
                     target_id=pick,
                     kind=pkind,
@@ -369,12 +499,14 @@ class FocusModule:
                     last_seen_pulse=pulse,
                     source_mix=pmix if pick == best_open_id else (best_mix if pick == best_id else pmix),
                 )
+                self.apply_means_for_focus(graph, pick)
                 self._force_switch = False
                 return self.thread
             # No alternative exists — clear flag and keep current one more cycle
             self._force_switch = False
 
         if residency_met and challenger_wins:
+            self._push_stack(current)
             self._start_cooldown(current.target_id, pulse)
             self.thread = FocusThread(
                 target_id=best_id,
@@ -384,6 +516,21 @@ class FocusModule:
                 last_seen_pulse=pulse,
                 source_mix=best_mix,
             )
+            self.apply_means_for_focus(graph, best_id)
+            return self.thread
+
+        # Try resume a suspended goal if its residual has risen
+        if residency_met:
+            resumed = self._try_resume_from_stack(graph, pulse, basin_anchor_set, cur_score)
+            if resumed is not None and resumed.target_id != current.target_id:
+                self._push_stack(current)
+                self._start_cooldown(current.target_id, pulse)
+                self.thread = resumed
+                self.apply_means_for_focus(graph, resumed.target_id)
+                return self.thread
+
+        # Maintain means residuals for the active focus
+        self.apply_means_for_focus(graph, current.target_id)
         return self.thread
 
     # ------------------------------------------------------------------
@@ -397,6 +544,10 @@ class FocusModule:
         """Additive score bonus for WM ranking."""
         if self.thread and node_id == self.thread.target_id:
             return self.WM_FOCUS_BONUS
+        if any(t.target_id == node_id for t in self.stack):
+            return self.WM_FOCUS_BONUS * 0.45
+        if self.r_means.get(node_id, 0) > 0.5:
+            return min(2.5, self.r_means[node_id] * 0.4)
         return 0.0
 
     def self_study_weight(self, node_id: str) -> float:
@@ -413,6 +564,8 @@ class FocusModule:
         out: Set[str] = set()
         if self.thread:
             out.add(self.thread.target_id)
+        for t in self.stack:
+            out.add(t.target_id)
         return out
 
     def neighbourhood_boost_ids(self, graph, max_n: int = 12) -> Set[str]:
@@ -653,7 +806,7 @@ class FocusModule:
 
     def top_residuals(self, n: int = 8) -> List[Tuple[str, float]]:
         totals = {}
-        keys = set(self.residuals) | set(self.r_pred) | set(self.r_par)
+        keys = set(self.residuals) | set(self.r_pred) | set(self.r_par) | set(self.r_means)
         for k in keys:
             totals[k] = self.total_residual(k)
         return sorted(totals.items(), key=lambda t: t[1], reverse=True)[:n]
@@ -673,6 +826,12 @@ class FocusModule:
             "hard_age_events": self._hard_age_events,
             "cooldowns_active": len(self._cooldown_until),
             "force_switch_armed": self._force_switch,
+            "stack": [
+                {"target_id": t.target_id, "kind": t.kind, "score": round(t.score, 3)}
+                for t in self.stack
+            ],
+            "means_count": len(self.r_means),
+            "top_means": sorted(self.r_means.items(), key=lambda x: -x[1])[:8],
             "last_tick": dict(self.last_tick_summary),
         }
 
@@ -692,13 +851,26 @@ class FocusModule:
                     "last_seen_pulse": self.thread.last_seen_pulse,
                     "source_mix": dict(self.thread.source_mix or {}),
                 }
+            stack_data = []
+            for t in self.stack:
+                stack_data.append({
+                    "target_id": t.target_id,
+                    "kind": t.kind,
+                    "score": t.score,
+                    "created_pulse": t.created_pulse,
+                    "last_seen_pulse": t.last_seen_pulse,
+                    "source_mix": dict(t.source_mix or {}),
+                    "suspended": True,
+                })
             data = {
                 "residuals": dict(self.residuals),
                 "r_pred": dict(self.r_pred),
                 "r_par": dict(self.r_par),
+                "r_means": dict(self.r_means),
                 "last_error": dict(self.last_error),
                 "cooldown_until": {k: int(v) for k, v in self._cooldown_until.items()},
                 "thread": thread,
+                "stack": stack_data,
                 "stagnation_events": int(self._stagnation_events),
                 "hard_age_events": int(self._hard_age_events),
             }
@@ -718,6 +890,7 @@ class FocusModule:
             self.residuals = {k: float(v) for k, v in (data.get("residuals") or {}).items()}
             self.r_pred = {k: float(v) for k, v in (data.get("r_pred") or {}).items()}
             self.r_par = {k: float(v) for k, v in (data.get("r_par") or {}).items()}
+            self.r_means = {k: float(v) for k, v in (data.get("r_means") or {}).items()}
             self.last_error = {k: float(v) for k, v in (data.get("last_error") or {}).items()}
             self._cooldown_until = {k: int(v) for k, v in (data.get("cooldown_until") or {}).items()}
             self._stagnation_events = int(data.get("stagnation_events") or 0)
@@ -732,6 +905,18 @@ class FocusModule:
                     last_seen_pulse=int(th.get("last_seen_pulse") or 0),
                     source_mix=dict(th.get("source_mix") or {}),
                 )
+            self.stack = []
+            for th in (data.get("stack") or []):
+                if th and th.get("target_id"):
+                    self.stack.append(FocusThread(
+                        target_id=th["target_id"],
+                        kind=th.get("kind") or "node",
+                        score=float(th.get("score") or 0),
+                        created_pulse=int(th.get("created_pulse") or 0),
+                        last_seen_pulse=int(th.get("last_seen_pulse") or 0),
+                        source_mix=dict(th.get("source_mix") or {}),
+                        suspended=True,
+                    ))
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning("FocusModule.load_state failed: %s", e)
