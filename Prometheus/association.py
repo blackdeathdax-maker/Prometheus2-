@@ -278,20 +278,48 @@ class AssociationEngine:
             if rel == EDGE_CONCERNS_OTHER or rel == "concerns-other":
                 targets = specific_others if specific_others else [OTHER_NODE]
                 for other in targets:
+                    # other ↔ event (the social concern)
                     self.archivist.link(
                         other, event_node, rel, source=source,
                         placement="explicit", felt_state=felt_state,
                     )
+                    # SELF always participates: I am relating to this other/event
+                    self.archivist.link(
+                        SELF_NODE, event_node, rel, source=source,
+                        placement="explicit", felt_state=felt_state,
+                    )
+                    # durable self↔other acquaintance edge (associated-with)
+                    if other != OTHER_NODE:
+                        self.archivist.link(
+                            SELF_NODE, other, "associated-with", source=source,
+                            placement="explicit", felt_state=felt_state,
+                        )
             elif rel in ROLE_EDGE_TYPES or rel in CAUSAL_EDGE_TYPES:
                 self.archivist.link(
                     SELF_NODE, event_node, rel, source=source,
                     placement="explicit", felt_state=felt_state,
                 )
+                # If a specific other is present, also bind them as participant
+                for other in specific_others:
+                    self.archivist.link(
+                        other, event_node, rel, source=source,
+                        placement="explicit", felt_state=felt_state,
+                    )
+                    self.archivist.link(
+                        SELF_NODE, other, "associated-with", source=source,
+                        placement="explicit", felt_state=felt_state,
+                    )
             else:
+                # Classic social-norm / temporal edges still anchored on SELF
                 self.archivist.link(
                     SELF_NODE, event_node, rel, source=source,
                     placement="explicit", felt_state=felt_state,
                 )
+                for other in specific_others:
+                    self.archivist.link(
+                        SELF_NODE, other, "associated-with", source=source,
+                        placement="explicit", felt_state=felt_state,
+                    )
 
     # ------------------------------------------------------------------
     # §2.1b item 4a: Schema Node naming trigger. Called whenever a term

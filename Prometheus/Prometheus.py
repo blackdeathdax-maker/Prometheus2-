@@ -561,6 +561,15 @@ class Prometheus:
         # depends on. A no-op if anchor is None (fewer than 2 real nodes).
         if node and anchor:
             self.archivist.record_co_activation([node, anchor])
+        # Self-relevance: ingested content co-activates with SELF so
+        # epistemic/somatic schemas and narrative can bind self-relevantly.
+        if node:
+            try:
+                from .archivist import SELF_NODE
+                self.archivist.bump_activation(SELF_NODE)
+                self.archivist.record_co_activation([node, SELF_NODE])
+            except Exception:
+                pass
 
         # §2.1b item 4a: try to name any unnamed schemas tied to the felt
         # state active right now (schema naming trigger when user/dictionary
@@ -596,6 +605,16 @@ class Prometheus:
                 self.association.link_relational(
                     node, relations, source=source, felt_state=felt_state,
                 )
+        # Bind named others into the same co-activation cluster as SELF + event
+        if node and other_ids:
+            try:
+                from .archivist import SELF_NODE
+                cluster = [node, SELF_NODE] + [o for o in other_ids if o][:4]
+                self.archivist.record_co_activation(cluster)
+                for oid in other_ids[:4]:
+                    self.archivist.bump_activation(oid)
+            except Exception:
+                pass
 
         if felt_state != "Unformed" and node:
             self.chronos.record_felt_state_link(basin_key, node)

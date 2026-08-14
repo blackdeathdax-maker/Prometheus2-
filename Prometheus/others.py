@@ -143,7 +143,7 @@ class OthersRegistry:
                     weakest = min(self.named.items(), key=lambda t: t[1].get("mentions", 0))[0]
                     # do not delete graph node (may have edges); just stop tracking new growth
                     pass
-            from .archivist import TIER_WORKING
+            from .archivist import TIER_WORKING, SELF_NODE
             self.archivist.store(other_id, source="social", tier=TIER_WORKING)
             if other_id in graph:
                 graph.nodes[other_id]["is_other"] = True
@@ -151,6 +151,30 @@ class OthersRegistry:
                 graph.nodes[other_id]["valence_coloring"] = graph.nodes[other_id].get(
                     "valence_coloring", 0.0
                 )
+                # Always connect named other to SELF so social content is self-relevant
+                try:
+                    self.archivist.link(
+                        SELF_NODE, other_id, "associated-with",
+                        source="social", placement="explicit",
+                    )
+                except Exception:
+                    pass
+        else:
+            # Re-touch: ensure SELF link exists even for previously created others
+            from .archivist import SELF_NODE
+            try:
+                has = any(
+                    ed.get("relation_type") == "associated-with"
+                    for _u, v, ed in graph.out_edges(SELF_NODE, data=True)
+                    if v == other_id
+                )
+                if not has:
+                    self.archivist.link(
+                        SELF_NODE, other_id, "associated-with",
+                        source="social", placement="explicit",
+                    )
+            except Exception:
+                pass
 
         stats = self.named.setdefault(
             other_id, {"mentions": 0, "last_pulse": 0, "role_hint": role_hint or ""}
