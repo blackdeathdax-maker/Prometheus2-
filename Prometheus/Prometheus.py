@@ -1062,7 +1062,11 @@ class Prometheus:
             target = self._select_self_study_target()
             if target is None:
                 return
-            expansions = self.sensory.lookup_expansion(target)
+            try:
+                expansions = self.sensory.lookup_expansion(target)
+            except Exception as e:
+                logger.warning("lookup_expansion(%r) failed: %s", target, e)
+                expansions = []
             if expansions:
                 break
             # Verified dead end -- memoize so this specific node is never
@@ -1099,7 +1103,9 @@ class Prometheus:
                 child, definition=definition, source="dictionary",
                 context_node=target, max_parent_children=self.SELF_STUDY_SOFT_CAP,
             )
-            placed_children.append(result.get("term") or child)
+            term_id = result.get("term") if isinstance(result, dict) else result
+            if term_id:
+                placed_children.append(term_id)
         self.archivist.store(target, source="dictionary")  # reinforce parent's last_reinforced
 
         # Co-activation (§13.3, new): target and its newly-placed children
@@ -1855,6 +1861,14 @@ class Prometheus:
         merged_names = self.reflector.merge_schemas_sharing_name()
         print(f"Consolidation: merged same-name schemas {merged_names}")
         expired_epistemic = self.reflector.expire_unnamed_epistemic_schemas()
+        garbage_epistemic = 0
+        try:
+            if hasattr(self.reflector, "prune_garbage_epistemic_schemas"):
+                garbage_epistemic = self.reflector.prune_garbage_epistemic_schemas()
+                if garbage_epistemic:
+                    print(f"Consolidation: pruned {garbage_epistemic} garbage epistemic schema(s)")
+        except Exception as e:
+            logger.warning("prune_garbage_epistemic_schemas failed: %s", e)
 
         # Schema–schema fuel before Tier-2: schemas that share residual heat
         # or current focus neighbourhood get a consolidation co-activation bump.
