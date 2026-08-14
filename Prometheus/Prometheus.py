@@ -60,7 +60,7 @@ class Prometheus:
     # All three remain undecided tuning placeholders (§10) -- named here
     # specifically so the Debug tab's sliders can adjust them live.
     FATIGUE_GROWTH_RATE = 0.2
-    FATIGUE_RECOVERY_CONSOLIDATION = 0.5
+    FATIGUE_RECOVERY_CONSOLIDATION = 0.88  # mild only — must not erase sleep pressure
     FATIGUE_RECOVERY_PRUNING = 0.7
     FATIGUE_RECOVERY_SLEEP = 0.55          # per-pulse pressure drop in sleep climate
     FATIGUE_URGENCY_GROWTH_MULT = 1.75     # high urgency accelerates pressure
@@ -1430,13 +1430,34 @@ class Prometheus:
         return soft + (high - soft) * max(0.0, min(1.0, urgency))
 
     def _update_fatigue(self):
-        """Continuous sleep pressure. Intensity + work raise it; urgency accelerates growth."""
-        intensity = self.synthesizer.get_current_intensity()
-        urgency = self._compute_urgency()
-        growth = float(self.FATIGUE_GROWTH_RATE)
+        """Continuous sleep pressure.
+
+        Three additive terms while awake:
+          1) MIN_PRESSURE_TICK — guaranteed floor every pulse (slider-proof)
+          2) work — intensity × growth rate (Debug slider still matters)
+          3) baseline — micro-day / circadian ramp
+
+        Sleep is the only place pressure falls hard. This prevents the
+        "stuck under 0.3" failure when intensity is low or growth slider
+        is near zero.
+        """
+        try:
+            intensity = float(self.synthesizer.get_current_intensity() or 0.0)
+        except Exception:
+            intensity = 0.3
+        if intensity != intensity:  # NaN
+            intensity = 0.3
+
+        urgency = 0.0
+        try:
+            urgency = float(self._compute_urgency() or 0.0)
+        except Exception:
+            urgency = 0.0
+        self._last_urgency = urgency
+
+        growth = max(0.0, float(getattr(self, "FATIGUE_GROWTH_RATE", 0.2) or 0.0))
         if urgency > 0.35:
             growth *= 1.0 + (self.FATIGUE_URGENCY_GROWTH_MULT - 1.0) * urgency
-            # Hidden body cost of pushing (mind only sees body later)
             try:
                 with self.bio.lock:
                     self.bio._hormones["cortisol"] = min(
@@ -1447,15 +1468,22 @@ class Prometheus:
                     )
             except Exception:
                 pass
-        # Micro-day baseline drift: slight pressure even when quiet (circadian-ish)
+
         self.micro_day_pulse = (int(self.micro_day_pulse) + 1) % max(8, int(self.MICRO_DAY_PULSES))
-        baseline = 0.02 * (self.micro_day_pulse / max(1, self.MICRO_DAY_PULSES))
+        day_frac = self.micro_day_pulse / max(1.0, float(self.MICRO_DAY_PULSES))
+        baseline = 0.015 + 0.025 * day_frac  # ~0.015 → ~0.040
+
+        # Guaranteed awake tick so soft threshold is reachable in ~10–20 pulses
+        # even if growth slider is 0 and intensity is 0.
+        MIN_PRESSURE_TICK = 0.025
+
         if self.state != "Sleep":
-            self.fatigue = min(1.0, self.fatigue + intensity * growth + baseline * 0.05)
+            work = max(0.0, intensity) * growth
+            delta = MIN_PRESSURE_TICK + work + baseline
+            self.fatigue = min(1.0, float(self.fatigue) + delta)
         else:
-            # Sleep recovers; debt lengthens effective recovery need
             rec = float(self.FATIGUE_RECOVERY_SLEEP)
-            self.fatigue = max(0.0, self.fatigue * rec - 0.01 * (1.0 - min(1.0, self.sleep_debt)))
+            self.fatigue = max(0.0, float(self.fatigue) * rec - 0.01 * (1.0 - min(1.0, self.sleep_debt)))
 
     def _enter_sleep(self):
         self.state = "Sleep"
@@ -1513,32 +1541,57 @@ class Prometheus:
                 self.sleep_stage = "digest"
 
     def _cycle_state(self):
-        """Sleep-pressure state machine: Learning ↔ Consolidation ↔ Sleep climate."""
+        """Sleep-pressure state machine: Learning → Consolidation → Sleep → Learning.
+
+        Consolidation is an evening stop *before* sleep, not a recovery loop
+        that returns to Learning. Mild pressure relief only; sleep is what
+        actually clears debt. This fixes the prior bug where Consolidation
+        halved fatigue and bounced back to Learning forever, so Sleep never
+        activated.
+        """
         urgency = self._last_urgency if self._last_urgency else self._compute_urgency()
         thresh = self._sleep_threshold(urgency)
+        # Debug T1/T2 sliders stay live: map them onto soft/hard each cycle
+        try:
+            self.SLEEP_SOFT_MIN = float(getattr(self, "T1", self.SLEEP_SOFT_MIN))
+        except Exception:
+            pass
+        try:
+            # T2 acts as hard sleep ceiling (old "Consolidation → Pruning" gate)
+            self.SLEEP_HARD_MAX = max(
+                float(getattr(self, "SLEEP_SOFT_MIN", 0.35)) + 0.05,
+                float(getattr(self, "T2", self.SLEEP_HARD_MAX)),
+            )
+        except Exception:
+            pass
         soft = float(getattr(self, "SLEEP_SOFT_MIN", self.T1))
         hard = float(getattr(self, "SLEEP_HARD_MAX", 0.92))
 
         if self.state == "Learning":
-            # Soft: prefer evening consolidation before full sleep
-            if self.fatigue >= soft and self.fatigue < thresh:
+            # Evening band: consolidate once, then sleep. Hard ceiling: sleep now.
+            if self.fatigue >= hard:
+                self._enter_sleep()
+            elif self.fatigue >= soft:
+                # Prefer a consolidation pass when not already past hard max.
+                # At very low urgency thresh≈soft, still do consolidation first
+                # so graph structure updates before sleep climate.
                 self.state = "Consolidation"
-            elif self.fatigue >= thresh or self.fatigue >= hard:
-                self._enter_sleep()
         elif self.state == "Consolidation":
-            if self.fatigue >= thresh or self.fatigue >= hard:
-                self._enter_sleep()
-            elif self.fatigue < soft - float(self.HYSTERESIS):
-                self.state = "Learning"
+            # Always run consolidation work this pulse, then advance toward sleep.
+            # Do NOT return to Learning from here — that was the trap.
+            pass
         elif self.state == "Sleep":
             pass  # handled below
         elif self.state == "Pruning":
-            # Migrate legacy state name
             self._enter_sleep()
 
         if self.state == "Consolidation":
             self._run_consolidation()
+            # Mild relief only — keep pressure high enough that next step is sleep
             self.fatigue *= float(self.FATIGUE_RECOVERY_CONSOLIDATION)
+            self.fatigue = max(self.fatigue, soft * 0.75)
+            # After evening consolidation → sleep climate
+            self._enter_sleep()
         elif self.state == "Sleep":
             self._run_sleep_pulse()
 
