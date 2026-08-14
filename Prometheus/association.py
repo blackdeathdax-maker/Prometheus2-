@@ -125,6 +125,19 @@ class AssociationEngine:
         Returns a small dict describing what happened, for logging/tests.
         """
         cap = self.PARENT_OUT_DEGREE_CAP if max_parent_children is None else max_parent_children
+        # Quality gate: self_generated / expansion terms should look concept-like.
+        # Full user sentences still allowed (source=user) so dialogue is recorded.
+        term_s = str(term).strip()
+        if source in ("self_generated", "schema", "social", "dictionary"):
+            words = term_s.split()
+            # dictionary hyponyms should still be short concepts; reject gloss-like labels
+            max_words = 3 if source == "dictionary" else 4
+            max_len = 36 if source == "dictionary" else 48
+            if len(term_s) > max_len or len(words) > max_words:
+                return {"term": None, "skipped": "garbage_label", "reason": "too_sentence_like"}
+            low = term_s.lower()
+            if low.startswith(("i ", "it was", "it is", "the act of", "a person who", "the state of")):
+                return {"term": None, "skipped": "garbage_label", "reason": "sentence_opener"}
         self.archivist.store(term, source=source, tier=TIER_PROVISIONAL)
 
         parsed = self.sensory.parse_hierarchy(definition) if definition else None
