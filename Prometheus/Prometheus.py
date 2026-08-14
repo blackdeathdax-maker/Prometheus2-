@@ -18,10 +18,15 @@ from .felt_anchors import FeltAnchorStore
 from .modulators import FastModulators
 from .long_term_interest import LongTermInterest
 from .schema_felt import SchemaFeltBinder
-from .others import OthersRegistry
 from .sensory import SensoryModule
 from .association import AssociationEngine
 from .stimulus import SyntheticStimulusEngine
+
+try:
+    from .others import OthersRegistry
+except ImportError:
+    OthersRegistry = None  # optional until others.py is deployed
+
 
 
 logger = logging.getLogger(__name__)
@@ -223,7 +228,7 @@ class Prometheus:
         self.modulators = FastModulators()
         self.long_term_interest = LongTermInterest()
         self.schema_felt = SchemaFeltBinder(threshold=3)
-        self.others = OthersRegistry(self.archivist)
+        self.others = OthersRegistry(self.archivist) if OthersRegistry is not None else None
         self.last_collapse_summary = {"collapsed": 0, "conflicts": 0, "candidates_considered": 0}
         self.last_focus_summary = {}
         self.last_hierarchy_summary = {}
@@ -573,10 +578,24 @@ class Prometheus:
 
         relations = self.sensory.detect_relational(text)
         if relations and node:
-            self.association.link_relational(
-                node, relations, source=source, felt_state=felt_state,
-                other_ids=other_ids or None,
-            )
+            # other_ids only if association.link_relational supports it
+            try:
+                import inspect
+                sig = inspect.signature(self.association.link_relational)
+                if "other_ids" in sig.parameters:
+                    self.association.link_relational(
+                        node, relations, source=source, felt_state=felt_state,
+                        other_ids=other_ids or None,
+                    )
+                else:
+                    self.association.link_relational(
+                        node, relations, source=source, felt_state=felt_state,
+                    )
+            except TypeError:
+                # Fallback for unexpected signature differences
+                self.association.link_relational(
+                    node, relations, source=source, felt_state=felt_state,
+                )
 
         if felt_state != "Unformed" and node:
             self.chronos.record_felt_state_link(basin_key, node)

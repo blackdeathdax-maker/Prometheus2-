@@ -252,19 +252,19 @@ class AssociationEngine:
     # detects candidates in incoming text.
     # ------------------------------------------------------------------
     def link_relational(self, event_node: str, relation_types: List[str], source: str = "user",
-                         felt_state: Optional[str] = None):
+                         felt_state: Optional[str] = None,
+                         other_ids: Optional[List[str]] = None):
         """Create relational / role / causal edges detected by sensory.py.
 
         - Social-norm / temporal (responsible-for, violates, temporal-contrast)
           → SELF → event_node
-        - concerns-other → OTHER → event_node
+        - concerns-other → specific named other(s) if provided, else OTHER
         - ROLE family (agent / patient / instrument) → SELF → event_node
-          (SELF is the participant; more nuanced multi-entity role binding
-          can be added later without changing this call site)
-        - CAUSAL family (causes / results-in / prevents / enables)
-          → SELF → event_node as the default explanatory anchor
-          (the event is treated as the effect; richer cause→effect pairs
-          can be layered later)
+        - CAUSAL family → SELF → event_node
+
+        `other_ids`: optional list from OthersRegistry.process_text();
+        when present, concerns-other edges attach to those nodes instead
+        of only the generic OTHER placeholder.
 
         `felt_state`: threaded through to archivist.link() so the edge
         carries felt_state_at_creation (ground truth at creation time).
@@ -272,24 +272,22 @@ class AssociationEngine:
         from .edge_types import (
             EDGE_CONCERNS_OTHER,
             ROLE_EDGE_TYPES, CAUSAL_EDGE_TYPES,
-            RELATIONAL_EDGE_TYPES,
         )
+        specific_others = [o for o in (other_ids or []) if o and o != OTHER_NODE]
         for rel in relation_types:
             if rel == EDGE_CONCERNS_OTHER or rel == "concerns-other":
-                self.archivist.link(
-                    OTHER_NODE, event_node, rel, source=source,
-                    placement="explicit", felt_state=felt_state,
-                )
+                targets = specific_others if specific_others else [OTHER_NODE]
+                for other in targets:
+                    self.archivist.link(
+                        other, event_node, rel, source=source,
+                        placement="explicit", felt_state=felt_state,
+                    )
             elif rel in ROLE_EDGE_TYPES or rel in CAUSAL_EDGE_TYPES:
-                # New producers: still anchored on SELF for the first
-                # implementation so focus.py's existing ROLE/CAUSAL
-                # expectation machinery immediately sees real edges.
                 self.archivist.link(
                     SELF_NODE, event_node, rel, source=source,
                     placement="explicit", felt_state=felt_state,
                 )
             else:
-                # Classic §2.1b social-norm / temporal edges
                 self.archivist.link(
                     SELF_NODE, event_node, rel, source=source,
                     placement="explicit", felt_state=felt_state,
