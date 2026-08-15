@@ -779,6 +779,113 @@ class ReflectorModule:
                 removed += 1
         return removed
 
+
+    def detect_kind_schemas_from_is_a(self) -> List[str]:
+        """Kind-schemas from shared is-a parent (user/hierarchy structure).
+
+        Co-activation alone misses the case where Color has 6 is-a children
+        but sibling pairs never stabilized as co-touch edges. A parent with
+        enough Working+ children IS a kind schema.
+        """
+        graph = self.archivist.graph
+        # parent -> set of children (edge child -is-a-> parent, or parent has inbound is-a)
+        children_of = {}
+        for u, v, ed in graph.edges(data=True):
+            if ed.get("relation_type") != EDGE_IS_A:
+                continue
+            # u is-a v  means u child, v parent (our link direction)
+            parent, child = v, u
+            children_of.setdefault(parent, set()).add(child)
+            # also accept reverse if stored that way
+            children_of.setdefault(u, set()).add(v)
+
+        created = []
+        for parent, kids in children_of.items():
+            if parent not in graph:
+                continue
+            pdata = graph.nodes.get(parent, {})
+            if pdata.get("node_type") in (NODE_EPISTEMIC_SCHEMA, NODE_SCHEMA, NODE_BASIN):
+                continue
+            if parent in ("SELF", "OTHER"):
+                continue
+            members = sorted(
+                n for n in kids
+                if n in graph
+                and graph.nodes.get(n, {}).get("tier", TIER_PROVISIONAL) >= TIER_WORKING
+                and n != parent
+                and graph.nodes.get(n, {}).get("node_type") not in (
+                    NODE_EPISTEMIC_SCHEMA, NODE_SCHEMA, NODE_BASIN
+                )
+            )
+            # Deduplicate if reverse edges double-counted parent as child
+            members = [m for m in members if m != parent]
+            # Prefer true children: those with is-a edge toward parent
+            true_kids = []
+            for m in members:
+                ok = False
+                if graph.has_edge(m, parent):
+                    for attr in (graph.get_edge_data(m, parent) or {}).values():
+                        if isinstance(attr, dict) and attr.get("relation_type") == EDGE_IS_A:
+                            ok = True
+                if ok:
+                    true_kids.append(m)
+            members = true_kids if true_kids else members
+            if len(members) < self.EPISTEMIC_MIN_CLUSTER_SIZE:
+                continue
+            coh = self.cluster_coherence(members)
+            lr = self.lemma_ratio(members)
+            if coh < self.EPISTEMIC_MIN_COHERENCE * 0.8 and lr < self.EPISTEMIC_MIN_LEMMA_RATIO * 0.8:
+                # pure is-a family still allowed if enough kids under one parent
+                if len(members) < self.EPISTEMIC_MIN_CLUSTER_SIZE + 1:
+                    continue
+            cluster_id = self._epistemic_cluster_id(members, dominant_parent=parent)
+            if cluster_id in graph:
+                existing = {
+                    v for _u, v, edata in graph.out_edges(cluster_id, data=True)
+                    if edata.get("relation_type") == EDGE_COMPOSED_OF
+                }
+                for m in members:
+                    if m not in existing:
+                        graph.add_edge(
+                            cluster_id, m, relation_type=EDGE_COMPOSED_OF,
+                            source="schema", placement="explicit",
+                        )
+                graph.nodes[cluster_id]["member_count"] = len(set(existing) | set(members))
+                graph.nodes[cluster_id]["last_reinforced"] = datetime.now()
+                continue
+            # Create named from parent immediately when parent is a real lemma
+            graph.add_node(
+                cluster_id,
+                node_type=NODE_EPISTEMIC_SCHEMA,
+                is_schema=True,
+                named=True,
+                name=str(parent),
+                member_count=len(members),
+                dominant_parent=parent,
+                source="schema",
+                tier=TIER_WORKING,
+                created_at=datetime.now().isoformat(),
+                last_reinforced=datetime.now(),
+                unnamed_cycles=0,
+                last_coherence=coh,
+                formation="is_a_kind",
+            )
+            for m in members:
+                graph.add_edge(
+                    cluster_id, m, relation_type=EDGE_COMPOSED_OF,
+                    source="schema", placement="explicit",
+                )
+            # schema is-a parent kind label
+            try:
+                graph.add_edge(
+                    cluster_id, parent, relation_type=EDGE_IS_A,
+                    source="schema", placement="explicit",
+                )
+            except Exception:
+                pass
+            created.append(cluster_id)
+        return created
+
     def detect_epistemic_clusters(self) -> List[str]:
         """
         Groups nodes whose co-activation has stabilized (archivist.
@@ -941,7 +1048,8 @@ class ReflectorModule:
                                 created_at=datetime.now().isoformat())
             created.append(cluster_id)
 
-        return created
+        kind_created = self.detect_kind_schemas_from_is_a()
+        return list(dict.fromkeys(created + kind_created))
 
     def _dominant_parent(self, members: List[str], min_coverage: Optional[int] = None) -> tuple:
         """Returns (best_parent, coverage) -- the is-a parent covering the
