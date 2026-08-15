@@ -130,14 +130,17 @@ class AssociationEngine:
         term_s = str(term).strip()
         if source in ("self_generated", "schema", "social", "dictionary"):
             words = term_s.split()
-            # dictionary hyponyms should still be short concepts; reject gloss-like labels
-            max_words = 3 if source == "dictionary" else 4
-            max_len = 36 if source == "dictionary" else 48
+            # Allow multiword WordNet lemmas; still block sentence-like strings
+            max_words = 5 if source == "dictionary" else 4
+            max_len = 56 if source == "dictionary" else 48
             if len(term_s) > max_len or len(words) > max_words:
                 return {"term": None, "skipped": "garbage_label", "reason": "too_sentence_like"}
             low = term_s.lower()
             if low.startswith(("i ", "it was", "it is", "the act of", "a person who", "the state of")):
                 return {"term": None, "skipped": "garbage_label", "reason": "sentence_opener"}
+            # Reject punctuation-heavy fragments
+            if any(ch in term_s for ch in ".?!;:"):
+                return {"term": None, "skipped": "garbage_label", "reason": "sentence_punct"}
         # Dictionary-original material is already an external authority
         # (§3.1 / §2.2): start at Working so epistemic clustering is not
         # permanently starved while co-activation accumulates on Tier-0 only.

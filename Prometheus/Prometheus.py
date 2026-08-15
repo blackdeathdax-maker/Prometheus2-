@@ -175,7 +175,7 @@ class Prometheus:
     # non-barren node already at the cap -- allow a bounded amount of
     # further growth rather than permanently halting, without reopening
     # unlimited runaway-hub growth the strict cap exists to prevent.
-    SELF_STUDY_MAX_ATTEMPTS = 3
+    SELF_STUDY_MAX_ATTEMPTS = 8
     SELF_STUDY_SOFT_CAP = 6
 
     # Bias-modulated self-study targeting (§13.1, new -- designed but
@@ -1067,6 +1067,68 @@ class Prometheus:
     # ------------------------------------------------------------------
     # §5.1 Autonomous idle expansion (self-study)
     # ------------------------------------------------------------------
+
+    def _ordered_self_study_expansions(self, target: str):
+        """Hyponyms first, then hypernym, then synonyms. Token/climb fallbacks."""
+        plan = []
+        seen = set()
+
+        def add_hypos(label, tag="hyponym"):
+            try:
+                hypos = self.sensory.lookup_expansion(label) or []
+            except Exception:
+                hypos = []
+            for h in hypos:
+                if h and h not in seen and h != target and h != label:
+                    seen.add(h)
+                    plan.append((tag, h))
+
+        def add_hyper(label):
+            try:
+                hyper = self.sensory.lookup_hypernym(label)
+            except Exception:
+                hyper = None
+            if hyper and hyper not in seen and hyper != target:
+                seen.add(hyper)
+                plan.append(("hypernym", hyper))
+            return hyper
+
+        def add_syns(label):
+            try:
+                syns = self.sensory.lookup_synonyms(label) or []
+            except Exception:
+                syns = []
+            for s in syns[:2]:
+                if s and s not in seen and s != target:
+                    seen.add(s)
+                    plan.append(("synonym", s))
+
+        add_hypos(target)
+        hyper = add_hyper(target)
+        add_syns(target)
+
+        if not plan and isinstance(target, str) and " " in target:
+            stop = {
+                "a", "an", "the", "of", "or", "and", "to", "in", "on", "for", "with",
+                "is", "are", "was", "were", "my", "me", "i", "it", "that", "this",
+            }
+            for word in target.replace("-", " ").split():
+                w = "".join(ch for ch in word if ch.isalnum() or ch in ("'",)).lower()
+                if len(w) < 3 or w in stop:
+                    continue
+                add_hypos(w)
+                if plan:
+                    break
+                add_hyper(w)
+                add_syns(w)
+                if plan:
+                    break
+
+        if hyper and len([k for k, _ in plan if k == "hyponym"]) < 2:
+            add_hypos(hyper, tag="hyponym")
+
+        return plan
+
     def _self_study(self):
         """During Learning, when no external input is queued, self-
         initiate dictionary expansion rather than sitting idle. Does NOT
@@ -1148,11 +1210,26 @@ class Prometheus:
                         pass
         self.archivist.store(target, source="dictionary")  # reinforce parent's last_reinforced
 
-        # Co-activation (§13.3, new): target and its newly-placed children
-        # were all touched in the same self-study cycle -- record every
-        # pairwise combination among them. This is the primary source of
-        # co-activation data in practice, since self-study runs far more
-        # often than real input in typical usage.
+        if not placed_children:
+            try:
+                hyper = self.sensory.lookup_hypernym(target)
+                if hyper and hyper != target:
+                    result = self.association.place_node(
+                        hyper,
+                        definition=self.sensory.lookup_definition(hyper) or "",
+                        source="dictionary",
+                        context_node=target,
+                        max_parent_children=self.SELF_STUDY_SOFT_CAP,
+                    )
+                    term_id = result.get("term") if isinstance(result, dict) else result
+                    if term_id:
+                        placed_children.append(term_id)
+            except Exception as e:
+                logger.warning("hypernym fallback failed: %s", e)
+        if not placed_children:
+            return
+
+        # Co-activation (§13.3): target + newly-placed children this cycle
         self.archivist.record_co_activation([target] + placed_children)
 
         if felt_state != "Unformed":
@@ -1323,13 +1400,7 @@ class Prometheus:
             if d.get("tier", 0) < TIER_WORKING and d.get("source") != "self_generated" and has_room(n, d)
         ]
 
-        # Soft gate: if focus neighborhood has room, study there first (less random)
-        if local:
-            loc_w = [n for n in working_candidates if n in local]
-            loc_p = [n for n in provisional_candidates if n in local]
-            if loc_w or loc_p:
-                working_candidates = loc_w or working_candidates
-                provisional_candidates = loc_p or provisional_candidates
+        # Soft preference only (do not hard-restrict to local barren leaves)
 
         # §14: Childhood hard-gate, unless the dead-end proxy fires.
         if epoch_value == "Childhood":
