@@ -781,18 +781,28 @@ class ReflectorModule:
 
 
     def detect_kind_schemas_from_is_a(self) -> List[str]:
-        """Kind-schemas from shared is-a parent (user/hierarchy structure).
+        """Kind-schemas from shared is-a parent, with nesting.
 
-        Only child -is-a-> parent out-edges. Never treat hyponyms as parents.
+        Color -is-a children → schema Color (L1, leaf members).
+        Blue  -is-a children → schema Blue  (L1 under Color if Blue is-a Color).
+        Schema–schema link: epistemic_of_Color -composed-of→ epistemic_of_Blue.
+
+        Same-level duplicate coverage is merged; sub-kinds are nested, not flattened.
         """
         graph = self.archivist.graph
         children_of = {}
         for u, v, ed in graph.edges(data=True):
             if ed.get("relation_type") != EDGE_IS_A:
                 continue
-            # u -is-a-> v  => u child, v parent
             child, parent = u, v
-            if parent in ("SELF", "OTHER"):
+            if parent in ("SELF", "OTHER") or child in ("SELF", "OTHER"):
+                continue
+            # Skip schema nodes as is-a endpoints for kind discovery
+            ct = graph.nodes.get(child, {}).get("node_type")
+            pt = graph.nodes.get(parent, {}).get("node_type")
+            if ct in (NODE_EPISTEMIC_SCHEMA, NODE_SCHEMA, NODE_BASIN):
+                continue
+            if pt in (NODE_EPISTEMIC_SCHEMA, NODE_SCHEMA, NODE_BASIN):
                 continue
             children_of.setdefault(parent, set()).add(child)
 
@@ -800,32 +810,27 @@ class ReflectorModule:
         for parent, kids in children_of.items():
             if parent not in graph:
                 continue
-            pdata = graph.nodes.get(parent, {})
-            if pdata.get("node_type") in (NODE_EPISTEMIC_SCHEMA, NODE_SCHEMA, NODE_BASIN):
-                continue
-            if parent in ("SELF", "OTHER"):
-                continue
             members = sorted(
                 n for n in kids
                 if n in graph
-                and graph.nodes.get(n, {}).get("tier", TIER_PROVISIONAL) >= TIER_WORKING
                 and n != parent
+                and graph.nodes.get(n, {}).get("tier", TIER_PROVISIONAL) >= TIER_WORKING
                 and graph.nodes.get(n, {}).get("node_type") not in (
                     NODE_EPISTEMIC_SCHEMA, NODE_SCHEMA, NODE_BASIN
                 )
             )
-            # Deduplicate if reverse edges double-counted parent as child
-            members = [m for m in members if m != parent]
-            # members already from child -is-a-> parent only
             if len(members) < self.EPISTEMIC_MIN_CLUSTER_SIZE:
                 continue
             coh = self.cluster_coherence(members)
             lr = self.lemma_ratio(members)
-            if coh < self.EPISTEMIC_MIN_COHERENCE * 0.8 and lr < self.EPISTEMIC_MIN_LEMMA_RATIO * 0.8:
-                # pure is-a family still allowed if enough kids under one parent
-                if len(members) < self.EPISTEMIC_MIN_CLUSTER_SIZE + 1:
-                    continue
-            cluster_id = self._epistemic_cluster_id(members, dominant_parent=parent)
+            if (
+                coh < self.EPISTEMIC_MIN_COHERENCE * 0.75
+                and lr < self.EPISTEMIC_MIN_LEMMA_RATIO * 0.75
+                and len(members) < self.EPISTEMIC_MIN_CLUSTER_SIZE + 1
+            ):
+                continue
+
+            cluster_id = f"epistemic_of_{_slug_id_fragment(parent)}"
             if cluster_id in graph:
                 existing = {
                     v for _u, v, edata in graph.out_edges(cluster_id, data=True)
@@ -837,10 +842,15 @@ class ReflectorModule:
                             cluster_id, m, relation_type=EDGE_COMPOSED_OF,
                             source="schema", placement="explicit",
                         )
-                graph.nodes[cluster_id]["member_count"] = len(set(existing) | set(members))
+                graph.nodes[cluster_id]["member_count"] = len(
+                    {v for _u, v, ed in graph.out_edges(cluster_id, data=True)
+                     if ed.get("relation_type") == EDGE_COMPOSED_OF}
+                )
                 graph.nodes[cluster_id]["last_reinforced"] = datetime.now()
+                graph.nodes[cluster_id]["named"] = True
+                graph.nodes[cluster_id]["name"] = str(parent)
                 continue
-            # Create named from parent immediately when parent is a real lemma
+
             graph.add_node(
                 cluster_id,
                 node_type=NODE_EPISTEMIC_SCHEMA,
@@ -856,22 +866,133 @@ class ReflectorModule:
                 unnamed_cycles=0,
                 last_coherence=coh,
                 formation="is_a_kind",
+                abstraction_level=1,
             )
             for m in members:
                 graph.add_edge(
                     cluster_id, m, relation_type=EDGE_COMPOSED_OF,
                     source="schema", placement="explicit",
                 )
-            # schema is-a parent kind label
-            try:
-                graph.add_edge(
-                    cluster_id, parent, relation_type=EDGE_IS_A,
-                    source="schema", placement="explicit",
-                )
-            except Exception:
-                pass
             created.append(cluster_id)
+
+        # Nest sub-kind schemas under parent-kind schemas via lemma is-a
+        self._nest_kind_schemas()
+        # Collapse same-level duplicates (same name / same dominant parent)
+        self._merge_same_level_kind_duplicates()
         return created
+
+    def _nest_kind_schemas(self) -> int:
+        """If Blue is-a Color and both have kind-schemas, Color-schema
+        composed-of Blue-schema; raise abstraction on nested child.
+        """
+        graph = self.archivist.graph
+        # map lemma parent -> schema id
+        lemma_schema = {}
+        for n, d in graph.nodes(data=True):
+            if d.get("node_type") != NODE_EPISTEMIC_SCHEMA:
+                continue
+            if d.get("formation") != "is_a_kind" and not (
+                d.get("named") and d.get("dominant_parent")
+            ):
+                # still allow named parent-slug schemas
+                if not str(n).startswith("epistemic_of_"):
+                    continue
+            parent_lemma = d.get("dominant_parent") or d.get("name")
+            if parent_lemma:
+                lemma_schema[str(parent_lemma)] = n
+                lemma_schema[str(parent_lemma).casefold()] = n
+
+        nested = 0
+        for u, v, ed in list(graph.edges(data=True)):
+            if ed.get("relation_type") != EDGE_IS_A:
+                continue
+            # u is-a v  (u=Blue, v=Color)
+            child_lemma, parent_lemma = u, v
+            child_sch = lemma_schema.get(str(child_lemma)) or lemma_schema.get(
+                str(child_lemma).casefold()
+            )
+            parent_sch = lemma_schema.get(str(parent_lemma)) or lemma_schema.get(
+                str(parent_lemma).casefold()
+            )
+            if not child_sch or not parent_sch or child_sch == parent_sch:
+                continue
+            # parent schema composed-of child schema
+            already = False
+            if graph.has_edge(parent_sch, child_sch):
+                for attr in (graph.get_edge_data(parent_sch, child_sch) or {}).values():
+                    if isinstance(attr, dict) and attr.get("relation_type") == EDGE_COMPOSED_OF:
+                        already = True
+            if not already:
+                graph.add_edge(
+                    parent_sch, child_sch, relation_type=EDGE_COMPOSED_OF,
+                    source="schema", placement="nest",
+                )
+                nested += 1
+            # abstraction: child at least parent+1
+            p_lvl = int(graph.nodes[parent_sch].get("abstraction_level", 1) or 1)
+            c_lvl = int(graph.nodes[child_sch].get("abstraction_level", 1) or 1)
+            if c_lvl <= p_lvl:
+                graph.nodes[child_sch]["abstraction_level"] = p_lvl + 1
+            graph.nodes[child_sch]["nested_under"] = parent_sch
+        return nested
+
+    def _merge_same_level_kind_duplicates(self) -> int:
+        """Merge schemas with same dominant_parent / same name at same level."""
+        graph = self.archivist.graph
+        groups = {}
+        for n, d in list(graph.nodes(data=True)):
+            if d.get("node_type") != NODE_EPISTEMIC_SCHEMA:
+                continue
+            key = (
+                str(d.get("dominant_parent") or d.get("name") or "").casefold(),
+                int(d.get("abstraction_level", 1) or 1),
+            )
+            if not key[0]:
+                continue
+            groups.setdefault(key, []).append(n)
+
+        merged = 0
+        for key, nodes in groups.items():
+            if len(nodes) < 2:
+                continue
+            # Prefer epistemic_of_* slug matching name, else richest members
+            def richness(nid):
+                mem = sum(
+                    1 for _u, v, ed in graph.out_edges(nid, data=True)
+                    if ed.get("relation_type") == EDGE_COMPOSED_OF
+                )
+                slug = 1 if str(nid).startswith("epistemic_of_") else 0
+                named = 1 if graph.nodes[nid].get("named") else 0
+                return (slug, named, mem)
+
+            nodes_sorted = sorted(nodes, key=richness, reverse=True)
+            survivor = nodes_sorted[0]
+            for other in nodes_sorted[1:]:
+                for _u, v, ed in list(graph.out_edges(other, data=True)):
+                    if ed.get("relation_type") != EDGE_COMPOSED_OF:
+                        continue
+                    if not graph.has_edge(survivor, v):
+                        graph.add_edge(
+                            survivor, v, relation_type=EDGE_COMPOSED_OF,
+                            source="schema", placement="merge",
+                        )
+                # rewire inbound composed-of from higher schemas
+                for u, _v, ed in list(graph.in_edges(other, data=True)):
+                    if ed.get("relation_type") == EDGE_COMPOSED_OF and u != survivor:
+                        if not graph.has_edge(u, survivor):
+                            graph.add_edge(
+                                u, survivor, relation_type=EDGE_COMPOSED_OF,
+                                source="schema", placement="merge",
+                            )
+                if other in graph:
+                    graph.remove_node(other)
+                    merged += 1
+            if survivor in graph:
+                graph.nodes[survivor]["member_count"] = sum(
+                    1 for _u, v, ed in graph.out_edges(survivor, data=True)
+                    if ed.get("relation_type") == EDGE_COMPOSED_OF
+                )
+        return merged
 
     def detect_epistemic_clusters(self) -> List[str]:
         """
@@ -954,6 +1075,9 @@ class ReflectorModule:
             members = sorted(
                 n for n in component
                 if graph.nodes.get(n, {}).get("tier", TIER_PROVISIONAL) >= TIER_WORKING
+                and graph.nodes.get(n, {}).get("node_type") not in (
+                    NODE_EPISTEMIC_SCHEMA, NODE_SCHEMA, NODE_BASIN
+                )
             )
             if len(members) < self.EPISTEMIC_MIN_CLUSTER_SIZE:
                 continue
