@@ -1,7 +1,7 @@
 import logging
 from typing import Dict, List, Optional
 
-from .archivist import SELF_NODE, OTHER_NODE, TIER_PROVISIONAL
+from .archivist import SELF_NODE, OTHER_NODE, TIER_PROVISIONAL, TIER_WORKING
 from .sensory import SensoryModule
 
 logger = logging.getLogger(__name__)
