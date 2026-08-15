@@ -8,7 +8,7 @@ import networkx as nx
 
 from .archivist import SELF_NODE, TIER_PROVISIONAL, TIER_WORKING, TIER_TRUSTED
 from .edge_types import (
-    RELATIONAL_EDGE_TYPES, EDGE_COMPOSED_OF, EDGE_IS_A, NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA,
+    RELATIONAL_EDGE_TYPES, EDGE_COMPOSED_OF, EDGE_IS_A, NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA, NODE_BASIN,
 )
 
 
@@ -29,8 +29,8 @@ EPISTEMIC_MIN_CLUSTER_SIZE = 4
 EPISTEMIC_NAME_MIN_COVERAGE = 2  # how many cluster members a parsed is-a parent must cover before it's recognized as earning the cluster's name (§13.3.1)
 
 # Schema quality gates (repair pass — sense before promotion)
-EPISTEMIC_MIN_COHERENCE = 0.35          # mean pairwise token/hypernym overlap
-EPISTEMIC_MIN_LEMMA_RATIO = 0.65         # fraction of members that look like lemmas not sentences
+EPISTEMIC_MIN_COHERENCE = 0.28          # mean pairwise token/hypernym overlap
+EPISTEMIC_MIN_LEMMA_RATIO = 0.55         # fraction of members that look like lemmas not sentences
 EPISTEMIC_NAME_MIN_FREQ = 1             # times a candidate label appears as member-ish
 EPISTEMIC_NAME_MIN_CONTEXTS = 3         # distinct sources or basins before naming
 EPISTEMIC_UNNAMED_MAX_CYCLES = 5        # consolidations unnamed+stagnant → dissolve wrapper
@@ -595,6 +595,19 @@ class ReflectorModule:
         return dissolved
 
 
+
+    def promote_dictionary_nodes_to_working(self) -> int:
+        """Dictionary-original Provisional nodes → Working (schema fuel)."""
+        graph = self.archivist.graph
+        n = 0
+        for node, data in graph.nodes(data=True):
+            if data.get("node_type") in (NODE_EPISTEMIC_SCHEMA, NODE_SCHEMA, NODE_BASIN):
+                continue
+            if data.get("source") == "dictionary" and data.get("tier", TIER_PROVISIONAL) < TIER_WORKING:
+                data["tier"] = TIER_WORKING
+                n += 1
+        return n
+
     def prune_garbage_epistemic_schemas(self) -> int:
         """Remove low-quality epistemic schemas: low coherence, low lemma ratio,
         or majority sentence-like members. Members are left intact.
@@ -1155,14 +1168,31 @@ class ReflectorModule:
         co_graph = nx.Graph()
         co_graph.add_edges_from(pairs)
         candidates = []
+        graph = self.archivist.graph
         for component in nx.connected_components(co_graph):
+            raw = sorted(component)
+            working = sorted(
+                n for n in raw
+                if graph.nodes.get(n, {}).get("tier", TIER_PROVISIONAL) >= TIER_WORKING
+            )
+            coh = self.cluster_coherence(working) if len(working) >= 2 else 0.0
+            lr = self.lemma_ratio(working) if working else 0.0
             candidates.append({
-                "size": len(component),
+                "size": len(raw),
+                "working_size": len(working),
                 "threshold": self.EPISTEMIC_MIN_CLUSTER_SIZE,
-                "remaining": max(0, self.EPISTEMIC_MIN_CLUSTER_SIZE - len(component)),
-                "members": sorted(component)[:5],
+                "remaining": max(0, self.EPISTEMIC_MIN_CLUSTER_SIZE - len(working)),
+                "coherence": round(coh, 3),
+                "lemma_ratio": round(lr, 3),
+                "members": working[:5] if working else raw[:5],
+                "blocked": (
+                    "need_working_tier" if len(working) < self.EPISTEMIC_MIN_CLUSTER_SIZE
+                    else ("low_coherence" if coh < self.EPISTEMIC_MIN_COHERENCE
+                          else ("low_lemma_ratio" if lr < self.EPISTEMIC_MIN_LEMMA_RATIO
+                                else "ready"))
+                ),
             })
-        candidates.sort(key=lambda c: c["remaining"])
+        candidates.sort(key=lambda c: (0 if c["blocked"] == "ready" else 1, c["remaining"]))
 
         schemas = [
             (n, d) for n, d in self.archivist.graph.nodes(data=True)

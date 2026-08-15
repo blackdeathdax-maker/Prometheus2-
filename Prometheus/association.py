@@ -138,7 +138,11 @@ class AssociationEngine:
             low = term_s.lower()
             if low.startswith(("i ", "it was", "it is", "the act of", "a person who", "the state of")):
                 return {"term": None, "skipped": "garbage_label", "reason": "sentence_opener"}
-        self.archivist.store(term, source=source, tier=TIER_PROVISIONAL)
+        # Dictionary-original material is already an external authority
+        # (§3.1 / §2.2): start at Working so epistemic clustering is not
+        # permanently starved while co-activation accumulates on Tier-0 only.
+        start_tier = TIER_WORKING if source in ("dictionary", "schema") else TIER_PROVISIONAL
+        self.archivist.store(term, source=source, tier=start_tier)
 
         parsed = self.sensory.parse_hierarchy(definition) if definition else None
         if parsed:

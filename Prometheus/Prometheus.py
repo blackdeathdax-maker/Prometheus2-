@@ -1888,6 +1888,13 @@ class Prometheus:
         # before shipping. Naming scan runs last, after any new clusters
         # this same pass have been created, so they're immediately
         # eligible.
+        try:
+            if hasattr(self.reflector, "promote_dictionary_nodes_to_working"):
+                n_dict = self.reflector.promote_dictionary_nodes_to_working()
+                if n_dict:
+                    print(f"Consolidation: promoted {n_dict} dictionary node(s) to Working")
+        except Exception as e:
+            logger.warning("promote_dictionary_nodes_to_working failed: %s", e)
         new_epistemic_schemas = self.reflector.detect_epistemic_clusters()
         self.archivist.decay_co_activation()
         merged_epistemic = self.reflector.merge_duplicate_epistemic_schemas()
