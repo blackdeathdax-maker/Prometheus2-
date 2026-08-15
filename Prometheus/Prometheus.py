@@ -2121,6 +2121,12 @@ class Prometheus:
                     print(f"Consolidation: promoted {n_dict} dictionary node(s) to Working")
         except Exception as e:
             logger.warning("promote_dictionary_nodes_to_working failed: %s", e)
+        try:
+            n_dup = self.archivist.dedupe_parallel_edges()
+            if n_dup:
+                print(f"Consolidation: removed {n_dup} duplicate parallel edge(s)")
+        except Exception as e:
+            logger.warning("dedupe_parallel_edges failed: %s", e)
         new_epistemic_schemas = self.reflector.detect_epistemic_clusters()
         self.archivist.decay_co_activation()
         merged_epistemic = self.reflector.merge_duplicate_epistemic_schemas()

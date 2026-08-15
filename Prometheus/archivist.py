@@ -321,6 +321,18 @@ class ArchivistModule:
                                      last_reinforced=datetime.now(),
                                      regulatory_efficacy=0.5, tier0_cycles=0,
                                      node_type=NODE_STANDARD, activation=0.0, valence_coloring=0.0)
+        # Idempotent: MultiDiGraph otherwise stacks duplicate same-type edges
+        # every pulse (WM is-a scaffolding / re-link), which draws "flower" graphs.
+        if self.graph.has_edge(node_a, node_b):
+            try:
+                for _k, attr in (self.graph.get_edge_data(node_a, node_b) or {}).items():
+                    if isinstance(attr, dict) and attr.get("relation_type") == relation_type:
+                        self.graph.nodes[node_a]["last_reinforced"] = datetime.now()
+                        if node_b in self.graph.nodes:
+                            self.graph.nodes[node_b]["last_reinforced"] = datetime.now()
+                        return  # already linked this way
+            except Exception:
+                pass
         edge_kwargs = dict(relation_type=relation_type, source=source,
                             placement=placement, created_at=datetime.now().isoformat())
         if felt_state is not None:
@@ -330,6 +342,30 @@ class ArchivistModule:
         # No self.save() here (§4C) -- see store()'s comment. link() is
         # called on every hierarchy placement and every relational edge,
         # same Learning-time frequency problem.
+
+
+    def dedupe_parallel_edges(self) -> int:
+        """Collapse MultiDiGraph parallel edges that share relation_type."""
+        g = self.graph
+        removed = 0
+        # snapshot edge keys
+        pairs = list(g.edges(keys=True, data=True))
+        seen = {}  # (u,v,rel) -> keep key
+        to_remove = []
+        for u, v, k, data in pairs:
+            rel = data.get("relation_type", "")
+            key = (u, v, rel)
+            if key in seen:
+                to_remove.append((u, v, k))
+            else:
+                seen[key] = k
+        for u, v, k in to_remove:
+            try:
+                g.remove_edge(u, v, key=k)
+                removed += 1
+            except Exception:
+                pass
+        return removed
 
     def name_schema(self, schema_id: str, word: str) -> bool:
         """§2.1b item 4a: a Schema Node earns a name only if/when the
