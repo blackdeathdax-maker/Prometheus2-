@@ -384,6 +384,8 @@ class Prometheus:
         # since the same dead ends kept getting re-picked. Tracked here so
         # a verified-empty target is never re-selected again.
         self._barren_self_study_targets = set()
+        # per-target expansion phase: 0=hyponym, 1=hypernym, 2=synonym, 3=done
+        self._self_study_phase = {}
 
         print("Prometheus Core Initialized with Fatigue Cycling")
 
@@ -989,6 +991,49 @@ class Prometheus:
             except Exception as e:
                 logger.warning("goals tick failed: %s", e)
 
+        # Working-memory co-presence → co-activation (§14 / kind schemas).
+        # Nodes held together "in mind" (e.g. Emotion, Sad, Happy) should
+        # accumulate pair evidence even without self-study co-touch.
+        try:
+            wm = self.get_current_working_memory()
+            slots = [s for s in (wm.get("slots") or []) if s and s in self.archivist.graph]
+            concepts = []
+            for s in slots:
+                if s in ("SELF", "OTHER"):
+                    continue
+                nd = self.archivist.graph.nodes.get(s, {})
+                if nd.get("node_type") in ("basin",):
+                    continue
+                concepts.append(s)
+            if len(concepts) >= 2:
+                self.archivist.record_co_activation(concepts)
+                lower_map = {c.lower(): c for c in concepts}
+                for parent_key, children in (
+                    ("emotion", (
+                        "sad", "happy", "angry", "fear", "afraid", "joy", "disgust",
+                        "surprise", "anger", "sadness", "happiness", "dismay",
+                    )),
+                    ("color", (
+                        "red", "blue", "green", "yellow", "black", "white", "orange",
+                        "purple", "pink", "brown", "gray", "grey",
+                    )),
+                ):
+                    parent = lower_map.get(parent_key)
+                    if not parent:
+                        continue
+                    for child_key in children:
+                        child = lower_map.get(child_key)
+                        if child and child != parent:
+                            try:
+                                self.archivist.link(
+                                    child, parent, "is-a",
+                                    source="wm_inference", placement="explicit",
+                                )
+                            except Exception:
+                                pass
+        except Exception as e:
+            logger.warning("WM co-activation failed: %s", e)
+
         results = self.archivist.retrieve("context")
 
 
@@ -1069,63 +1114,92 @@ class Prometheus:
     # ------------------------------------------------------------------
 
     def _ordered_self_study_expansions(self, target: str):
-        """Hyponyms first, then hypernym, then synonyms. Token/climb fallbacks."""
+        """Phase-ordered expansion for a target (esp. WM/user nodes):
+
+        phase 0: hyponyms (kind children) until exhausted / soft-cap
+        phase 1: hypernym (parent)
+        phase 2: synonyms
+        phase 3: done → barren
+
+        Skips terms already linked under the target so we advance phases
+        instead of re-placing the same leaves forever.
+        """
+        graph = self.archivist.graph
+        phase = int(self._self_study_phase.get(target, 0))
         plan = []
         seen = set()
 
-        def add_hypos(label, tag="hyponym"):
+        # Already children of target (any categorical edge)
+        already = set()
+        if target in graph:
+            for _u, v, ed in graph.out_edges(target, data=True):
+                if ed.get("relation_type") in ("is-a", "part-of", "associated-with", "composed-of"):
+                    already.add(v)
+            for u, _v, ed in graph.in_edges(target, data=True):
+                if ed.get("relation_type") in ("is-a", "part-of", "associated-with"):
+                    already.add(u)
+
+        def hypos(label):
             try:
-                hypos = self.sensory.lookup_expansion(label) or []
+                return list(self.sensory.lookup_expansion(label) or [])
             except Exception:
-                hypos = []
-            for h in hypos:
-                if h and h not in seen and h != target and h != label:
-                    seen.add(h)
-                    plan.append((tag, h))
+                return []
 
-        def add_hyper(label):
+        def hyper(label):
             try:
-                hyper = self.sensory.lookup_hypernym(label)
+                return self.sensory.lookup_hypernym(label)
             except Exception:
-                hyper = None
-            if hyper and hyper not in seen and hyper != target:
-                seen.add(hyper)
-                plan.append(("hypernym", hyper))
-            return hyper
+                return None
 
-        def add_syns(label):
+        def syns(label):
             try:
-                syns = self.sensory.lookup_synonyms(label) or []
+                return list(self.sensory.lookup_synonyms(label) or [])[:3]
             except Exception:
-                syns = []
-            for s in syns[:2]:
-                if s and s not in seen and s != target:
-                    seen.add(s)
-                    plan.append(("synonym", s))
+                return []
 
-        add_hypos(target)
-        hyper = add_hyper(target)
-        add_syns(target)
-
-        if not plan and isinstance(target, str) and " " in target:
-            stop = {
-                "a", "an", "the", "of", "or", "and", "to", "in", "on", "for", "with",
-                "is", "are", "was", "were", "my", "me", "i", "it", "that", "this",
-            }
+        labels = [target]
+        if isinstance(target, str) and " " in target:
+            stop = {"a","an","the","of","or","and","to","in","on","for","with","is","are","was","were"}
             for word in target.replace("-", " ").split():
-                w = "".join(ch for ch in word if ch.isalnum() or ch in ("'",)).lower()
-                if len(w) < 3 or w in stop:
-                    continue
-                add_hypos(w)
-                if plan:
-                    break
-                add_hyper(w)
-                add_syns(w)
-                if plan:
-                    break
+                w = "".join(ch for ch in word if ch.isalnum()).lower()
+                if len(w) >= 3 and w not in stop:
+                    labels.append(w)
 
-        if hyper and len([k for k, _ in plan if k == "hyponym"]) < 2:
-            add_hypos(hyper, tag="hyponym")
+        # --- phase 0: hyponyms ---
+        if phase <= 0:
+            for lab in labels:
+                for h in hypos(lab):
+                    if h and h != target and h not in already and h not in seen:
+                        seen.add(h)
+                        plan.append(("hyponym", h))
+            if plan:
+                return plan
+            # exhausted hyponyms → advance
+            self._self_study_phase[target] = 1
+            phase = 1
+
+        # --- phase 1: hypernym ---
+        if phase == 1:
+            for lab in labels:
+                h = hyper(lab)
+                if h and h != target and h not in already and h not in seen:
+                    seen.add(h)
+                    plan.append(("hypernym", h))
+            if plan:
+                return plan
+            self._self_study_phase[target] = 2
+            phase = 2
+
+        # --- phase 2: synonyms ---
+        if phase == 2:
+            for lab in labels:
+                for s in syns(lab):
+                    if s and s != target and s not in already and s not in seen:
+                        seen.add(s)
+                        plan.append(("synonym", s))
+            if plan:
+                return plan
+            self._self_study_phase[target] = 3
 
         return plan
 
@@ -1164,7 +1238,10 @@ class Prometheus:
                 expansion_plan = []
             if expansions:
                 break
-            self._barren_self_study_targets.add(target)
+            if int(getattr(self, "_self_study_phase", {}).get(target, 0)) >= 3:
+                self._barren_self_study_targets.add(target)
+            else:
+                self._self_study_phase[target] = int(self._self_study_phase.get(target, 0)) + 1
             target = None
 
         if target is None or not expansions:
@@ -1428,11 +1505,32 @@ class Prometheus:
         # already in scope).
         boost_set = in_scope_nodes if epoch_value != "Childhood" else None
 
+        # Soft priority (~72%): expand WM / user nodes first (hyponym order
+        # runs on the chosen target). Not absolute — still explores rest.
+        try:
+            wm_now = self.get_current_working_memory()
+            wm_slots = set(wm_now.get("slots") or [])
+        except Exception:
+            wm_slots = set()
+
+        def wm_prefer(cands):
+            if not cands:
+                return cands
+            preferred = [n for n in cands if n in wm_slots]
+            userish = [
+                n for n in cands
+                if n not in preferred
+                and self.archivist.graph.nodes.get(n, {}).get("source") == "user"
+            ]
+            top = preferred + userish
+            if top and random.random() < 0.72:
+                return top
+            return cands
+
+        working_candidates = wm_prefer(working_candidates)
+        provisional_candidates = wm_prefer(provisional_candidates)
+
         if working_candidates and provisional_candidates:
-            # Weighted toward provisional under NEUTRAL/default: established
-            # hubs already got their initial attention, fresh nodes need it
-            # more. Under EXPLORE/STABILIZE, the ratio shifts instead per
-            # provisional_prob above. Not a tuned ratio (§10) either way.
             pool = provisional_candidates if random.random() < provisional_prob else working_candidates
             return self._weighted_choice_by_activation(pool, bias=bias, boost_set=boost_set)
         if provisional_candidates:
@@ -1513,6 +1611,18 @@ class Prometheus:
             weights = [self.archivist.graph.nodes[n].get("activation", 0.0) + 0.1 for n in pool]
         if boost_set:
             weights = [w * 3.0 if n in boost_set else w for n, w in zip(pool, weights)]
+        # User / WM priority (not absolute): stronger than general boost
+        try:
+            wm = self.get_current_working_memory()
+            wm_slots = set(wm.get("slots") or [])
+        except Exception:
+            wm_slots = set()
+        if wm_slots:
+            weights = [w * 5.0 if n in wm_slots else w for n, w in zip(pool, weights)]
+        for i, n in enumerate(pool):
+            src = self.archivist.graph.nodes.get(n, {}).get("source", "")
+            if src == "user":
+                weights[i] *= 2.5
         try:
             local = self.focus_neighborhood_ids(cap=48)
             weights = [w * 4.0 if n in local else w for n, w in zip(pool, weights)]
