@@ -8,7 +8,9 @@ import networkx as nx
 
 from .archivist import SELF_NODE, TIER_PROVISIONAL, TIER_WORKING, TIER_TRUSTED
 from .edge_types import (
-    RELATIONAL_EDGE_TYPES, EDGE_COMPOSED_OF, EDGE_IS_A, NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA, NODE_BASIN,
+    RELATIONAL_EDGE_TYPES, EDGE_COMPOSED_OF, EDGE_IS_A, EDGE_PART_OF, EDGE_ASSOCIATED_WITH,
+    NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA, NODE_BASIN,
+    get_family, FAMILY_HIERARCHY, FAMILY_MEMBERSHIP, FAMILY_CAUSAL, FAMILY_SOCIAL_NORM,
 )
 
 
@@ -33,7 +35,17 @@ EPISTEMIC_MIN_COHERENCE = 0.28          # mean pairwise token/hypernym overlap
 EPISTEMIC_MIN_LEMMA_RATIO = 0.55         # fraction of members that look like lemmas not sentences
 EPISTEMIC_NAME_MIN_FREQ = 1             # times a candidate label appears as member-ish
 EPISTEMIC_NAME_MIN_CONTEXTS = 3         # distinct sources or basins before naming
-EPISTEMIC_UNNAMED_MAX_CYCLES = 5        # consolidations unnamed+stagnant → dissolve wrapper
+EPISTEMIC_UNNAMED_MAX_CYCLES = 5
+# Taxonomic affinity: co-activation alone is not enough for kind-schemas.
+AFFINITY_THRESHOLD = 2.5          # min weighted score to keep a pair in cluster graph
+AFFINITY_SHARED_PARENT = 1.5      # bonus if nodes share an is-a parent
+AFFINITY_DIRECT_IS_A = 2.0        # one is-a the other
+AFFINITY_PART_OF = 1.2
+AFFINITY_ASSOCIATED = 0.25        # bare co-occurrence placement — weak
+AFFINITY_CAUSAL = 0.4             # thematic, not kind
+AFFINITY_SOCIAL = 0.15
+AFFINITY_COACT_SCALE = 0.35       # per stabilized co-activation count unit
+        # consolidations unnamed+stagnant → dissolve wrapper
 
 # §13 naming hygiene: graph node *ids* must stay short/stable; human-readable
 # glosses live on attributes (name / definition), not in the id string.
@@ -110,6 +122,14 @@ class ReflectorModule:
         self.EPISTEMIC_NAME_MIN_FREQ = EPISTEMIC_NAME_MIN_FREQ
         self.EPISTEMIC_NAME_MIN_CONTEXTS = EPISTEMIC_NAME_MIN_CONTEXTS
         self.EPISTEMIC_UNNAMED_MAX_CYCLES = EPISTEMIC_UNNAMED_MAX_CYCLES
+        self.AFFINITY_THRESHOLD = AFFINITY_THRESHOLD
+        self.AFFINITY_SHARED_PARENT = AFFINITY_SHARED_PARENT
+        self.AFFINITY_DIRECT_IS_A = AFFINITY_DIRECT_IS_A
+        self.AFFINITY_PART_OF = AFFINITY_PART_OF
+        self.AFFINITY_ASSOCIATED = AFFINITY_ASSOCIATED
+        self.AFFINITY_CAUSAL = AFFINITY_CAUSAL
+        self.AFFINITY_SOCIAL = AFFINITY_SOCIAL
+        self.AFFINITY_COACT_SCALE = AFFINITY_COACT_SCALE
 
     # ------------------------------------------------------------------
     # 1. Structural self-report (pre-existing, unchanged)
@@ -608,6 +628,123 @@ class ReflectorModule:
                 n += 1
         return n
 
+
+    # ------------------------------------------------------------------
+    # Taxonomic affinity (weighted relations → logical kind-schemas)
+    # ------------------------------------------------------------------
+    def _is_a_parents(self, node: str) -> set:
+        graph = self.archivist.graph
+        if node not in graph:
+            return set()
+        parents = set()
+        for u, _v, ed in graph.in_edges(node, data=True):
+            if ed.get("relation_type") == EDGE_IS_A:
+                parents.add(u)
+        for _u, v, ed in graph.out_edges(node, data=True):
+            # some placements use node -is-a-> parent as out-edge
+            if ed.get("relation_type") == EDGE_IS_A:
+                parents.add(v)
+        return parents
+
+    def _shared_hubs(self, a: str, b: str) -> set:
+        """Nodes that both a and b link to via is-a / part-of / associated-with."""
+        graph = self.archivist.graph
+        if a not in graph or b not in graph:
+            return set()
+        rel_ok = {EDGE_IS_A, EDGE_PART_OF, EDGE_ASSOCIATED_WITH, EDGE_COMPOSED_OF}
+
+        def neighbors(n):
+            out = set()
+            for u, v, ed in list(graph.in_edges(n, data=True)) + list(graph.out_edges(n, data=True)):
+                if ed.get("relation_type") in rel_ok:
+                    out.add(u if v == n else v)
+            return out
+
+        return neighbors(a) & neighbors(b) - {a, b}
+
+    def _best_edge_weight(self, a: str, b: str) -> float:
+        """Strongest typed relation weight between a and b (either direction)."""
+        graph = self.archivist.graph
+        best = 0.0
+        if a not in graph or b not in graph:
+            return best
+        edges = []
+        try:
+            for u, v in ((a, b), (b, a)):
+                data = graph.get_edge_data(u, v)
+                if not data:
+                    continue
+                # MultiDiGraph: {key: attr_dict}
+                if isinstance(data, dict):
+                    for val in data.values():
+                        if isinstance(val, dict) and "relation_type" in val:
+                            edges.append(val)
+                        elif isinstance(val, dict):
+                            for sub in val.values():
+                                if isinstance(sub, dict):
+                                    edges.append(sub)
+        except Exception:
+            pass
+        for attr in edges:
+            if not isinstance(attr, dict):
+                continue
+            rel = attr.get("relation_type", "")
+            fam = attr.get("family") or get_family(rel)
+            if rel == EDGE_IS_A or fam == FAMILY_HIERARCHY:
+                best = max(best, self.AFFINITY_DIRECT_IS_A)
+            elif rel == EDGE_PART_OF or rel == EDGE_COMPOSED_OF or fam == FAMILY_MEMBERSHIP:
+                best = max(best, self.AFFINITY_PART_OF)
+            elif fam == FAMILY_CAUSAL or rel in ("causes", "enables", "results-in", "prevents"):
+                best = max(best, self.AFFINITY_CAUSAL)
+            elif fam == FAMILY_SOCIAL_NORM or rel in ("concerns-other", "violates", "responsible-for"):
+                best = max(best, self.AFFINITY_SOCIAL)
+            elif rel == EDGE_ASSOCIATED_WITH:
+                best = max(best, self.AFFINITY_ASSOCIATED)
+            else:
+                best = max(best, 0.2)
+        return best
+
+    def pair_affinity(self, a: str, b: str, co_count: float = 1.0) -> float:
+        """Weighted score for whether (a,b) may join a taxonomic kind-schema.
+
+        affinity = co_act_scale * count + edge_weight + shared_parent_bonus
+        Taxonomically unrelated pairs with only weak associated-with stay low.
+        """
+        if a == b:
+            return 0.0
+        score = self.AFFINITY_COACT_SCALE * float(co_count)
+        score += self._best_edge_weight(a, b)
+        pa, pb = self._is_a_parents(a), self._is_a_parents(b)
+        if pa and pb and (pa & pb):
+            score += self.AFFINITY_SHARED_PARENT
+        # One parent of the other (siblings under expansion target)
+        if a in pb or b in pa:
+            score += self.AFFINITY_SHARED_PARENT * 0.8
+        # Shared structural neighbor (same self-study parent / hub via is-a or associated-with)
+        shared_hub = self._shared_hubs(a, b)
+        if shared_hub:
+            score += self.AFFINITY_SHARED_PARENT * 0.9
+        # Hard veto: both have is-a parents, no overlap, no direct hierarchy edge
+        if pa and pb and not (pa & pb) and self._best_edge_weight(a, b) < self.AFFINITY_PART_OF:
+            # allow if pure co-act is very strong AND lemma-similar
+            if self._pair_similarity(a, b) < 0.25:
+                return 0.0
+            score *= 0.35
+        return score
+
+    def taxonomic_coactivation_pairs(self) -> list:
+        """Stabilized co-activation pairs that pass affinity threshold."""
+        raw = self.archivist.stabilized_co_activation_pairs()
+        counts = getattr(self.archivist, "co_activation", {})
+        kept = []
+        for a, b in raw:
+            key = (a, b) if a < b else (b, a)
+            cnt = float(counts.get(key, counts.get((a, b), counts.get((b, a), 5))))
+            aff = self.pair_affinity(a, b, co_count=cnt)
+            if aff >= self.AFFINITY_THRESHOLD:
+                kept.append((a, b, aff))
+        return kept
+
     def prune_garbage_epistemic_schemas(self) -> int:
         """Remove low-quality epistemic schemas: low coherence, low lemma ratio,
         or majority sentence-like members. Members are left intact.
@@ -700,12 +837,13 @@ class ReflectorModule:
         tracked; it just isn't eligible to form a schema until both sides
         have separately earned cortical status.
         """
-        pairs = self.archivist.stabilized_co_activation_pairs()
-        if not pairs:
+        weighted = self.taxonomic_coactivation_pairs()
+        if not weighted:
             return []
 
         co_graph = nx.Graph()
-        co_graph.add_edges_from(pairs)
+        for a, b, aff in weighted:
+            co_graph.add_edge(a, b, affinity=aff)
 
         graph = self.archivist.graph
         created = []
@@ -1164,9 +1302,11 @@ class ReflectorModule:
         EPISTEMIC_MIN_CLUSTER_SIZE -- plus a summary of formed schemas
         (named/unnamed). Read-only, never mutates the graph.
         """
+        weighted = self.taxonomic_coactivation_pairs()
         pairs = self.archivist.stabilized_co_activation_pairs()
         co_graph = nx.Graph()
-        co_graph.add_edges_from(pairs)
+        for a, b, aff in weighted:
+            co_graph.add_edge(a, b, affinity=aff)
         candidates = []
         graph = self.archivist.graph
         for component in nx.connected_components(co_graph):
@@ -1201,6 +1341,7 @@ class ReflectorModule:
         return {
             "total_co_activation_pairs": len(self.archivist.co_activation),
             "stabilized_pairs": len(pairs),
+            "taxonomic_pairs": len(weighted),
             "candidate_clusters": candidates[:top_n],
             "schemas_formed": len(schemas),
             "schemas_named": sum(1 for _n, d in schemas if d.get("named")),
