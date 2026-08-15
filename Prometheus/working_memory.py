@@ -209,23 +209,33 @@ class WorkingMemoryModule:
 
     def _score_candidate(self, node: str, epoch_value: str, basin_anchor_set: set) -> float:
         data = self.archivist.graph.nodes.get(node, {})
-        score = data.get("activation", 0.0)
+        score = float(data.get("activation", 0.0) or 0.0)
 
         user_priority = self._effective_user_priority(epoch_value)
         if self.is_user_linked(node):
             score += user_priority * self.USER_PRIORITY_WEIGHT
+            # Extra stickiness so user Color/Green/… are not washed out
+            score += 2.0
         else:
             score += (1.0 - user_priority) * self.USER_PRIORITY_WEIGHT
 
-        # §14.4: schemas/nodes actually co-occurring with the CURRENT
-        # basin (not just generically active) get an extra bonus, on top
-        # of whatever candidacy they already have.
         if node in basin_anchor_set:
             score += self.BASIN_COOCCURRENCE_BONUS
 
-        # §13.y: sticky focus boost
         if self.focus is not None:
             score += self.focus.focus_boost_for(node)
+
+        # Prefer real kind schemas; penalize anonymous / gloss schema ids
+        if data.get("node_type") in (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA):
+            name = str(data.get("name") or "")
+            if data.get("formation") == "is_a_kind" or (data.get("named") and len(name.split()) <= 2):
+                score += 3.0
+            elif str(node).startswith("epistemic_of_"):
+                score += 1.0
+            else:
+                score -= 2.0  # hash schemas
+            if len(name.split()) > 3 or len(name) > 32:
+                score -= 4.0
 
         return score
 
@@ -280,12 +290,38 @@ class WorkingMemoryModule:
         # priority, exactly as designed.
         covered = set()
         for s in real_schemas:
-            covered.update(self._schema_members(s))
+            # Only trust coverage from schemas that look like real kinds
+            d = graph.nodes.get(s, {})
+            name = str(d.get("name") or "")
+            if d.get("named") and name and len(name.split()) <= 3:
+                covered.update(self._schema_members(s))
+            elif d.get("formation") == "is_a_kind":
+                covered.update(self._schema_members(s))
 
-        candidates = list(real_schemas)
+        candidates = []
+        # Prefer well-formed schemas (named short, or is_a_kind)
+        for s in real_schemas:
+            d = graph.nodes.get(s, {})
+            name = str(d.get("name") or s)
+            # Demote hash/gloss schemas: still eligible but scored low later
+            candidates.append(s)
+
         for n in basin_anchors:
             if n not in covered and n in graph and n not in (SELF_NODE, OTHER_NODE):
                 candidates.append(n)
+
+        # User-taught nodes must be eligible even if not current basin anchors
+        # (otherwise WM only shows self-study drift once anchors move).
+        for n, d in graph.nodes(data=True):
+            if n in (SELF_NODE, OTHER_NODE):
+                continue
+            if n in covered:
+                continue
+            if d.get("source") == "user":
+                candidates.append(n)
+            elif d.get("tier", 0) >= TIER_WORKING and float(d.get("activation", 0) or 0) >= 0.8:
+                candidates.append(n)
+
         candidates = list(dict.fromkeys(candidates))  # de-dup, preserve order
 
         # Prefer a single schema per display name before scoring (fixes triple Sweat)
@@ -311,6 +347,17 @@ class WorkingMemoryModule:
         # so user-linked content can never be squeezed out entirely even
         # if internal-interest scores dominate everywhere else.
         slots: List[str] = []
+        # Childhood / Adolescence: keep most slots user-linked when available
+        if epoch_value in ("Childhood", "Adolescence"):
+            reserve_n = max(3, capacity - 2) if epoch_value == "Childhood" else max(2, capacity // 2)
+            user_linked_scored = sorted(
+                (t for t in scored if self.is_user_linked(t[0])),
+                key=lambda t: t[1], reverse=True,
+            )
+            for n, _s in user_linked_scored[:reserve_n]:
+                if n not in slots:
+                    slots.append(n)
+            scored = [t for t in scored if t[0] not in slots]
         if epoch_value == "Maturity" and self.MATURITY_RESERVED_SLOTS > 0:
             user_linked_scored = sorted(
                 (t for t in scored if self.is_user_linked(t[0])),

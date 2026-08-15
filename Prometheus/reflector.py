@@ -783,21 +783,18 @@ class ReflectorModule:
     def detect_kind_schemas_from_is_a(self) -> List[str]:
         """Kind-schemas from shared is-a parent (user/hierarchy structure).
 
-        Co-activation alone misses the case where Color has 6 is-a children
-        but sibling pairs never stabilized as co-touch edges. A parent with
-        enough Working+ children IS a kind schema.
+        Only child -is-a-> parent out-edges. Never treat hyponyms as parents.
         """
         graph = self.archivist.graph
-        # parent -> set of children (edge child -is-a-> parent, or parent has inbound is-a)
         children_of = {}
         for u, v, ed in graph.edges(data=True):
             if ed.get("relation_type") != EDGE_IS_A:
                 continue
-            # u is-a v  means u child, v parent (our link direction)
-            parent, child = v, u
+            # u -is-a-> v  => u child, v parent
+            child, parent = u, v
+            if parent in ("SELF", "OTHER"):
+                continue
             children_of.setdefault(parent, set()).add(child)
-            # also accept reverse if stored that way
-            children_of.setdefault(u, set()).add(v)
 
         created = []
         for parent, kids in children_of.items():
@@ -819,17 +816,7 @@ class ReflectorModule:
             )
             # Deduplicate if reverse edges double-counted parent as child
             members = [m for m in members if m != parent]
-            # Prefer true children: those with is-a edge toward parent
-            true_kids = []
-            for m in members:
-                ok = False
-                if graph.has_edge(m, parent):
-                    for attr in (graph.get_edge_data(m, parent) or {}).values():
-                        if isinstance(attr, dict) and attr.get("relation_type") == EDGE_IS_A:
-                            ok = True
-                if ok:
-                    true_kids.append(m)
-            members = true_kids if true_kids else members
+            # members already from child -is-a-> parent only
             if len(members) < self.EPISTEMIC_MIN_CLUSTER_SIZE:
                 continue
             coh = self.cluster_coherence(members)
@@ -1052,26 +1039,44 @@ class ReflectorModule:
         return list(dict.fromkeys(created + kind_created))
 
     def _dominant_parent(self, members: List[str], min_coverage: Optional[int] = None) -> tuple:
-        """Returns (best_parent, coverage) -- the is-a parent covering the
-        most of `members`, and how many it covers. Returns (None, 0) if
-        no member has an is-a parent at all. `min_coverage` lets a caller
-        check against a different bar than EPISTEMIC_NAME_MIN_COVERAGE
-        without needing a second near-duplicate method (used by
-        merge_duplicate_epistemic_schemas() below, same threshold by
-        default but kept as a parameter for that reuse)."""
+        """Best is-a *parent* covering the most members.
+
+        Edge convention in this codebase: child -is-a-> parent (out-edge).
+        Looking at in-edges inverted parents (counted hyponyms as parents)
+        and produced ids like epistemic_of_canary_yellow.
+        """
         min_coverage = self.EPISTEMIC_NAME_MIN_COVERAGE if min_coverage is None else min_coverage
         graph = self.archivist.graph
         parent_counts: Counter = Counter()
         for member in members:
             if member not in graph:
                 continue
-            for u, _v, edata in graph.in_edges(member, data=True):
+            # Primary: member -is-a-> parent
+            for _u, v, edata in graph.out_edges(member, data=True):
                 if edata.get("relation_type") == EDGE_IS_A:
-                    parent_counts[u] += 1
+                    if v not in members:  # parent should not be a peer member
+                        parent_counts[v] += 1
         if not parent_counts:
             return None, 0
-        best_parent, coverage = parent_counts.most_common(1)[0]
+
+        def parent_score(item):
+            p, cov = item
+            if p not in graph:
+                return (cov, 0, 0, 0, 0)
+            d = graph.nodes.get(p, {})
+            if d.get("node_type") in (NODE_EPISTEMIC_SCHEMA, NODE_SCHEMA, NODE_BASIN):
+                return (0, 0, 0, 0, 0)  # never name after a schema node
+            tier = int(d.get("tier", 0))
+            user = 1 if d.get("source") == "user" else 0
+            short = 1 if len(str(p).split()) <= 2 and len(str(p)) <= 24 else 0
+            # prefer higher coverage, user, short lemma, tier
+            return (cov, user, short, tier, -len(str(p)))
+
+        best_parent, coverage = max(parent_counts.items(), key=parent_score)
         if coverage < min_coverage:
+            return None, coverage
+        # Reject gloss-like parents
+        if len(str(best_parent).split()) > 4 or len(str(best_parent)) > 40:
             return None, coverage
         return best_parent, coverage
 
