@@ -35,7 +35,7 @@ EPISTEMIC_MIN_COHERENCE = 0.28          # mean pairwise token/hypernym overlap
 EPISTEMIC_MIN_LEMMA_RATIO = 0.55         # fraction of members that look like lemmas not sentences
 EPISTEMIC_NAME_MIN_FREQ = 1             # times a candidate label appears as member-ish
 EPISTEMIC_NAME_MIN_CONTEXTS = 3         # distinct sources or basins before naming
-EPISTEMIC_UNNAMED_MAX_CYCLES = 5
+EPISTEMIC_UNNAMED_MAX_CYCLES = 24  # unnamed is valid; only dissolve long-stagnant shells
 # Taxonomic affinity: co-activation alone is not enough for kind-schemas.
 AFFINITY_THRESHOLD = 2.5          # min weighted score to keep a pair in cluster graph
 AFFINITY_SHARED_PARENT = 1.5      # bonus if nodes share an is-a parent
@@ -583,7 +583,12 @@ class ReflectorModule:
         return scrubbed
 
     def expire_unnamed_epistemic_schemas(self) -> int:
-        """Dissolve stagnant unnamed schema wrappers; members and their edges remain."""
+        """Dissolve only empty or chronically incoherent unnamed shells.
+
+        Unnamed is a valid terminal state (§13.3.1). Do not delete a schema
+        just because it lacks a label. Require: past cycle budget AND
+        (no members OR coherence collapsed).
+        """
         graph = self.archivist.graph
         dissolved = 0
         for node, data in list(graph.nodes(data=True)):
@@ -594,21 +599,19 @@ class ReflectorModule:
                 continue
             cycles = int(data.get("unnamed_cycles", 0)) + 1
             data["unnamed_cycles"] = cycles
-            # Reinforced recently? treat as not stagnant
-            # last_reinforced is datetime — if member_count grew this pass, growth path resets via caller
             if cycles < self.EPISTEMIC_UNNAMED_MAX_CYCLES:
                 continue
             members = [
                 v for _u, v, ed in list(graph.out_edges(node, data=True))
                 if ed.get("relation_type") == EDGE_COMPOSED_OF
             ]
-            coh = self.cluster_coherence(members) if members else 0.0
-            # Still improving coherence — keep probation
-            prev = float(data.get("last_coherence", 0.0))
-            data["last_coherence"] = coh
-            if coh > prev + 0.02 and cycles < self.EPISTEMIC_UNNAMED_MAX_CYCLES * 2:
-                continue
-            # Dissolve wrapper only
+            if len(members) >= self.EPISTEMIC_MIN_CLUSTER_SIZE:
+                # Durable structural fact — keep even if unnamed
+                coh = self.cluster_coherence(members)
+                data["last_coherence"] = coh
+                if coh >= self.EPISTEMIC_MIN_COHERENCE * 0.7:
+                    continue
+            # Empty or incoherent shell only
             if node in graph:
                 graph.remove_node(node)
                 dissolved += 1
@@ -765,10 +768,11 @@ class ReflectorModule:
                 continue
             coh = self.cluster_coherence(members)
             lr = self.lemma_ratio(members)
+            # Only destroy empty/broken shells — not "unnamed but coherent"
             bad = (
-                (not data.get("named") and coh < self.EPISTEMIC_MIN_COHERENCE * 0.85)
-                or lr < self.EPISTEMIC_MIN_LEMMA_RATIO * 0.9
-                or len(members) < 2
+                len(members) < 2
+                or (lr < 0.25 and coh < 0.15)
+                or (not data.get("named") and coh < 0.12 and lr < 0.3)
             )
             if bad:
                 graph.remove_node(node)

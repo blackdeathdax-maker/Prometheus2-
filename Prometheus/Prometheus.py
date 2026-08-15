@@ -1088,20 +1088,20 @@ class Prometheus:
         future selection (see _select_self_study_target's has_room)."""
         target = None
         expansions = []
+        expansion_plan = []  # ordered (kind, term) hyponym → hypernym → …
         for _ in range(self.SELF_STUDY_MAX_ATTEMPTS):
             target = self._select_self_study_target()
             if target is None:
                 return
             try:
-                expansions = self.sensory.lookup_expansion(target)
+                expansion_plan = self._ordered_self_study_expansions(target)
+                expansions = [t for _kind, t in expansion_plan]
             except Exception as e:
-                logger.warning("lookup_expansion(%r) failed: %s", target, e)
+                logger.warning("ordered expansion(%r) failed: %s", target, e)
                 expansions = []
+                expansion_plan = []
             if expansions:
                 break
-            # Verified dead end -- memoize so this specific node is never
-            # wastefully re-picked again, freeing the random-selection
-            # pool toward nodes that can actually still produce children.
             self._barren_self_study_targets.add(target)
             target = None
 
@@ -1127,7 +1127,8 @@ class Prometheus:
         basin_key = self.synthesizer.get_current_basin_key()
         felt_state = self.synthesizer.get_current_felt_state()
         placed_children = []
-        for child in expansions[:3]:
+        # Prefer hyponyms first (kind structure), then hypernyms, max 3
+        for kind, child in (expansion_plan or [("+", c) for c in expansions])[:3]:
             definition = self.sensory.lookup_definition(child) or ""
             result = self.association.place_node(
                 child, definition=definition, source="dictionary",
@@ -1136,6 +1137,15 @@ class Prometheus:
             term_id = result.get("term") if isinstance(result, dict) else result
             if term_id:
                 placed_children.append(term_id)
+                # Hyponyms get is-a toward target when missing (kind schema fuel)
+                if kind == "hyponym" and term_id != target:
+                    try:
+                        self.archivist.link(
+                            term_id, target, "is-a",
+                            source="dictionary", placement="explicit",
+                        )
+                    except Exception:
+                        pass
         self.archivist.store(target, source="dictionary")  # reinforce parent's last_reinforced
 
         # Co-activation (§13.3, new): target and its newly-placed children
@@ -1273,6 +1283,23 @@ class Prometheus:
 
         # Curiosity narrowing: prefer focus neighborhood over whole graph
         local = self.focus_neighborhood_ids(cap=48)
+        # Prefer members of existing epistemic schemas (deepen kinds)
+        try:
+            g = self.archivist.graph
+            for n, d in g.nodes(data=True):
+                if d.get("node_type") in ("epistemic_schema", "schema") or d.get("is_schema"):
+                    for _u, v, ed in g.out_edges(n, data=True):
+                        if ed.get("relation_type") == "composed-of":
+                            local.add(v)
+                    local.add(n)
+        except Exception:
+            pass
+        # Working-memory slots always preferred
+        try:
+            for sid in (wm.get("slots") or []):
+                local.add(sid)
+        except Exception:
+            pass
         pin = None
         try:
             # session pin is app-side; residual-top is engine-side
