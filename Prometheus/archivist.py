@@ -55,7 +55,7 @@ DEMOTION_HYSTERESIS_N = 2
 
 # §10 item 19 concrete pruning rule: still Tier 0 after N consolidation
 # cycles with no reinforcement -> eligible for pruning.
-PRUNE_TIER0_CYCLES = 5
+PRUNE_TIER0_CYCLES = 12  # longer life so co-activation can mature to Working/schemas
 
 # Activation / working-memory layer (new, this revision -- a v1-scoped
 # pull-forward of §11's deferred activation-based working-memory concept,
@@ -1229,11 +1229,22 @@ class ArchivistModule:
         as opposed to a raw salience score (the alternative it explicitly
         left undecided). Only prometheus.py should call this, and only
         while in the Pruning state."""
+        # Nodes in stabilized co-activation pairs are schema fuel — keep them.
+        protected = set()
+        try:
+            for a, b in self.stabilized_co_activation_pairs():
+                protected.add(a)
+                protected.add(b)
+        except Exception:
+            pass
         to_remove = [
             n for n, d in self.graph.nodes(data=True)
             if n != SELF_NODE
+            and n != OTHER_NODE
+            and n not in protected
             and not d.get("is_schema")
-            and d.get("node_type") not in (NODE_BASIN, NODE_EPISTEMIC_SCHEMA)
+            and not d.get("is_other")
+            and d.get("node_type") not in (NODE_BASIN, NODE_EPISTEMIC_SCHEMA, NODE_SCHEMA)
             and d.get("tier", TIER_PROVISIONAL) == TIER_PROVISIONAL
             and d.get("tier0_cycles", 0) >= self.PRUNE_TIER0_CYCLES
         ]

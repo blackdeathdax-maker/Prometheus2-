@@ -47,13 +47,14 @@ class Prometheus:
     # Fatigue state-cycling thresholds with hysteresis margins (spec §5).
     # --- Sleep pressure / micro-day cycle (replaces pure T1/T2 sawtooth) ---
     # Soft threshold band (no urgency → sleep sooner). Hard max always forces sleep.
-    SLEEP_SOFT_MIN = 0.35          # low-urgency ceiling (was near T1)
+    SLEEP_SOFT_MIN = 0.55          # longer Learning day before evening
     SLEEP_HARD_MAX = 0.92          # mandatory sleep
+    MIN_LEARNING_PULSES_BETWEEN_SLEEP = 45  # schema fuel needs a real Learning stretch
     SLEEP_WAKE_BELOW = 0.22        # exit sleep climate when pressure under this (scaled by debt)
     HYSTERESIS = 0.05
     # Legacy aliases so Debug sliders / old docs still map
-    T1 = 0.35
-    T2 = 0.75
+    T1 = 0.55
+    T2 = 0.85
 
     # Fatigue growth (per tick, scaled by urgency) and per-state recovery
     # rates. Consolidation recovers more than Pruning -- it's the
@@ -63,7 +64,7 @@ class Prometheus:
     # therefore all graph growth, unreachable after the first few ticks).
     # All three remain undecided tuning placeholders (§10) -- named here
     # specifically so the Debug tab's sliders can adjust them live.
-    FATIGUE_GROWTH_RATE = 0.2
+    FATIGUE_GROWTH_RATE = 0.12
     FATIGUE_RECOVERY_CONSOLIDATION = 0.88  # mild only — must not erase sleep pressure
     FATIGUE_RECOVERY_PRUNING = 0.7
     FATIGUE_RECOVERY_SLEEP = 0.55          # per-pulse pressure drop in sleep climate
@@ -250,6 +251,7 @@ class Prometheus:
         self.sleep_stage = "none"  # none | digest | reorganize | homeostatic | wake_prep
         self.sleep_debt = 0.0      # excess pressure carried into sleep (lengthens recovery)
         self.micro_day_pulse = 0
+        self.pulses_since_sleep = 0
         self._last_urgency = 0.0
         self.load_extended_state()  # restore focus/felt/topo/runtime if present
 
@@ -1505,16 +1507,17 @@ class Prometheus:
 
         self.micro_day_pulse = (int(self.micro_day_pulse) + 1) % max(8, int(self.MICRO_DAY_PULSES))
         day_frac = self.micro_day_pulse / max(1.0, float(self.MICRO_DAY_PULSES))
-        baseline = 0.015 + 0.025 * day_frac  # ~0.015 → ~0.040
+        baseline = 0.004 + 0.010 * day_frac  # gentle circadian, not a rush to sleep
 
         # Guaranteed awake tick so soft threshold is reachable in ~10–20 pulses
         # even if growth slider is 0 and intensity is 0.
-        MIN_PRESSURE_TICK = 0.025
+        MIN_PRESSURE_TICK = 0.008
 
         if self.state != "Sleep":
             work = max(0.0, intensity) * growth
             delta = MIN_PRESSURE_TICK + work + baseline
             self.fatigue = min(1.0, float(self.fatigue) + delta)
+            self.pulses_since_sleep = int(getattr(self, "pulses_since_sleep", 0)) + 1
         else:
             rec = float(self.FATIGUE_RECOVERY_SLEEP)
             self.fatigue = max(0.0, float(self.fatigue) * rec - 0.01 * (1.0 - min(1.0, self.sleep_debt)))
@@ -1522,6 +1525,7 @@ class Prometheus:
     def _enter_sleep(self):
         self.state = "Sleep"
         self.sleep_stage = "digest"
+        self.pulses_since_sleep = 0
         self.sleep_debt = max(0.0, self.fatigue - float(getattr(self, "SLEEP_SOFT_MIN", self.T1)))
         if hasattr(self, "modulators"):
             self.modulators.pulse("sleep_enter", amount=0.15)
@@ -1536,11 +1540,28 @@ class Prometheus:
             self.fatigue *= float(self.FATIGUE_RECOVERY_CONSOLIDATION)
             self.sleep_stage = "reorganize"
         elif stage == "reorganize":
-            # Collapse already runs inside consolidation; light extra prune of tier-0
+            # Prune only when cortex has some Working mass; early graphs
+            # need Tier-0 co-activation fuel for schemas.
             try:
-                pruned = self.archivist.prune()
-                if pruned:
-                    print(f"Sleep reorganize: pruned {pruned} stale Tier-0 node(s).")
+                g = self.archivist.graph
+                n_working = sum(
+                    1 for _, d in g.nodes(data=True)
+                    if d.get("tier", 0) >= 1
+                )
+                n_schema = sum(
+                    1 for _, d in g.nodes(data=True)
+                    if d.get("node_type") in ("epistemic_schema", "schema")
+                    or d.get("is_schema")
+                )
+                if n_working >= 8 or n_schema >= 1:
+                    pruned = self.archivist.prune()
+                    if pruned:
+                        print(f"Sleep reorganize: pruned {pruned} stale Tier-0 node(s).")
+                else:
+                    print(
+                        f"Sleep reorganize: skip prune "
+                        f"(working={n_working}, schemas={n_schema} — protecting fuel)"
+                    )
             except Exception as e:
                 print(f"Sleep prune: {e}")
             self.fatigue *= float(self.FATIGUE_RECOVERY_PRUNING)
@@ -1575,57 +1596,54 @@ class Prometheus:
                 self.sleep_stage = "digest"
 
     def _cycle_state(self):
-        """Sleep-pressure state machine: Learning → Consolidation → Sleep → Learning.
+        """Learning (long) → occasional Consolidation → Sleep only when due.
 
-        Consolidation is an evening stop *before* sleep, not a recovery loop
-        that returns to Learning. Mild pressure relief only; sleep is what
-        actually clears debt. This fixes the prior bug where Consolidation
-        halved fatigue and bounced back to Learning forever, so Sleep never
-        activated.
+        Schema formation needs many Learning pulses + several Consolidation
+        passes. Sleep must not fire every ~15 pulses and prune Tier-0 fuel.
         """
         urgency = self._last_urgency if self._last_urgency else self._compute_urgency()
-        thresh = self._sleep_threshold(urgency)
-        # Debug T1/T2 sliders stay live: map them onto soft/hard each cycle
         try:
             self.SLEEP_SOFT_MIN = float(getattr(self, "T1", self.SLEEP_SOFT_MIN))
         except Exception:
             pass
         try:
-            # T2 acts as hard sleep ceiling (old "Consolidation → Pruning" gate)
             self.SLEEP_HARD_MAX = max(
-                float(getattr(self, "SLEEP_SOFT_MIN", 0.35)) + 0.05,
+                float(getattr(self, "SLEEP_SOFT_MIN", 0.55)) + 0.05,
                 float(getattr(self, "T2", self.SLEEP_HARD_MAX)),
             )
         except Exception:
             pass
         soft = float(getattr(self, "SLEEP_SOFT_MIN", self.T1))
         hard = float(getattr(self, "SLEEP_HARD_MAX", 0.92))
+        min_learn = int(getattr(self, "MIN_LEARNING_PULSES_BETWEEN_SLEEP", 45))
+        since = int(getattr(self, "pulses_since_sleep", 0))
+        day_ok = since >= min_learn
 
         if self.state == "Learning":
-            # Evening band: consolidate once, then sleep. Hard ceiling: sleep now.
-            if self.fatigue >= hard:
-                self._enter_sleep()
-            elif self.fatigue >= soft:
-                # Prefer a consolidation pass when not already past hard max.
-                # At very low urgency thresh≈soft, still do consolidation first
-                # so graph structure updates before sleep climate.
+            if self.fatigue >= hard and day_ok:
                 self.state = "Consolidation"
-        elif self.state == "Consolidation":
-            # Always run consolidation work this pulse, then advance toward sleep.
-            # Do NOT return to Learning from here — that was the trap.
-            pass
-        elif self.state == "Sleep":
-            pass  # handled below
+            elif self.fatigue >= soft and day_ok:
+                self.state = "Consolidation"
+            elif self.fatigue >= hard and not day_ok:
+                # Too early for sleep: still consolidate to form schemas, then Learning
+                self.state = "Consolidation"
         elif self.state == "Pruning":
             self._enter_sleep()
 
         if self.state == "Consolidation":
             self._run_consolidation()
-            # Mild relief only — keep pressure high enough that next step is sleep
             self.fatigue *= float(self.FATIGUE_RECOVERY_CONSOLIDATION)
-            self.fatigue = max(self.fatigue, soft * 0.75)
-            # After evening consolidation → sleep climate
-            self._enter_sleep()
+            # Sleep only after a real Learning stretch; otherwise return to Learning
+            if day_ok and self.fatigue >= soft * 0.7:
+                self._enter_sleep()
+            else:
+                # Partial day: keep Learning so co-activation + tiers can mature
+                self.fatigue = min(soft * 0.9, max(0.15, self.fatigue))
+                self.state = "Learning"
+                print(
+                    f"Consolidation done → Learning "
+                    f"(since_sleep={since}/{min_learn}, pressure={self.fatigue:.3f})"
+                )
         elif self.state == "Sleep":
             self._run_sleep_pulse()
 
