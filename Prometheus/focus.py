@@ -28,6 +28,7 @@ from .edge_types import (
     get_family,
     NODE_SCHEMA,
     NODE_EPISTEMIC_SCHEMA,
+    EDGE_COMPOSED_OF,
 )
 
 logger = logging.getLogger(__name__)
@@ -322,14 +323,22 @@ class FocusModule:
         """
         fid = focus_id or self.focus_id
         if not fid or fid not in graph:
+            self._closure_cache = set()
             return 0
+        self._closure_cache = self.schema_closure(graph, fid)
         means_rels = {
             "associated-with", "causes", "enables", "results-in",
             "responsible-for", "composed-of", "is-a", "part-of",
             "agent", "instrument", "prevents",
         }
         n = 0
-        # Nodes that point at focus or that focus points at
+        # Schema-guided: residual on members + nested child schemas
+        for other in self.schema_closure(graph, fid):
+            if other in (SELF_NODE, OTHER_NODE, fid):
+                continue
+            self.boost_means(other)
+            n += 1
+        # Structural neighbors still count (means toward focus)
         for u, v, ed in list(graph.in_edges(fid, data=True)) + list(graph.out_edges(fid, data=True)):
             rel = ed.get("relation_type", "")
             if rel not in means_rels:
@@ -540,25 +549,79 @@ class FocusModule:
     def focus_id(self) -> Optional[str]:
         return self.thread.target_id if self.thread else None
 
+
+    def schema_closure(self, graph, root_id: str, max_n: int = 48) -> Set[str]:
+        """Focus root + schema members + nested child schemas (depth ≤ 2)."""
+        if not root_id or root_id not in graph:
+            return set()
+        out: Set[str] = {root_id}
+        is_schema = graph.nodes.get(root_id, {}).get("node_type") in (
+            NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA,
+        )
+
+        def add_composed(schema_id: str, depth: int) -> None:
+            if depth > 2 or schema_id not in graph or len(out) >= max_n:
+                return
+            for _u, v, ed in graph.out_edges(schema_id, data=True):
+                if len(out) >= max_n:
+                    break
+                if ed.get("relation_type") != EDGE_COMPOSED_OF:
+                    continue
+                if v in out:
+                    continue
+                out.add(v)
+                if graph.nodes.get(v, {}).get("node_type") in (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA):
+                    add_composed(v, depth + 1)
+
+        if is_schema:
+            add_composed(root_id, 0)
+        else:
+            for _u, v in list(graph.out_edges(root_id))[:12]:
+                out.add(v)
+            for u, _v in list(graph.in_edges(root_id))[:12]:
+                out.add(u)
+            for u, _v, ed in graph.in_edges(root_id, data=True):
+                if ed.get("relation_type") == EDGE_COMPOSED_OF:
+                    if graph.nodes.get(u, {}).get("node_type") in (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA):
+                        out.add(u)
+                        add_composed(u, 1)
+                    break
+        return out
+
     def focus_boost_for(self, node_id: str) -> float:
-        """Additive score bonus for WM ranking."""
+        """Additive score bonus for WM ranking (schema-guided closure)."""
         if self.thread and node_id == self.thread.target_id:
             return self.WM_FOCUS_BONUS
         if any(t.target_id == node_id for t in self.stack):
             return self.WM_FOCUS_BONUS * 0.45
+        if self.thread and self._closure_cache_contains(node_id):
+            return self.WM_FOCUS_BONUS * 0.65
         if self.r_means.get(node_id, 0) > 0.5:
             return min(2.5, self.r_means[node_id] * 0.4)
         return 0.0
 
     def self_study_weight(self, node_id: str) -> float:
-        """Multiplicative-ish weight contribution for self-study selection."""
+        """Self-study selection weight — prefer focus schema closure."""
         if self.thread and node_id == self.thread.target_id:
             return self.SELF_STUDY_FOCUS_WEIGHT
-        # Neighbourhood: mild boost if residual is high
+        if self.thread and self._closure_cache_contains(node_id):
+            return max(2.2, float(self.SELF_STUDY_FOCUS_WEIGHT) * 0.55)
         r = self.total_residual(node_id)
         if r > 1.0:
             return 1.0 + min(2.0, r / 5.0)
         return 1.0
+
+    def _closure_cache_contains(self, node_id: str) -> bool:
+        return node_id in (getattr(self, "_closure_cache", None) or set())
+
+    def refresh_closure_cache(self, graph) -> Set[str]:
+        """Recompute focus schema closure after focus tick."""
+        fid = self.focus_id
+        if not fid:
+            self._closure_cache = set()
+            return set()
+        self._closure_cache = self.schema_closure(graph, fid)
+        return self._closure_cache
 
     def protected_ids(self) -> Set[str]:
         out: Set[str] = set()
@@ -568,16 +631,12 @@ class FocusModule:
             out.add(t.target_id)
         return out
 
-    def neighbourhood_boost_ids(self, graph, max_n: int = 12) -> Set[str]:
-        """Focus target + immediate neighbors for self-study pool bias."""
+    def neighbourhood_boost_ids(self, graph, max_n: int = 48) -> Set[str]:
+        """Focus target + schema closure for self-study pool bias."""
         fid = self.focus_id
         if not fid or fid not in graph:
             return set()
-        ids = {fid}
-        for _, v in list(graph.out_edges(fid))[:max_n]:
-            ids.add(v)
-        for u, _ in list(graph.in_edges(fid))[:max_n]:
-            ids.add(u)
+        ids = self.schema_closure(graph, fid, max_n=max_n)
         return ids
 
     # ------------------------------------------------------------------

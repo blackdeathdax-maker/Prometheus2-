@@ -967,6 +967,14 @@ class Prometheus:
             pulse=self.pulse_count,
             basin_anchor_set=basin_anchors,
         )
+        try:
+            self.focus.refresh_closure_cache(self.archivist.graph)
+            # Schema-guided residual: keep members "warm" while schema is focus
+            for nid in list(getattr(self.focus, "_closure_cache", set()) or [])[:40]:
+                self.focus.boost_residual(nid, amount=0.08)
+        except Exception as e:
+            logger.debug("schema-guided focus warm failed: %s", e)
+
         # Explicit commitments (contentful substrate)
         if getattr(self, "goals", None) is not None:
             try:
@@ -1641,6 +1649,12 @@ class Prometheus:
             pass
         # §13.y: sticky focus / residual neighbourhood bias
         weights = [w * self.focus.self_study_weight(n) for n, w in zip(pool, weights)]
+        try:
+            guided = self.focus.neighbourhood_boost_ids(self.archivist.graph)
+            if guided:
+                weights = [w * 3.5 if n in guided else w for n, w in zip(pool, weights)]
+        except Exception:
+            pass
         return random.choices(pool, weights=weights, k=1)[0]
 
     # ------------------------------------------------------------------
