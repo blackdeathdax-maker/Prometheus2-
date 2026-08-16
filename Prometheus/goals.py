@@ -66,19 +66,22 @@ class Commitment:
     fail_reason: str = ""
     success_reason: str = ""
     dwell_pulses: int = 0
+    off_focus_pulses: int = 0
 
 
 class GoalModule:
     """Bounded set of explicit commitments (node or schema targets)."""
 
     MAX_ACTIVE = 5
-    COMMIT_AFTER_PULSES = 10
+    COMMIT_AFTER_PULSES = 8
     SATISFY_RESIDUAL_BELOW = 1.15
     SATISFY_MIN_DWELL = 6
     SCHEMA_GROWTH_MEMBERS = 2
     SCHEMA_GROWTH_NESTED = 1
     SCHEMA_GROWTH_EVENTS = 2
     FAIL_ON_STAGNATION = True
+    STAGNATION_OFF_FOCUS_MIN = 40   # must be off-focus this long before stagnation fails
+    FORCE_SWITCH_OFF_FOCUS_MIN = 25
     STRENGTH_DECAY = 0.98
     STRENGTH_FOCUS_BOOST = 0.05
     STRENGTH_CAP = 3.0
@@ -184,12 +187,17 @@ class GoalModule:
             last_pulse=pulse,
             strength=1.0,
             dwell_pulses=1,
+            off_focus_pulses=0,
             is_schema_goal=is_schema,
             baseline_member_count=leaves,
             baseline_nested_count=nested,
             last_member_count=leaves,
             last_nested_count=nested,
             growth_events=0,
+        )
+        print(
+            f"Goals: OPEN {gid} schema={is_schema} "
+            f"members={leaves} nested={nested} pulse={pulse}"
         )
 
     def tick(
@@ -205,10 +213,36 @@ class GoalModule:
         for gid, g in list(self.active.items()):
             g.last_pulse = pulse
             on_focus = focus_id == g.target_id
+            # Also treat focus on schema closure as on-goal (Color schema vs Color node)
+            if not on_focus and graph is not None and g.is_schema_goal:
+                try:
+                    if focus_id in self.schema_closure_ids(graph, g.target_id):
+                        on_focus = True
+                except Exception:
+                    pass
+            if not on_focus and graph is not None and focus_id:
+                # Focus on schema whose dominant parent / name matches target lemma
+                try:
+                    fd = graph.nodes.get(focus_id, {})
+                    if fd.get("node_type") in (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA):
+                        if str(fd.get("name") or "").casefold() == str(g.target_id).casefold():
+                            on_focus = True
+                        if str(fd.get("dominant_parent") or "").casefold() == str(g.target_id).casefold():
+                            on_focus = True
+                    # Inverse: goal on schema, focus on lemma name
+                    if g.is_schema_goal:
+                        gd = graph.nodes.get(g.target_id, {})
+                        if str(gd.get("name") or "").casefold() == str(focus_id).casefold():
+                            on_focus = True
+                except Exception:
+                    pass
+
             if on_focus:
                 g.dwell_pulses += 1
+                g.off_focus_pulses = 0
                 g.strength = min(self.STRENGTH_CAP, g.strength + self.STRENGTH_FOCUS_BOOST)
             else:
+                g.off_focus_pulses = int(getattr(g, "off_focus_pulses", 0) or 0) + 1
                 g.strength *= self.STRENGTH_DECAY
 
             r = 0.0
@@ -267,15 +301,28 @@ class GoalModule:
                     satisfied += 1
                     continue
 
-            if self.FAIL_ON_STAGNATION and stagnation and not on_focus and r > self.SATISFY_RESIDUAL_BELOW * 1.5:
+            off = int(getattr(g, "off_focus_pulses", 0) or 0)
+            # Stagnation/explore overrides must NOT kill a fresh commitment
+            if (
+                self.FAIL_ON_STAGNATION
+                and stagnation
+                and not on_focus
+                and off >= self.STAGNATION_OFF_FOCUS_MIN
+                and r > self.SATISFY_RESIDUAL_BELOW * 1.5
+            ):
                 self._close(g, status="failed", pulse=pulse, reason="stagnation")
                 failed += 1
                 continue
-            if force_switch and not on_focus and r > self.SATISFY_RESIDUAL_BELOW * 2.0:
+            if (
+                force_switch
+                and not on_focus
+                and off >= self.FORCE_SWITCH_OFF_FOCUS_MIN
+                and r > self.SATISFY_RESIDUAL_BELOW * 2.0
+            ):
                 self._close(g, status="failed", pulse=pulse, reason="force_switch_heat")
                 failed += 1
                 continue
-            if g.strength < 0.25 and not on_focus:
+            if g.strength < 0.2 and not on_focus and off >= 30:
                 self._close(g, status="failed", pulse=pulse, reason="strength_collapse")
                 failed += 1
                 continue
