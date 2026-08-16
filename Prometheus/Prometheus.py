@@ -979,7 +979,7 @@ class Prometheus:
         if getattr(self, "goals", None) is not None:
             try:
                 fid = self.focus.focus_id
-                self.goals.observe_focus(fid, self.pulse_count)
+                self.goals.observe_focus(fid, self.pulse_count, graph=self.archivist.graph)
                 fs = self.last_focus_summary or {}
                 summary = self.goals.tick(
                     pulse=self.pulse_count,
@@ -989,12 +989,26 @@ class Prometheus:
                     force_switch=bool(fs.get("force_switch") or fs.get("hard_age_escape")),
                     graph=self.archivist.graph,
                 )
-                # Inject commitment residual into focus store
+                # Inject commitment residual into focus store (target + schema closure)
+                graph = self.archivist.graph
+                boosted = set()
                 for tid in self.goals.active_target_ids():
-                    boost = self.goals.commitment_boost(tid)
-                    if boost > 0:
+                    boost = self.goals.commitment_boost(tid, graph=graph)
+                    if boost > 0 and tid not in boosted:
                         self.focus.boost_residual(tid, amount=min(1.2, boost * 0.35))
-                if summary.get("satisfied") or summary.get("failed"):
+                        boosted.add(tid)
+                    # Warm schema members under the goal
+                    try:
+                        for mid in list(self.goals.schema_closure_ids(graph, tid))[:32]:
+                            if mid in boosted:
+                                continue
+                            b = self.goals.commitment_boost(mid, graph=graph)
+                            if b > 0:
+                                self.focus.boost_residual(mid, amount=min(0.8, b * 0.25))
+                                boosted.add(mid)
+                    except Exception:
+                        pass
+                if summary.get("satisfied_this_tick") or summary.get("failed_this_tick"):
                     print(f"Goals: {summary}")
             except Exception as e:
                 logger.warning("goals tick failed: %s", e)
@@ -2234,7 +2248,7 @@ class Prometheus:
         protected_nodes |= self.focus.protected_ids()
         if getattr(self, "goals", None) is not None:
             try:
-                protected_nodes |= set(self.goals.active_target_ids())
+                protected_nodes |= set(self.goals.protected_ids(self.archivist.graph))
             except Exception:
                 pass
 
