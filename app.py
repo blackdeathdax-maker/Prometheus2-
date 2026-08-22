@@ -778,6 +778,25 @@ if st.session_state.prom is not None:
                 st.caption("No schema slots filled yet.")
 
             st.divider()
+            st.subheader("Stream of Consciousness")
+            st.caption(
+                "Moment-to-moment trace from focus, felt state, working memory, "
+                "and goals — template-only, not an LLM monologue. Updates every pulse."
+            )
+            try:
+                soc = prom.get_stream_report(last_n=15) if hasattr(prom, "get_stream_report") else {}
+            except Exception as e:
+                soc = {"beats": [], "latest": "", "error": str(e)}
+            if soc.get("latest"):
+                st.info(soc["latest"])
+            beats = soc.get("beats") or []
+            if beats:
+                with st.expander(f"Recent stream ({len(beats)} beats)", expanded=False):
+                    for b in reversed(beats):
+                        st.write(f"**p{b.get('pulse')}** — {b.get('line')}")
+            else:
+                st.caption("No stream beats yet — run a few pulses.")
+
             st.subheader("Self-Narrative (§16, new)")
             st.caption(
                 "Compressed, decaying record of what has turned out to "
