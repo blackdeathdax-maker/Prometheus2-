@@ -787,13 +787,19 @@ if st.session_state.prom is not None:
                 soc = prom.get_stream_report(last_n=15) if hasattr(prom, "get_stream_report") else {}
             except Exception as e:
                 soc = {"beats": [], "latest": "", "error": str(e)}
+            if soc.get("monologue"):
+                st.markdown("**Inner monologue**")
+                st.write(soc["monologue"])
             if soc.get("latest"):
+                st.caption("Latest beat")
                 st.info(soc["latest"])
             beats = soc.get("beats") or []
             if beats:
                 with st.expander(f"Recent stream ({len(beats)} beats)", expanded=False):
                     for b in reversed(beats):
-                        st.write(f"**p{b.get('pulse')}** — {b.get('line')}")
+                        kind = b.get("kind") or "pulse"
+                        tag = "⚡" if kind == "event" else "·"
+                        st.write(f"{tag} **p{b.get('pulse')}** — {b.get('line')}")
             else:
                 st.caption("No stream beats yet — run a few pulses.")
 
