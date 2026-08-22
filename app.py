@@ -490,6 +490,39 @@ if st.session_state.prom is not None:
                         "clustering is correctly skipped as redundant)."
                     )
 
+            st.subheader("Goals / Commitments")
+            st.caption(
+                "Explicit commitments opened by focus dwell. Schema goals track "
+                "member/nested growth; node goals track residual cool-down."
+            )
+            try:
+                gr = prom.get_goals_report() if hasattr(prom, "get_goals_report") else {"active": [], "recent_history": []}
+            except Exception as e:
+                gr = {"active": [], "recent_history": [], "error": str(e)}
+            gcol1, gcol2 = st.columns(2)
+            with gcol1:
+                st.metric("Active goals", len(gr.get("active") or []))
+            with gcol2:
+                st.metric("Recent closed", len(gr.get("recent_history") or []))
+            if gr.get("active"):
+                for g in gr["active"]:
+                    tag = "schema" if g.get("is_schema_goal") else "node"
+                    st.write(
+                        f"- **`{g.get('target_id')}`** ({tag}) "
+                        f"str={g.get('strength')} dwell={g.get('dwell_pulses')} "
+                        f"members={g.get('members')} nested={g.get('nested')} "
+                        f"growth={g.get('growth_events')}"
+                    )
+            else:
+                st.caption("No active goals — hold focus on a node/schema for ~8+ pulses.")
+            if gr.get("recent_history"):
+                with st.expander("Recent goal history"):
+                    for h in gr["recent_history"]:
+                        st.write(
+                            f"- `{h.get('target_id')}` → **{h.get('status')}** "
+                            f"({h.get('reason')}) @ pulse {h.get('pulse')}"
+                        )
+
             st.subheader("Directed Working Memory (§14, new)")
             st.caption(
                 "What's actually 'in mind' right now -- SELF + current basin "
