@@ -237,8 +237,8 @@ class Prometheus:
         self.goals = GoalModule() if GoalModule is not None else None
 
         # --- Learning policy (phase / inhibition / valence / lookup budgets) ---
-        self.DICT_LOOKUPS_PER_PULSE = 4
-        self.DICT_LOOKUPS_PER_WAKE = 200
+        self.DICT_LOOKUPS_PER_PULSE = 6
+        self.DICT_LOOKUPS_PER_WAKE = 300
         self._dict_lookups_this_pulse = 0
         self._dict_lookups_this_wake = 0
         self.PEDAGOGICAL_COACT_WEIGHT = 2.5
@@ -1227,43 +1227,49 @@ class Prometheus:
 
     def _may_dictionary_lookup(self, term: str, source: str = "dictionary",
                                context_node=None) -> bool:
-        """WordNet is a shelf: lookup needs a reason + budget.
+        """WordNet shelf: allow expand-from-known; budget new free-floating nodes.
 
-        Reasons (any one):
-          - term already in graph (reinforce)
-          - context_node is a known graph node (self-study expand-from-parent)
-          - context_node or focus/WM/goal open set is non-empty
-        Free-floating dictionary minting with no context and no open set: deny.
+        Self-study always passes context_node=target (known node) → allow.
+        Budget only limits brand-new terms without a graph parent context.
         """
         if source != "dictionary":
             return True
-        # Already known — reinforce free (does not spend budget)
-        try:
-            if term and term in self.archivist.graph:
-                return True
-        except Exception:
-            pass
+        g = self.archivist.graph
+        # Already present (any case) — free reinforce
+        if term in g:
+            return True
+        if term:
+            low = str(term).casefold()
+            for n in g.nodes:
+                if str(n).casefold() == low:
+                    return True
 
-        # Budget (only for NEW nodes)
         pulse_n = int(getattr(self, "_dict_lookups_this_pulse", 0) or 0)
         wake_n = int(getattr(self, "_dict_lookups_this_wake", 0) or 0)
-        if pulse_n >= self.DICT_LOOKUPS_PER_PULSE:
-            return False
-        if wake_n >= self.DICT_LOOKUPS_PER_WAKE:
+        per_pulse = int(getattr(self, "DICT_LOOKUPS_PER_PULSE", 6) or 6)
+        per_wake = int(getattr(self, "DICT_LOOKUPS_PER_WAKE", 300) or 300)
+        if pulse_n >= per_pulse or wake_n >= per_wake:
             return False
 
-        # Primary reason: expanding from a known parent/target (self-study)
-        if context_node and context_node in self.archivist.graph:
-            self._dict_lookups_this_pulse = pulse_n + 1
-            self._dict_lookups_this_wake = wake_n + 1
-            return True
+        # Expand from a known context/target → always a valid reason
+        if context_node:
+            if context_node in g:
+                self._dict_lookups_this_pulse = pulse_n + 1
+                self._dict_lookups_this_wake = wake_n + 1
+                return True
+            # case-insensitive context match
+            cl = str(context_node).casefold()
+            for n in g.nodes:
+                if str(n).casefold() == cl:
+                    self._dict_lookups_this_pulse = pulse_n + 1
+                    self._dict_lookups_this_wake = wake_n + 1
+                    return True
 
         open_ids = self._open_parent_ids()
         if open_ids:
             self._dict_lookups_this_pulse = pulse_n + 1
             self._dict_lookups_this_wake = wake_n + 1
             return True
-
         return False
 
     def _current_basin_key(self) -> str:
@@ -1541,6 +1547,7 @@ class Prometheus:
             result = self.association.place_node(
                 child, definition=definition, source="dictionary",
                 context_node=target, max_parent_children=self.SELF_STUDY_SOFT_CAP,
+                force_lookup=True,
             )
             term_id = result.get("term") if isinstance(result, dict) else result
             if term_id:
@@ -1566,6 +1573,7 @@ class Prometheus:
                         source="dictionary",
                         context_node=target,
                         max_parent_children=self.SELF_STUDY_SOFT_CAP,
+                        force_lookup=True,
                     )
                     term_id = result.get("term") if isinstance(result, dict) else result
                     if term_id:
@@ -1573,6 +1581,7 @@ class Prometheus:
             except Exception as e:
                 logger.warning("hypernym fallback failed: %s", e)
         if not placed_children:
+            print(f"Self-study: no children placed for target={target!r} plan={expansion_plan[:5]!r}")
             return
 
         # Co-activation (§13.3): target + newly-placed children this cycle

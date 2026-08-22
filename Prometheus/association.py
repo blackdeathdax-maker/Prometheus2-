@@ -100,7 +100,8 @@ class AssociationEngine:
 
     def place_node(self, term: str, definition: str = "", source: str = "user",
                     context_node: Optional[str] = None,
-                    max_parent_children: Optional[int] = None) -> Dict:
+                    max_parent_children: Optional[int] = None,
+                    force_lookup: bool = False) -> Dict:
         """
         Places `term` into the knowledge web using §2.3's two paths:
           1. Dictionary-pattern parsing on `definition`, if it yields a
@@ -131,12 +132,16 @@ class AssociationEngine:
         # Quality gate: self_generated / expansion terms should look concept-like.
         # Full user sentences still allowed (source=user) so dialogue is recorded.
         term_s = str(term).strip()
-        if source == "dictionary" and callable(self.lookup_gate):
+        if source == "dictionary" and callable(self.lookup_gate) and not force_lookup:
             try:
                 if not self.lookup_gate(term_s, source, context_node):
                     return {"term": None, "skipped": "lookup_denied", "reason": "no_reason_to_lookup"}
-            except Exception:
-                return {"term": None, "skipped": "lookup_denied", "reason": "gate_error"}
+            except Exception as e:
+                # Fail OPEN on gate errors so self-study never hard-locks
+                try:
+                    print(f"lookup_gate error ({term_s!r}): {e}")
+                except Exception:
+                    pass
         if source in ("self_generated", "schema", "social", "dictionary"):
             words = term_s.split()
             # Allow multiword WordNet lemmas; still block sentence-like strings
