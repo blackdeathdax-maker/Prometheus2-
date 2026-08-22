@@ -237,8 +237,8 @@ class Prometheus:
         self.goals = GoalModule() if GoalModule is not None else None
 
         # --- Learning policy (phase / inhibition / valence / lookup budgets) ---
-        self.DICT_LOOKUPS_PER_PULSE = 2
-        self.DICT_LOOKUPS_PER_WAKE = 40
+        self.DICT_LOOKUPS_PER_PULSE = 4
+        self.DICT_LOOKUPS_PER_WAKE = 200
         self._dict_lookups_this_pulse = 0
         self._dict_lookups_this_wake = 0
         self.PEDAGOGICAL_COACT_WEIGHT = 2.5
@@ -1227,28 +1227,44 @@ class Prometheus:
 
     def _may_dictionary_lookup(self, term: str, source: str = "dictionary",
                                context_node=None) -> bool:
-        """WordNet is a shelf: only open an entry with reason + budget."""
+        """WordNet is a shelf: lookup needs a reason + budget.
+
+        Reasons (any one):
+          - term already in graph (reinforce)
+          - context_node is a known graph node (self-study expand-from-parent)
+          - context_node or focus/WM/goal open set is non-empty
+        Free-floating dictionary minting with no context and no open set: deny.
+        """
         if source != "dictionary":
             return True
-        # Already known — reinforcing is fine
-        if term in self.archivist.graph:
+        # Already known — reinforce free (does not spend budget)
+        try:
+            if term and term in self.archivist.graph:
+                return True
+        except Exception:
+            pass
+
+        # Budget (only for NEW nodes)
+        pulse_n = int(getattr(self, "_dict_lookups_this_pulse", 0) or 0)
+        wake_n = int(getattr(self, "_dict_lookups_this_wake", 0) or 0)
+        if pulse_n >= self.DICT_LOOKUPS_PER_PULSE:
+            return False
+        if wake_n >= self.DICT_LOOKUPS_PER_WAKE:
+            return False
+
+        # Primary reason: expanding from a known parent/target (self-study)
+        if context_node and context_node in self.archivist.graph:
+            self._dict_lookups_this_pulse = pulse_n + 1
+            self._dict_lookups_this_wake = wake_n + 1
             return True
-        if self._dict_lookups_this_pulse >= self.DICT_LOOKUPS_PER_PULSE:
-            return False
-        if self._dict_lookups_this_wake >= self.DICT_LOOKUPS_PER_WAKE:
-            return False
+
         open_ids = self._open_parent_ids()
-        if context_node and context_node in open_ids:
-            self._dict_lookups_this_pulse += 1
-            self._dict_lookups_this_wake += 1
+        if open_ids:
+            self._dict_lookups_this_pulse = pulse_n + 1
+            self._dict_lookups_this_wake = wake_n + 1
             return True
-        # Focus / WM / goal must justify *some* open parent
-        if not open_ids:
-            return False
-        # Allow if any open node is a plausible parent context (always if we have open set)
-        self._dict_lookups_this_pulse += 1
-        self._dict_lookups_this_wake += 1
-        return True
+
+        return False
 
     def _current_basin_key(self) -> str:
         try:
@@ -2317,6 +2333,9 @@ class Prometheus:
         return True
 
     def _run_consolidation(self):
+        # Soft recovery of lookup budget so multi-hour Learning soaks still expand
+        self._dict_lookups_this_wake = max(0, int(getattr(self, '_dict_lookups_this_wake', 0) or 0) - 30)
+
         """
         Everything the spec pins to the Consolidation clock, in one place
         (§5, §3.3, §2.3 mechanism 3, §4.5, §2.1b, §5's slow-layer baseline
