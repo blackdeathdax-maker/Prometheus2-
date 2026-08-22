@@ -1123,27 +1123,22 @@ class ArchivistModule:
     # (a per-node score): this is per-PAIR, tracking which nodes get
     # touched together, not just how often each is touched alone.
     # ------------------------------------------------------------------
-    def record_co_activation(self, nodes: List[str]):
-        """Bumps the co-activation count for every pair within `nodes` --
-        called once per "touch event" (a self-study cycle's target plus
-        its newly-placed children, an ingestion's node plus its felt-state
-        anchor). Deliberately pairwise-within-the-event, not all-pairs
-        across the whole graph -- this is what keeps it sparse. Silently
-        ignores nodes not actually in the graph (defensive; callers
-        shouldn't need to pre-filter).
+    def record_co_activation(self, nodes: List[str], weight: float = 1.0):
+        """Bumps co-activation for pairs within `nodes`.
 
-        Also lifts co-activation one level: if two+ of the touched nodes
-        are members of different epistemic/somatic schemas, those schemas
-        receive a co-activation bump (schema–schema fuel for Tier-2).
+        weight < 1: gated/weak evidence (off-basin, parent closed)
+        weight > 1: pedagogical / lesson boost
         """
         real_nodes = [n for n in nodes if n in self.graph]
         if len(real_nodes) < 2:
             return
         unique = sorted(set(real_nodes))
+        w = float(weight) if weight is not None else 1.0
+        if w <= 0:
+            return
         for a, b in combinations(unique, 2):
-            self.co_activation[(a, b)] += 1
-        # Schema–schema lift
-        self.record_schema_co_activation(unique)
+            self.co_activation[(a, b)] = self.co_activation.get((a, b), 0) + w
+        self.record_schema_co_activation(unique, amount=w)
 
     def schemas_covering(self, node_id: str) -> List[str]:
         """Return schema node ids that claim `node_id` via composed-of (in-edge)."""

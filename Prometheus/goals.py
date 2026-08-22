@@ -93,6 +93,7 @@ class GoalModule:
         self.active: Dict[str, Commitment] = {}
         self.history: List[Commitment] = []
         self._dwell: Dict[str, int] = {}
+        self._on_event = None  # optional callable(event, target, detail, pulse)
         self.load()
 
     def _gid(self, target_id: str) -> str:
@@ -199,6 +200,15 @@ class GoalModule:
             f"Goals: OPEN {gid} schema={is_schema} "
             f"members={leaves} nested={nested} pulse={pulse}"
         )
+        if callable(self._on_event):
+            try:
+                self._on_event(
+                    "open", focus_id,
+                    detail=f"schema={is_schema};members={leaves};nested={nested}",
+                    pulse=pulse,
+                )
+            except Exception:
+                pass
 
     def tick(
         self,
@@ -346,6 +356,15 @@ class GoalModule:
         self.history.append(g)
         if len(self.history) > self.HISTORY_CAP:
             self.history = self.history[-self.HISTORY_CAP :]
+        if callable(self._on_event):
+            try:
+                self._on_event(
+                    status, g.target_id,
+                    detail=g.success_reason or g.fail_reason,
+                    pulse=pulse,
+                )
+            except Exception:
+                pass
 
     def commitment_boost(self, node_id: str, graph=None) -> float:
         g = self.active.get(self._gid(node_id))

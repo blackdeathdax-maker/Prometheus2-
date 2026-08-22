@@ -479,6 +479,101 @@ class ReflectorModule:
         self.merge_schemas_sharing_name()
         return named
 
+
+
+    def prune_hollow_meta_schemas(self) -> int:
+        """Remove high-abstraction schemas with <2 real members."""
+        graph = self.archivist.graph
+        removed = 0
+        for n, d in list(graph.nodes(data=True)):
+            if d.get("node_type") != NODE_EPISTEMIC_SCHEMA:
+                continue
+            lvl = int(d.get("abstraction_level", 1) or 1)
+            if lvl < 3:
+                continue
+            members = [
+                v for _u, v, ed in graph.out_edges(n, data=True)
+                if ed.get("relation_type") == EDGE_COMPOSED_OF
+            ]
+            if len(members) < 2:
+                try:
+                    graph.remove_node(n)
+                    removed += 1
+                except Exception:
+                    pass
+        return removed
+
+    def merge_case_variant_kind_schemas(self) -> int:
+        """Merge epistemic_of_Color / epistemic_of_color and weak parents
+        (tinge) into the richest same-lemma schema.
+        """
+        graph = self.archivist.graph
+        groups = {}
+        for n, d in list(graph.nodes(data=True)):
+            if d.get("node_type") != NODE_EPISTEMIC_SCHEMA:
+                continue
+            name = str(d.get("name") or d.get("dominant_parent") or "")
+            if not name and str(n).startswith("epistemic_of_"):
+                name = str(n)[len("epistemic_of_"):].replace("_", " ")
+            key = name.strip().casefold()
+            if not key:
+                continue
+            groups.setdefault(key, []).append(n)
+
+        merged = 0
+        for key, nodes in groups.items():
+            if len(nodes) < 2:
+                continue
+
+            def richness(nid):
+                d = graph.nodes.get(nid, {})
+                mem = sum(
+                    1 for _u, v, ed in graph.out_edges(nid, data=True)
+                    if ed.get("relation_type") == EDGE_COMPOSED_OF
+                )
+                named = 1 if d.get("named") else 0
+                userish = 0
+                # prefer schemas whose dominant_parent is a user node
+                parent = d.get("dominant_parent") or d.get("name")
+                if parent and graph.nodes.get(str(parent), {}).get("source") == "user":
+                    userish = 2
+                short = 1 if len(str(parent or "").split()) <= 2 else 0
+                slug = 1 if str(nid).startswith("epistemic_of_") else 0
+                return (userish, named, short, slug, mem)
+
+            nodes_sorted = sorted(nodes, key=richness, reverse=True)
+            survivor = nodes_sorted[0]
+            for other in nodes_sorted[1:]:
+                for _u, v, ed in list(graph.out_edges(other, data=True)):
+                    if ed.get("relation_type") != EDGE_COMPOSED_OF:
+                        continue
+                    if not graph.has_edge(survivor, v):
+                        graph.add_edge(
+                            survivor, v, relation_type=EDGE_COMPOSED_OF,
+                            source="schema", placement="case_merge",
+                        )
+                for u, _v, ed in list(graph.in_edges(other, data=True)):
+                    if ed.get("relation_type") == EDGE_COMPOSED_OF and u != survivor:
+                        if not graph.has_edge(u, survivor):
+                            graph.add_edge(
+                                u, survivor, relation_type=EDGE_COMPOSED_OF,
+                                source="schema", placement="case_merge",
+                            )
+                if other in graph:
+                    graph.remove_node(other)
+                    merged += 1
+            if survivor in graph:
+                graph.nodes[survivor]["member_count"] = sum(
+                    1 for _u, v, ed in graph.out_edges(survivor, data=True)
+                    if ed.get("relation_type") == EDGE_COMPOSED_OF
+                )
+                # Canonical display name: Title-case short lemma if possible
+                nm = graph.nodes[survivor].get("name") or graph.nodes[survivor].get("dominant_parent")
+                if nm and len(str(nm).split()) <= 2:
+                    graph.nodes[survivor]["name"] = str(nm)
+                    graph.nodes[survivor]["named"] = True
+        return merged
+
     def merge_schemas_sharing_name(self) -> int:
         """Collapse multiple schema nodes that share the same display name.
 

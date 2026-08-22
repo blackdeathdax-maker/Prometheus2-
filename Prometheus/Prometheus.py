@@ -235,6 +235,27 @@ class Prometheus:
         self.schema_felt = SchemaFeltBinder(threshold=3)
         self.others = OthersRegistry(self.archivist) if OthersRegistry is not None else None
         self.goals = GoalModule() if GoalModule is not None else None
+
+        # --- Learning policy (phase / inhibition / valence / lookup budgets) ---
+        self.DICT_LOOKUPS_PER_PULSE = 2
+        self.DICT_LOOKUPS_PER_WAKE = 40
+        self._dict_lookups_this_pulse = 0
+        self._dict_lookups_this_wake = 0
+        self.PEDAGOGICAL_COACT_WEIGHT = 2.5
+        self.OFF_BASIN_COACT_WEIGHT = 0.25
+        self.CLOSED_PARENT_COACT_WEIGHT = 0.35
+        self.LATERAL_INHIBITION_SCALE = 0.55
+        self.SIBLING_INHIBITION_TOP_K = 6
+
+        if getattr(self, "association", None) is not None:
+            self.association.lookup_gate = self._may_dictionary_lookup
+        if self.goals is not None:
+            def _goal_narr(event, target, detail="", pulse=0):
+                try:
+                    self.self_narrative.record_goal_event(event, target, detail=detail, pulse=pulse)
+                except Exception:
+                    pass
+            self.goals._on_event = _goal_narr
         self.last_collapse_summary = {"collapsed": 0, "conflicts": 0, "candidates_considered": 0}
         self.last_focus_summary = {}
         self.last_hierarchy_summary = {}
@@ -619,7 +640,7 @@ class Prometheus:
             try:
                 from .archivist import SELF_NODE
                 cluster = [node, SELF_NODE] + [o for o in other_ids if o][:4]
-                self.archivist.record_co_activation(cluster)
+                self._record_co_activation_gated(cluster)
                 for oid in other_ids[:4]:
                     self.archivist.bump_activation(oid)
             except Exception:
@@ -654,6 +675,16 @@ class Prometheus:
         # question this fix doesn't take on.
         if node and source in ("user", "dictionary"):
             self._record_protected_anchor(node)
+        if node and source == "user":
+            try:
+                self._mark_pedagogical([node])
+                # Multi-word lessons: also mark individual content tokens already in graph
+                for w in str(text).replace(",", " ").split():
+                    tok = "".join(ch for ch in w if ch.isalnum())
+                    if len(tok) >= 3 and tok in self.archivist.graph:
+                        self._mark_pedagogical([tok])
+            except Exception:
+                pass
 
         # Explicit negation/correction (§3.4 mechanism 1): flag whatever
         # node was most recently active for gradual demotion at the next
@@ -962,6 +993,20 @@ class Prometheus:
         basin_anchors = set(self._get_unique_anchors(key))
         if hasattr(self, "modulators"):
             self.focus.switch_cost_mult = self.modulators.switch_cost_mult()
+                # Bias focus toward goals + current WM (anti-drift)
+        try:
+            prefer = set()
+            if getattr(self, "goals", None) is not None:
+                prefer |= set(self.goals.protected_ids(self.archivist.graph))
+            wm_ids = set()
+            try:
+                wm_ids = set(self.get_current_working_memory().get("slots") or [])
+            except Exception:
+                pass
+            prefer |= wm_ids
+            self.focus.set_attention_context(prefer_ids=prefer, wm_ids=wm_ids)
+        except Exception as e:
+            logger.debug("set_attention_context failed: %s", e)
         self.last_focus_summary = self.focus.tick(
             self.archivist.graph,
             pulse=self.pulse_count,
@@ -1010,6 +1055,18 @@ class Prometheus:
                         pass
                 if summary.get("satisfied_this_tick") or summary.get("failed_this_tick"):
                     print(f"Goals: {summary}")
+                # Narrative beats for newly closed goals
+                try:
+                    for h in (self.goals.history or [])[-3:]:
+                        pulse_h = h.satisfied_pulse or h.failed_pulse
+                        if pulse_h == self.pulse_count:
+                            self.self_narrative.record_goal_event(
+                                h.status, h.target_id,
+                                detail=h.success_reason or h.fail_reason,
+                                pulse=self.pulse_count,
+                            )
+                except Exception:
+                    pass
             except Exception as e:
                 logger.warning("goals tick failed: %s", e)
 
@@ -1134,6 +1191,180 @@ class Prometheus:
     # ------------------------------------------------------------------
     # §5.1 Autonomous idle expansion (self-study)
     # ------------------------------------------------------------------
+
+
+    # ==================================================================
+    # Learning policy: reason-gated lookup, phase, inhibition, valence
+    # ==================================================================
+    def _reset_pulse_lookup_budget(self) -> None:
+        self._dict_lookups_this_pulse = 0
+
+    def _note_wake_boundary(self) -> None:
+        """Call when leaving Sleep → Learning."""
+        self._dict_lookups_this_wake = 0
+
+    def _open_parent_ids(self) -> set:
+        """Parents currently 'open' (phase window): focus closure, WM, goals."""
+        open_ids = set()
+        try:
+            fid = self.focus.focus_id if self.focus else None
+            if fid:
+                open_ids.add(fid)
+                open_ids |= set(self.focus.schema_closure(self.archivist.graph, fid) or [])
+        except Exception:
+            pass
+        try:
+            wm = self.get_current_working_memory()
+            open_ids |= set(wm.get("slots") or [])
+        except Exception:
+            pass
+        try:
+            if getattr(self, "goals", None) is not None:
+                open_ids |= set(self.goals.protected_ids(self.archivist.graph) or [])
+        except Exception:
+            pass
+        return open_ids
+
+    def _may_dictionary_lookup(self, term: str, source: str = "dictionary",
+                               context_node=None) -> bool:
+        """WordNet is a shelf: only open an entry with reason + budget."""
+        if source != "dictionary":
+            return True
+        # Already known — reinforcing is fine
+        if term in self.archivist.graph:
+            return True
+        if self._dict_lookups_this_pulse >= self.DICT_LOOKUPS_PER_PULSE:
+            return False
+        if self._dict_lookups_this_wake >= self.DICT_LOOKUPS_PER_WAKE:
+            return False
+        open_ids = self._open_parent_ids()
+        if context_node and context_node in open_ids:
+            self._dict_lookups_this_pulse += 1
+            self._dict_lookups_this_wake += 1
+            return True
+        # Focus / WM / goal must justify *some* open parent
+        if not open_ids:
+            return False
+        # Allow if any open node is a plausible parent context (always if we have open set)
+        self._dict_lookups_this_pulse += 1
+        self._dict_lookups_this_wake += 1
+        return True
+
+    def _current_basin_key(self) -> str:
+        try:
+            return str(self.synthesizer.get_current_basin_key() or "")
+        except Exception:
+            return ""
+
+    def _node_basin_tag(self, node_id: str) -> str:
+        d = self.archivist.graph.nodes.get(node_id, {})
+        return str(d.get("basin_tag") or d.get("felt_state_at_creation") or "")
+
+    def _stamp_basin_tag(self, node_id: str) -> None:
+        if node_id not in self.archivist.graph:
+            return
+        key = self._current_basin_key()
+        if not key:
+            return
+        d = self.archivist.graph.nodes[node_id]
+        if not d.get("basin_tag"):
+            d["basin_tag"] = key
+
+    def _coact_weight_for_nodes(self, nodes) -> float:
+        """Phase + valence + pedagogical gating for kind evidence."""
+        nodes = [n for n in nodes if n in self.archivist.graph]
+        if len(nodes) < 2:
+            return 0.0
+        w = 1.0
+        open_ids = self._open_parent_ids()
+        # Phase: if none of the nodes are under an open parent/focus, weaken
+        if open_ids and not any(n in open_ids for n in nodes):
+            w *= self.CLOSED_PARENT_COACT_WEIGHT
+        # Valence: prefer shared basin tag with current climate
+        cur = self._current_basin_key()
+        if cur:
+            tags = [self._node_basin_tag(n) for n in nodes]
+            tagged = [t for t in tags if t]
+            if tagged and not any(t == cur for t in tagged):
+                w *= self.OFF_BASIN_COACT_WEIGHT
+        # Pedagogical boost
+        ped = 0
+        for n in nodes:
+            if self.archivist.graph.nodes.get(n, {}).get("pedagogical"):
+                ped += 1
+        if ped >= 2:
+            w *= self.PEDAGOGICAL_COACT_WEIGHT
+        elif ped == 1:
+            w *= 1.4
+        return w
+
+    def _record_co_activation_gated(self, nodes) -> None:
+        nodes = [n for n in nodes if n and n in self.archivist.graph]
+        if len(nodes) < 2:
+            return
+        w = self._coact_weight_for_nodes(nodes)
+        if w <= 0:
+            return
+        self.archivist.record_co_activation(nodes, weight=w)
+
+    def _apply_lateral_inhibition(self) -> int:
+        """When focus wins among siblings under same is-a parent, damp rivals."""
+        fid = self.focus.focus_id if self.focus else None
+        if not fid or fid not in self.archivist.graph:
+            return 0
+        graph = self.archivist.graph
+        # Parents of focus via is-a out-edges
+        parents = []
+        for _u, v, ed in graph.out_edges(fid, data=True):
+            if ed.get("relation_type") == "is-a":
+                parents.append(v)
+        if not parents:
+            return 0
+        damp_n = 0
+        scale = self.LATERAL_INHIBITION_SCALE
+        for parent in parents:
+            siblings = []
+            for u, _v, ed in graph.in_edges(parent, data=True):
+                if ed.get("relation_type") != "is-a":
+                    continue
+                if u == fid:
+                    continue
+                # only same-level standard nodes
+                if graph.nodes.get(u, {}).get("node_type") in (
+                    "epistemic_schema", "schema", "basin"
+                ):
+                    continue
+                siblings.append(u)
+            # also children of parent via reverse if stored parent→child (skip)
+            siblings = siblings[: self.SIBLING_INHIBITION_TOP_K * 3]
+            # damp residual on siblings
+            for s in siblings[: self.SIBLING_INHIBITION_TOP_K]:
+                try:
+                    r = self.focus.residuals.get(s, 0.0)
+                    if r > 0:
+                        self.focus.residuals[s] = r * scale
+                        damp_n += 1
+                    # activation damp
+                    if s in graph:
+                        act = float(graph.nodes[s].get("activation", 0) or 0)
+                        if act > 0:
+                            graph.nodes[s]["activation"] = act * scale
+                except Exception:
+                    pass
+            # slight vertical boost to parent
+            try:
+                self.focus.boost_residual(parent, amount=0.05)
+            except Exception:
+                pass
+        return damp_n
+
+    def _mark_pedagogical(self, node_ids) -> None:
+        for n in node_ids:
+            if n in self.archivist.graph:
+                self.archivist.graph.nodes[n]["pedagogical"] = True
+                self.archivist.graph.nodes[n]["user_linked"] = True
+                self._stamp_basin_tag(n)
+
 
     def _ordered_self_study_expansions(self, target: str):
         """Phase-ordered expansion for a target (esp. WM/user nodes):
@@ -1827,6 +2058,7 @@ class Prometheus:
                 if hasattr(self, "modulators"):
                     self.modulators.pulse("sleep_exit", amount=0.1)
                 print(f"Sleep climate exit → Learning (pressure={self.fatigue:.3f})")
+                self._note_wake_boundary()
             else:
                 # Loop: another digest pass if still heavily indebted
                 self.sleep_stage = "digest"
@@ -2161,6 +2393,18 @@ class Prometheus:
         named_epistemic = self.reflector.try_name_epistemic_schemas()
         merged_names = self.reflector.merge_schemas_sharing_name()
         print(f"Consolidation: merged same-name schemas {merged_names}")
+        try:
+            merged_case = self.reflector.merge_case_variant_kind_schemas()
+            if merged_case:
+                print(f"Consolidation: merged case-variant kind schemas {merged_case}")
+        except Exception as e:
+            logger.warning("case-variant merge failed: %s", e)
+        try:
+            hollow = self.reflector.prune_hollow_meta_schemas()
+            if hollow:
+                print(f"Consolidation: pruned hollow meta-schemas {hollow}")
+        except Exception as e:
+            logger.warning("hollow meta prune failed: %s", e)
         expired_epistemic = self.reflector.expire_unnamed_epistemic_schemas()
         garbage_epistemic = 0
         try:

@@ -33,6 +33,9 @@ class AssociationEngine:
     def __init__(self, archivist, sensory: Optional[SensoryModule] = None):
         self.archivist = archivist
         self.sensory = sensory or SensoryModule()
+        # Optional: callable(term, source, context_node) -> bool
+        # Prometheus sets this to reason-gate dictionary node formation.
+        self.lookup_gate = None
 
     # ------------------------------------------------------------------
     # Generic explicit edge (kept for backward compatibility / manual use)
@@ -128,6 +131,12 @@ class AssociationEngine:
         # Quality gate: self_generated / expansion terms should look concept-like.
         # Full user sentences still allowed (source=user) so dialogue is recorded.
         term_s = str(term).strip()
+        if source == "dictionary" and callable(self.lookup_gate):
+            try:
+                if not self.lookup_gate(term_s, source, context_node):
+                    return {"term": None, "skipped": "lookup_denied", "reason": "no_reason_to_lookup"}
+            except Exception:
+                return {"term": None, "skipped": "lookup_denied", "reason": "gate_error"}
         if source in ("self_generated", "schema", "social", "dictionary"):
             words = term_s.split()
             # Allow multiword WordNet lemmas; still block sentence-like strings

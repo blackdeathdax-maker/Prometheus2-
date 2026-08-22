@@ -189,6 +189,43 @@ class NarrativeModule:
     # ------------------------------------------------------------------
     # §16.3 triggers
     # ------------------------------------------------------------------
+
+    def record_goal_event(self, event: str, target_id: str, detail: str = "", pulse: int = 0) -> bool:
+        """Narrative beat for goal OPEN / satisfied / failed.
+
+        Links SELF + target so continuity tracks commitments.
+        """
+        try:
+            nodes = ["SELF", target_id] if target_id else ["SELF"]
+            nodes = [n for n in nodes if n]
+            # Prefer epistemic element if target is a schema
+            el_type = ELEMENT_EPISTEMIC_SCHEMA
+            try:
+                nt = self.archivist.graph.nodes.get(target_id, {}).get("node_type")
+                if nt not in ("epistemic_schema", "schema"):
+                    el_type = ELEMENT_SOMATIC_SCHEMA
+            except Exception:
+                pass
+            # Use reinforce_or_create if available
+            if hasattr(self, "_reinforce_or_create"):
+                created = self._reinforce_or_create(el_type, nodes)
+            else:
+                created = False
+            # Stamp a lightweight annotation on the freshest element if possible
+            try:
+                for eid, el in list(getattr(self, "elements", {}).items())[-3:]:
+                    if target_id in (el.get("nodes") or []):
+                        el["goal_event"] = event
+                        el["goal_detail"] = detail
+                        el["goal_pulse"] = pulse
+                        break
+            except Exception:
+                pass
+            return bool(created)
+        except Exception as e:
+            logger.warning("record_goal_event failed: %s", e)
+            return False
+
     def _trigger_stickiness(self) -> tuple:
         """Trigger 3: co-activation-pair degree crossing threshold, using
         archivist.stabilized_co_activation_pairs() -- a real, already-

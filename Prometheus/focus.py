@@ -133,6 +133,11 @@ class FocusModule:
     # Hierarchical focus / means residuals
     STACK_CAP = 2                    # max suspended goals
     MEANS_BOOST = 0.35               # residual given to means neighbors of focus
+    DRIFT_PENALTY_NON_USER = 0.55
+    DRIFT_BONUS_USER = 1.35
+    DRIFT_BONUS_GOAL = 1.6
+    DRIFT_BONUS_WM = 1.25
+    MAX_FOCUS_AGE_LOW_VALUE = 40
     MEANS_CAP = 8.0
     W_MEANS = 0.45                   # weight of means residual in composite score
     RESUME_MARGIN_SCALE = 0.85       # slightly easier to resume a suspended goal
@@ -233,6 +238,11 @@ class FocusModule:
         sparsity = 1.0 - (len(families_seen) / max(1, len(STRUCTURAL_FAMILIES)))
         return self.W_UNC * ((1.0 - trust_unit) + 0.5 * sparsity)
 
+    def set_attention_context(self, prefer_ids=None, wm_ids=None) -> None:
+        """Call each pulse: active goals + WM slots bias focus selection."""
+        self._prefer_ids = set(prefer_ids or [])
+        self._wm_ids = set(wm_ids or [])
+
     def composite_score(self, graph, node_id: str, basin_anchor_set: Optional[Set[str]] = None) -> Tuple[float, Dict[str, float]]:
         basin_anchor_set = basin_anchor_set or set()
         r_act = self.residuals.get(node_id, 0.0)
@@ -246,6 +256,22 @@ class FocusModule:
             data.get("is_schema")
             or data.get("node_type") in (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA)
         ) else 0.0
+        # Anti-drift multipliers
+        src = data.get("source", "")
+        drift = 1.0
+        if src == "user":
+            drift *= self.DRIFT_BONUS_USER
+        elif src in ("dictionary", "self_generated", "schema"):
+            # dictionary leaves (preoccupation, tinge, …) lose stickiness
+            if data.get("node_type") not in (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA):
+                drift *= self.DRIFT_PENALTY_NON_USER
+        prefer = getattr(self, "_prefer_ids", set()) or set()
+        wm = getattr(self, "_wm_ids", set()) or set()
+        if node_id in prefer:
+            drift *= self.DRIFT_BONUS_GOAL
+        if node_id in wm:
+            drift *= self.DRIFT_BONUS_WM
+
         mix = {
             "act": r_act,
             "unc": r_unc,
@@ -254,6 +280,7 @@ class FocusModule:
             "means": r_means,
             "basin": basin_bonus,
             "schema": schema_bonus,
+            "drift": drift,
         }
         score = (
             self.W_ACT * r_act
@@ -263,7 +290,7 @@ class FocusModule:
             + self.W_MEANS * r_means
             + basin_bonus
             + schema_bonus
-        )
+        ) * drift
         return score, mix
 
     # ------------------------------------------------------------------
@@ -478,6 +505,34 @@ class FocusModule:
         current.last_seen_pulse = pulse
 
         age = pulse - current.created_pulse
+        # Soft-break long monopoly by low-value dictionary nodes
+        low_value = (
+            graph.nodes.get(current.target_id, {}).get("source") in ("dictionary", "self_generated")
+            and graph.nodes.get(current.target_id, {}).get("node_type")
+            not in (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA)
+            and current.target_id not in (getattr(self, "_prefer_ids", set()) or set())
+            and current.target_id not in (getattr(self, "_wm_ids", set()) or set())
+        )
+        if low_value and age >= self.MAX_FOCUS_AGE_LOW_VALUE and best_open_id and best_open_id != current.target_id:
+            if best_open_score >= cur_score * 0.85:
+                self._start_cooldown(current.target_id, pulse)
+                self._push_stack(current)
+                data2 = graph.nodes.get(best_open_id, {})
+                kind2 = (
+                    "schema"
+                    if (data2.get("is_schema") or data2.get("node_type") in (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA))
+                    else "node"
+                )
+                self.thread = FocusThread(
+                    target_id=best_open_id,
+                    kind=kind2,
+                    score=best_open_score,
+                    created_pulse=pulse,
+                    last_seen_pulse=pulse,
+                    source_mix=best_open_mix,
+                )
+                self.apply_means_for_focus(graph, best_open_id)
+                return self.thread
         residency_met = age >= self.MIN_FOCUS_RESIDENCY
         margin_needed = max(abs(cur_score) * (self.FOCUS_SWITCH_MARGIN * getattr(self, "switch_cost_mult", 1.0)), 0.5)
         challenger_wins = best_id != current.target_id and best_score > cur_score + margin_needed
