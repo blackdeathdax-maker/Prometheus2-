@@ -128,7 +128,7 @@ class NarrativeModule:
 
         # Pulse-time stream of consciousness (not consolidation-only)
         self.stream: List[dict] = []
-        self.STREAM_CAP = 80
+        self.STREAM_CAP = 120
         self._stream_last_line = ""
         self.load()
 
@@ -198,8 +198,13 @@ class NarrativeModule:
         """Narrative beat for goal OPEN / satisfied / failed.
 
         Links SELF + target so continuity tracks commitments.
+        Also interrupts the stream of consciousness.
         """
         try:
+            try:
+                self.stream_interrupt(event, target_id=target_id, detail=detail, pulse=pulse)
+            except Exception:
+                pass
             nodes = ["SELF", target_id] if target_id else ["SELF"]
             nodes = [n for n in nodes if n]
             # Prefer epistemic element if target is a schema
@@ -621,6 +626,31 @@ class NarrativeModule:
     # ------------------------------------------------------------------
     # Stream of consciousness (§16 companion) -- pulse-time, not prose LLM
     # ------------------------------------------------------------------
+    def _stream_label(self, n: str) -> str:
+        if not n:
+            return ""
+        d = self.archivist.graph.nodes.get(n, {})
+        name = d.get("name")
+        if name and str(name).strip():
+            return str(name).strip()
+        if str(n).startswith("epistemic_of_"):
+            return str(n)[len("epistemic_of_"):].replace("_", " ")
+        if str(n).startswith("basin_"):
+            return self._pad_description(n)
+        return str(n)
+
+    def _felt_phrase(self, felt_state: str, basin_key: str = "") -> str:
+        if not felt_state or felt_state == "Unformed":
+            return "nothing has quite settled"
+        # Prefer human name on basin node if any
+        if basin_key and basin_key in self.archivist.graph:
+            nm = self.archivist.graph.nodes[basin_key].get("name")
+            if nm:
+                return f"a {nm} climate"
+        if felt_state.startswith("basin_"):
+            return self._pad_description(felt_state)
+        return f"a {felt_state} climate"
+
     def record_stream_beat(
         self,
         pulse: int,
@@ -632,99 +662,169 @@ class NarrativeModule:
         bias: str = "",
         state: str = "",
         residual_top: Optional[List[str]] = None,
+        event: Optional[str] = None,
+        event_detail: str = "",
     ) -> Optional[str]:
-        """Append one short deterministic SoC line from live cognitive state.
-
-        Not a chat log and not the consolidated Self-Narrative. This is the
-        moment-to-moment trace: what is online, felt, aimed-at, in mind.
-        Template-only (no LLM). Skips near-duplicate consecutive lines.
-        """
+        """Append one SoC beat. Optional event= interrupts (goal open/sat/fail)."""
         wm_slots = list(wm_slots or [])
         goal_targets = list(goal_targets or [])
         residual_top = list(residual_top or [])
+        label = self._stream_label
 
-        def label(n: str) -> str:
-            if not n:
-                return ""
-            d = self.archivist.graph.nodes.get(n, {})
-            name = d.get("name")
-            if name and str(name).strip():
-                return str(name).strip()
-            if str(n).startswith("epistemic_of_"):
-                return str(n)[len("epistemic_of_"):].replace("_", " ")
-            if str(n).startswith("basin_"):
-                return self._pad_description(n)
-            return str(n)
+        # --- Interrupt beats (goals, etc.) ---
+        if event:
+            tgt = label(event_detail) if event_detail and event_detail in self.archivist.graph else (
+                label(event_detail) if event_detail else ""
+            )
+            # event_detail often is target_id
+            if not tgt and event_detail:
+                tgt = label(event_detail) or str(event_detail)
+            ev = str(event).lower()
+            if ev in ("open", "opened"):
+                line = f"Something takes hold: I mean to stay with {tgt or 'this'}."
+            elif ev in ("satisfied", "success"):
+                line = f"It settles — {tgt or 'that'} has come far enough for now."
+            elif ev in ("failed", "fail"):
+                line = f"I let go of {tgt or 'that'}; it will not hold."
+            else:
+                line = f"A shift around {tgt or 'something'}: {event}."
+            return self._append_stream_beat(
+                pulse, line, focus_id, felt_state, basin_key,
+                [], goal_targets, kind="event", event=ev,
+            )
 
-        felt = felt_state if felt_state and felt_state != "Unformed" else "something unformed"
         focus = label(focus_id) if focus_id else ""
         goals = [label(g) for g in goal_targets[:3] if g]
-        # WM: skip SELF-like, prefer short labels
         mind = []
         for s in wm_slots:
             if s in (SELF_NODE, OTHER_NODE, "SELF", "OTHER"):
                 continue
             lab = label(s)
-            if lab and lab not in mind:
+            if lab and lab not in mind and lab != focus:
                 mind.append(lab)
             if len(mind) >= 4:
                 break
 
-        parts = []
-        # Felt climate
-        if felt_state == "Unformed" or not felt_state:
-            parts.append("A haze; nothing has settled yet")
-        else:
-            parts.append(f"This {felt} state holds")
+        climate = self._felt_phrase(felt_state, basin_key)
+        clauses = []
 
-        # Focus
+        # Opening: body/climate
+        if not felt_state or felt_state == "Unformed":
+            clauses.append("Still forming — the body has no clear weather yet")
+        else:
+            clauses.append(f"Under {climate}")
+
+        # Attention
         if focus:
-            parts.append(f"attention on {focus}")
+            if goals and focus in goals:
+                clauses.append(f"I keep returning to {focus}")
+            else:
+                clauses.append(f"my attention rests on {focus}")
         else:
-            parts.append("attention drifts")
+            clauses.append("attention has nowhere firm to land")
 
-        # Goals
+        # Intention
         if goals:
-            parts.append("reaching for " + ", ".join(goals))
+            other = [g for g in goals if g != focus]
+            if other:
+                clauses.append("while still reaching for " + ", ".join(other[:2]))
+            elif focus and focus not in goals:
+                clauses.append("aimed at " + ", ".join(goals[:2]))
 
-        # Working memory contents
+        # Working memory
         if mind:
-            parts.append("in mind: " + ", ".join(mind[:4]))
+            if len(mind) == 1:
+                clauses.append(f"{mind[0]} stays close in mind")
+            else:
+                clauses.append("near at hand: " + ", ".join(mind[:4]))
 
-        # Residual tension tips
-        tips = [label(x) for x in residual_top[:2] if x and label(x) not in (focus,)]
-        tips = [t for t in tips if t]
+        # Residual pulls
+        tips = []
+        for x in residual_top[:3]:
+            lab = label(x)
+            if lab and lab != focus and lab not in mind and lab not in tips:
+                tips.append(lab)
         if tips:
-            parts.append("pull from " + " and ".join(tips))
+            clauses.append("something tugs from " + " / ".join(tips[:2]))
 
-        # Operating mode color
-        if state == "Sleep" or (state and "Sleep" in str(state)):
-            parts.append("the body is offline, sorting")
+        # Mode
+        stt = str(state or "")
+        if "Sleep" in stt:
+            clauses.append("the rest of me is offline, filing things away")
         elif bias in ("FORCE_EXPLORE", "BIAS_EXPLORE"):
-            parts.append("a restlessness to look further")
+            clauses.append("restless enough to look further")
         elif bias == "BIAS_STABILIZE":
-            parts.append("a need to settle what is known")
+            clauses.append("inclined to hold what is already known")
 
-        line = "; ".join(parts) + "."
-        # De-dupe consecutive identical traces
-        if line == getattr(self, "_stream_last_line", ""):
+        line = "; ".join(clauses) + "."
+        return self._append_stream_beat(
+            pulse, line, focus_id, felt_state, basin_key,
+            mind, goal_targets, kind="pulse",
+        )
+
+    def _append_stream_beat(
+        self, pulse, line, focus_id, felt_state, basin_key,
+        mind, goal_targets, kind="pulse", event="",
+    ) -> Optional[str]:
+        if line == getattr(self, "_stream_last_line", "") and kind == "pulse":
             return None
         self._stream_last_line = line
-
         beat = {
             "pulse": pulse,
             "line": line,
+            "kind": kind,
+            "event": event,
             "focus": focus_id,
             "felt": felt_state,
             "basin": basin_key,
-            "wm": mind[:4],
-            "goals": goal_targets[:3],
+            "wm": list(mind)[:4],
+            "goals": list(goal_targets)[:3],
             "ts": datetime.now().isoformat(),
         }
         self.stream.append(beat)
         if len(self.stream) > self.STREAM_CAP:
             self.stream = self.stream[-self.STREAM_CAP:]
         return line
+
+    def stream_interrupt(self, event: str, target_id: str = "", detail: str = "",
+                         pulse: int = 0) -> Optional[str]:
+        """Public hook for goal OPEN / satisfied / failed → stream interrupt."""
+        return self.record_stream_beat(
+            pulse=pulse,
+            event=event,
+            event_detail=target_id or detail,
+            felt_state="",
+            focus_id=target_id or None,
+        )
+
+    def stream_monologue(self, last_n: int = 8) -> str:
+        """Chain recent beats into one short inner-monologue paragraph."""
+        beats = list(self.stream[-last_n:]) if self.stream else []
+        if not beats:
+            return ""
+        # Prefer variety: keep events always; thin near-duplicate pulse lines
+        lines = []
+        prev = ""
+        for b in beats:
+            ln = (b.get("line") or "").strip()
+            if not ln:
+                continue
+            if b.get("kind") == "event":
+                lines.append(ln)
+                prev = ln
+                continue
+            # skip if too similar to previous
+            if prev and ln[:40] == prev[:40]:
+                continue
+            lines.append(ln)
+            prev = ln
+        if not lines:
+            return ""
+        # Soft join into a paragraph
+        text = " ".join(lines)
+        if len(text) > 900:
+            text = text[:897] + "..."
+        return text
 
     def stream_report(self, last_n: int = 12) -> Dict:
         """Rolling stream-of-consciousness buffer for UI / diagnostics."""
@@ -733,6 +833,7 @@ class NarrativeModule:
             "count": len(self.stream),
             "cap": self.STREAM_CAP,
             "latest": beats[-1]["line"] if beats else "",
+            "monologue": self.stream_monologue(last_n=min(10, max(last_n, 6))),
             "beats": beats,
         }
 
