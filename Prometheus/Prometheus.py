@@ -1070,6 +1070,45 @@ class Prometheus:
             except Exception as e:
                 logger.warning("goals tick failed: %s", e)
 
+        # Stream of consciousness (pulse-time trace)
+        try:
+            fid = self.focus.focus_id if self.focus else None
+            wm_slots = []
+            try:
+                wm_slots = list(self.get_current_working_memory().get("slots") or [])
+            except Exception:
+                pass
+            goals = []
+            try:
+                if getattr(self, "goals", None) is not None:
+                    goals = list(self.goals.active_target_ids() or [])
+            except Exception:
+                pass
+            residual_top = []
+            try:
+                # top residual keys
+                items = sorted(
+                    (self.focus.residuals or {}).items(),
+                    key=lambda kv: -float(kv[1] or 0),
+                )[:5]
+                residual_top = [k for k, _v in items]
+            except Exception:
+                pass
+            self.self_narrative.record_stream_beat(
+                pulse=self.pulse_count,
+                focus_id=fid,
+                felt_state=str(self.synthesizer.get_current_felt_state() or ""),
+                basin_key=str(self.synthesizer.get_current_basin_key() or ""),
+                wm_slots=wm_slots,
+                goal_targets=goals,
+                bias=str(getattr(self.executive, "current_bias", "") or ""),
+                state=str(self.state or ""),
+                residual_top=residual_top,
+            )
+        except Exception as e:
+            logger.debug("stream beat failed: %s", e)
+
+
         # Working-memory co-presence → co-activation (§14 / kind schemas).
         # Nodes held together "in mind" (e.g. Emotion, Sad, Happy) should
         # accumulate pair evidence even without self-study co-touch.
@@ -2154,6 +2193,10 @@ class Prometheus:
         except Exception:
             pass
         return self.working_memory.get_working_memory(self.bio.epoch.value, basin_anchors)
+
+    def get_stream_report(self, last_n: int = 12) -> dict:
+        """Pulse-time stream of consciousness (rolling)."""
+        return self.self_narrative.stream_report(last_n=last_n)
 
     def get_narrative_report(self, top_n: int = 10) -> dict:
         """§16 convenience wrapper, matching get_current_working_memory()'s

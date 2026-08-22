@@ -126,6 +126,10 @@ class NarrativeModule:
         # NARRATIVE_BASIN_SHIFT_WINDOW passes ago.
         self._dominant_basin_history: List[Optional[str]] = []
 
+        # Pulse-time stream of consciousness (not consolidation-only)
+        self.stream: List[dict] = []
+        self.STREAM_CAP = 80
+        self._stream_last_line = ""
         self.load()
 
     # ------------------------------------------------------------------
@@ -612,6 +616,125 @@ class NarrativeModule:
             return f"from {self._pad_description(nodes[0])} to {self._pad_description(nodes[1])}"
 
         return ", ".join(label(n) for n in nodes)
+
+
+    # ------------------------------------------------------------------
+    # Stream of consciousness (§16 companion) -- pulse-time, not prose LLM
+    # ------------------------------------------------------------------
+    def record_stream_beat(
+        self,
+        pulse: int,
+        focus_id: Optional[str] = None,
+        felt_state: str = "",
+        basin_key: str = "",
+        wm_slots: Optional[List[str]] = None,
+        goal_targets: Optional[List[str]] = None,
+        bias: str = "",
+        state: str = "",
+        residual_top: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """Append one short deterministic SoC line from live cognitive state.
+
+        Not a chat log and not the consolidated Self-Narrative. This is the
+        moment-to-moment trace: what is online, felt, aimed-at, in mind.
+        Template-only (no LLM). Skips near-duplicate consecutive lines.
+        """
+        wm_slots = list(wm_slots or [])
+        goal_targets = list(goal_targets or [])
+        residual_top = list(residual_top or [])
+
+        def label(n: str) -> str:
+            if not n:
+                return ""
+            d = self.archivist.graph.nodes.get(n, {})
+            name = d.get("name")
+            if name and str(name).strip():
+                return str(name).strip()
+            if str(n).startswith("epistemic_of_"):
+                return str(n)[len("epistemic_of_"):].replace("_", " ")
+            if str(n).startswith("basin_"):
+                return self._pad_description(n)
+            return str(n)
+
+        felt = felt_state if felt_state and felt_state != "Unformed" else "something unformed"
+        focus = label(focus_id) if focus_id else ""
+        goals = [label(g) for g in goal_targets[:3] if g]
+        # WM: skip SELF-like, prefer short labels
+        mind = []
+        for s in wm_slots:
+            if s in (SELF_NODE, OTHER_NODE, "SELF", "OTHER"):
+                continue
+            lab = label(s)
+            if lab and lab not in mind:
+                mind.append(lab)
+            if len(mind) >= 4:
+                break
+
+        parts = []
+        # Felt climate
+        if felt_state == "Unformed" or not felt_state:
+            parts.append("A haze; nothing has settled yet")
+        else:
+            parts.append(f"This {felt} state holds")
+
+        # Focus
+        if focus:
+            parts.append(f"attention on {focus}")
+        else:
+            parts.append("attention drifts")
+
+        # Goals
+        if goals:
+            parts.append("reaching for " + ", ".join(goals))
+
+        # Working memory contents
+        if mind:
+            parts.append("in mind: " + ", ".join(mind[:4]))
+
+        # Residual tension tips
+        tips = [label(x) for x in residual_top[:2] if x and label(x) not in (focus,)]
+        tips = [t for t in tips if t]
+        if tips:
+            parts.append("pull from " + " and ".join(tips))
+
+        # Operating mode color
+        if state == "Sleep" or (state and "Sleep" in str(state)):
+            parts.append("the body is offline, sorting")
+        elif bias in ("FORCE_EXPLORE", "BIAS_EXPLORE"):
+            parts.append("a restlessness to look further")
+        elif bias == "BIAS_STABILIZE":
+            parts.append("a need to settle what is known")
+
+        line = "; ".join(parts) + "."
+        # De-dupe consecutive identical traces
+        if line == getattr(self, "_stream_last_line", ""):
+            return None
+        self._stream_last_line = line
+
+        beat = {
+            "pulse": pulse,
+            "line": line,
+            "focus": focus_id,
+            "felt": felt_state,
+            "basin": basin_key,
+            "wm": mind[:4],
+            "goals": goal_targets[:3],
+            "ts": datetime.now().isoformat(),
+        }
+        self.stream.append(beat)
+        if len(self.stream) > self.STREAM_CAP:
+            self.stream = self.stream[-self.STREAM_CAP:]
+        return line
+
+    def stream_report(self, last_n: int = 12) -> Dict:
+        """Rolling stream-of-consciousness buffer for UI / diagnostics."""
+        beats = list(self.stream[-last_n:]) if self.stream else []
+        return {
+            "count": len(self.stream),
+            "cap": self.STREAM_CAP,
+            "latest": beats[-1]["line"] if beats else "",
+            "beats": beats,
+        }
 
     def report(self, top_n: int = 10) -> Dict:
         ranked = sorted(self.elements.values(), key=lambda el: el["weight"], reverse=True)
