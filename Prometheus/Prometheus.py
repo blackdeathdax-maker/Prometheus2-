@@ -1044,6 +1044,11 @@ class Prometheus:
                 boosted = set()
                 for tid in self.goals.active_target_ids():
                     boost = self.goals.commitment_boost(tid, graph=graph)
+                    # Ensure open goals stay in the attention contest
+                    try:
+                        self.focus.boost_residual(tid, amount=max(0.25, float(boost or 0) * 0.5))
+                    except Exception:
+                        pass
                     if boost > 0 and tid not in boosted:
                         self.focus.boost_residual(tid, amount=min(1.2, boost * 0.35))
                         boosted.add(tid)
@@ -2980,10 +2985,38 @@ class Prometheus:
                     self.focus.boost_residual(expand_target, amount=0.5)
                     detail = "expand_under=" + str(expand_target)
                     if self.state == "Learning":
-                        before = self.archivist.graph.number_of_nodes()
-                        placed = self._expand_under_parent(expand_target)
-                        after = self.archivist.graph.number_of_nodes()
-                        detail += " placed=" + str(placed) + " nodes+" + str(after - before)
+                        # Skip if recent expands under same target placed nothing
+                        barren_streak = 0
+                        try:
+                            for e in reversed(self.operators.episodes[-5:]):
+                                if e.get("operator") != "EXPAND":
+                                    break
+                                d = str(e.get("detail") or "")
+                                if "placed=0" in d or "nodes+0" in d:
+                                    barren_streak += 1
+                                else:
+                                    break
+                        except Exception:
+                            pass
+                        if barren_streak >= 2:
+                            detail += " skip_barren"
+                            # convert to HOLD credit
+                            try:
+                                self.focus.boost_residual(expand_target, amount=0.2)
+                            except Exception:
+                                pass
+                        else:
+                            before = self.archivist.graph.number_of_nodes()
+                            placed = self._expand_under_parent(expand_target)
+                            after = self.archivist.graph.number_of_nodes()
+                            detail += " placed=" + str(placed) + " nodes+" + str(after - before)
+                            try:
+                                if self.goals is not None and placed:
+                                    self.goals.note_growth(
+                                        expand_target, placed=placed, graph=self.archivist.graph,
+                                    )
+                            except Exception:
+                                pass
                 except Exception as e:
                     detail = "expand_failed:" + str(e)[:60]
             try:

@@ -196,8 +196,27 @@ class GoalModule:
 
         is_schema = self._is_schema(graph, focus_id) if graph is not None else False
         leaves, nested = (0, 0)
+        tracked_id = focus_id
         if is_schema and graph is not None:
             leaves, nested = self._schema_stats(graph, focus_id)
+        elif graph is not None and focus_id in graph:
+            # Lemma goal: bind to epistemic_of_* / named kind if present
+            for n, d in graph.nodes(data=True):
+                if d.get("node_type") not in (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA):
+                    continue
+                nm = str(d.get("name") or d.get("dominant_parent") or "")
+                if nm.casefold() == str(focus_id).casefold():
+                    tracked_id = n
+                    is_schema = True
+                    leaves, nested = self._schema_stats(graph, n)
+                    break
+                if str(n).startswith("epistemic_of_"):
+                    tail = str(n)[len("epistemic_of_"):].replace("_", " ").casefold()
+                    if tail == str(focus_id).casefold():
+                        tracked_id = n
+                        is_schema = True
+                        leaves, nested = self._schema_stats(graph, n)
+                        break
 
         self.active[gid] = Commitment(
             goal_id=gid,
@@ -401,7 +420,36 @@ class GoalModule:
                     )
         return 0.0
 
+    def note_growth(self, node_id: Optional[str] = None, placed: int = 0, graph=None) -> None:
+        """Record expansion progress against active goals (operator EXPAND hook)."""
+        if placed <= 0 and graph is None:
+            return
+        for g in list(self.active.values()):
+            on = False
+            if node_id and (node_id == g.node_id or node_id in (g.schema_members or set())):
+                on = True
+            if not on and node_id and graph is not None:
+                try:
+                    fam = self.schema_closure_ids(graph, g.node_id) if hasattr(self, "schema_closure_ids") else set()
+                    if node_id in fam or str(node_id).casefold() == str(g.node_id).casefold():
+                        on = True
+                except Exception:
+                    pass
+            if not on and node_id is None:
+                on = True  # global expand credit to strongest goal
+            if not on:
+                continue
+            g.growth_events += max(1, int(placed) if placed else 1)
+            g.strength = min(self.STRENGTH_CAP, g.strength + 0.08 * max(1, placed))
+            if graph is not None and g.is_schema_goal:
+                leaves, nested = self._schema_stats(graph, g.node_id)
+                g.last_member_count = leaves
+                g.last_nested_count = nested
+            print(f"Goals: GROWTH {g.goal_id} events={g.growth_events} strength={g.strength:.2f}")
+            break  # credit primary
+
     def active_target_ids(self) -> List[str]:
+
         return [g.target_id for g in self.active.values() if g.status == "active"]
 
     def protected_ids(self, graph=None) -> Set[str]:
