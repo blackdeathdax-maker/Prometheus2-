@@ -51,42 +51,50 @@ class OperatorModule:
     # ------------------------------------------------------------------
     # Family helpers (graph-local; same spirit as kind_family)
     # ------------------------------------------------------------------
-    def family_ids(self, graph, root_id: str, max_n: int = 64) -> Set[str]:
+    def family_ids(self, graph, root_id: str, max_n: int = 80) -> Set[str]:
+        """Structural family around a goal/hub: self, name twins, 1-hop edges."""
         if not root_id or graph is None or root_id not in graph:
             return set()
         out: Set[str] = {root_id}
         try:
-            d0 = graph.nodes.get(root_id, {})
-            nm = str(d0.get("name") or d0.get("dominant_parent") or root_id).casefold()
+            d0 = graph.nodes.get(root_id, {}) or {}
+            nm = str(d0.get("name") or root_id).casefold()
             rid = str(root_id).casefold()
-            for n, nd in graph.nodes(data=True):
+            for n, nd in list(graph.nodes(data=True)):
                 if len(out) >= max_n:
                     break
+                sn = str(nd.get("name") or "").casefold()
                 is_sch = nd.get("node_type") in ("schema", "epistemic_schema") or nd.get("is_schema")
-                sn = str(nd.get("name") or nd.get("dominant_parent") or "").casefold()
-                if str(n).casefold() in (rid, nm) or (is_sch and sn in (rid, nm)):
+                if str(n).casefold() in (rid, nm) or sn in (rid, nm):
                     out.add(n)
                 if is_sch and str(n).startswith("epistemic_of_"):
                     tail = str(n)[len("epistemic_of_"):].replace("_", " ").casefold()
-                    if tail in (rid, nm):
+                    if tail in (rid, nm) or nm in tail or tail in nm:
                         out.add(n)
-            # composed-of members of schema family members
-            for seed in list(out):
-                nd = graph.nodes.get(seed, {})
-                if not (nd.get("node_type") in ("schema", "epistemic_schema") or nd.get("is_schema")):
+            seed = list(out)
+            for s in seed:
+                if s not in graph:
                     continue
-                for _u, v, ed in graph.out_edges(seed, data=True):
-                    if ed.get("relation_type") == "composed-of" and v in graph:
+                try:
+                    for _, v in list(graph.out_edges(s)):
                         out.add(v)
                         if len(out) >= max_n:
                             return out
+                    for u, _ in list(graph.in_edges(s)):
+                        out.add(u)
+                        if len(out) >= max_n:
+                            return out
+                except Exception:
+                    pass
+            for n, nd in list(graph.nodes(data=True)):
+                if len(out) >= max_n:
+                    break
+                if nd.get("kind_of") in (root_id, d0.get("name")):
+                    out.add(n)
         except Exception:
-            pass
+            out = {root_id}
         return out
 
-    # ------------------------------------------------------------------
-    # Prediction
-    # ------------------------------------------------------------------
     def predict(
         self,
         graph,
@@ -113,15 +121,31 @@ class OperatorModule:
             return str(nid).casefold() in {str(x).casefold() for x in fam}
 
         focus_ok = on_family(focus_id)
+        # Soft: focus has any edge into the family
+        focus_touching = False
+        if focus_id and not focus_ok and graph is not None and focus_id in graph:
+            try:
+                for _, v in list(graph.out_edges(focus_id)):
+                    if on_family(v):
+                        focus_touching = True
+                        break
+                if not focus_touching:
+                    for u, _ in list(graph.in_edges(focus_id)):
+                        if on_family(u):
+                            focus_touching = True
+                            break
+            except Exception:
+                pass
         wm_hit = any(on_family(s) for s in (wm_slots or [])[:8])
         res_hit = any(on_family(s) for s in (residual_top or [])[:5])
 
-        if focus_ok or wm_hit or res_hit:
+        if focus_ok or focus_touching or wm_hit or res_hit:
             return PredictResult(
                 match=True,
                 expected_family=g0,
                 reason="family_present_in_focus_wm_or_residual",
-                off_family_focus=bool(focus_id and not focus_ok),
+                # only hard-off when focus exists, not in family, and not touching
+                off_family_focus=bool(focus_id and not focus_ok and not focus_touching),
             )
 
         return PredictResult(
@@ -153,40 +177,74 @@ class OperatorModule:
 
         scores = {op: 0.0 for op in OPS}
 
-        # HOLD: default comfort when coherent
+        # Anti-oscillation: recent RETURN streak → prefer HOLD/EXPAND
+        recent_ops = [e.get("operator") for e in self.episodes[-6:]]
+        return_streak = 0
+        for o in reversed(recent_ops):
+            if o == "RETURN":
+                return_streak += 1
+            else:
+                break
+        same_return_target = False
+        if return_streak >= 2 and goal_targets:
+            # last RETURN details
+            for e in reversed(self.episodes[-6:]):
+                if e.get("operator") == "RETURN":
+                    if e.get("goal") and e.get("goal") == goal_targets[0]:
+                        same_return_target = True
+                    break
+
+        # HOLD: coherent focus or after RETURN streak
         scores["HOLD"] = 1.0
-        if pred.match and focus_id:
-            scores["HOLD"] += 1.2
+        if pred.match and focus_id and not pred.off_family_focus:
+            scores["HOLD"] += 2.0  # truly on-family
+        elif pred.match and focus_id:
+            scores["HOLD"] += 1.0  # family in WM but focus slightly off
         if bias == "BIAS_STABILIZE":
             scores["HOLD"] += 0.4
+        if return_streak >= 2:
+            scores["HOLD"] += 2.5  # break RETURN loops
+        if return_streak >= 4:
+            scores["HOLD"] += 2.0
 
-        # RETURN: goal active but focus off-family
-        if goal_targets and pred.off_family_focus:
-            scores["RETURN"] += 2.5
-        if goal_targets and not pred.match:
-            scores["RETURN"] += 2.0
-        if goal_strength > 1.2:
+        # RETURN: only when focus clearly off-family AND prediction violated
+        # or off-family with no WM family presence
+        if goal_targets and pred.off_family_focus and not pred.match:
+            scores["RETURN"] += 3.0
+        elif goal_targets and pred.off_family_focus and pred.match:
+            # family in WM but focus drifted — mild RETURN once, not forever
+            if return_streak == 0:
+                scores["RETURN"] += 1.2
+            else:
+                scores["RETURN"] += 0.2  # damp after first
+        if goal_targets and not pred.match and not pred.off_family_focus:
+            scores["RETURN"] += 1.0
+        if goal_strength > 1.2 and pred.off_family_focus and return_streak == 0:
             scores["RETURN"] += 0.3
 
-        # EXPAND: open parent + uncertainty/explore + budget
-        if parent_open and lookup_budget_ok:
-            scores["EXPAND"] += 1.0
-            if bias in ("BIAS_EXPLORE", "FORCE_EXPLORE"):
-                scores["EXPAND"] += 1.2
-            if pred.match and focus_id:
-                scores["EXPAND"] += 0.8  # deepen coherent focus
-            if stagnation and parent_open:
-                scores["EXPAND"] += 0.6
+        # EXPAND: on-family or mild off with match — deepen schema
+        if parent_open or (pred.match and focus_id):
+            scores["EXPAND"] += 1.2
+        if pred.match and not pred.off_family_focus:
+            scores["EXPAND"] += 1.5  # deepen coherent goal family
+        if lookup_budget_ok and pred.match:
+            scores["EXPAND"] += 0.8
+        if bias == "BIAS_EXPLORE" or bias == "BIAS_FORCE_EXPLORE":
+            scores["EXPAND"] += 0.6
+        if return_streak >= 2:
+            scores["EXPAND"] += 1.8  # after RETURN loop, grow instead
 
-        # RELEASE: stagnation / weak goal / long mess
+        # RELEASE
         if stagnation and not pred.match:
             scores["RELEASE"] += 1.5
         if goal_targets and goal_strength < 0.45:
             scores["RELEASE"] += 1.2
         if fatigue > 0.85:
             scores["RELEASE"] += 0.4
+        if return_streak >= 5:
+            scores["RELEASE"] += 1.0  # give up sticky RETURN
 
-        # SETTLE: high fatigue or stabilize bias
+        # SETTLE
         if fatigue >= 0.7:
             scores["SETTLE"] += 1.5
         if bias == "BIAS_STABILIZE":
@@ -194,9 +252,11 @@ class OperatorModule:
         if fatigue >= 0.85:
             scores["SETTLE"] += 0.8
 
-        # Soft mutual exclusion: if RETURN very high, damp EXPAND slightly
-        if scores["RETURN"] >= 2.5:
-            scores["EXPAND"] *= 0.7
+        # Mutual exclusion
+        if scores["RETURN"] >= 2.5 and return_streak == 0:
+            scores["EXPAND"] *= 0.85
+        if return_streak >= 2:
+            scores["RETURN"] *= 0.3  # hard damp
 
         best = max(scores, key=lambda k: scores[k])
         note = {

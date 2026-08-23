@@ -2926,25 +2926,38 @@ class Prometheus:
         )
         detail = ""
         op = dec.operator
-        parent = fid or (goals[0] if goals else None)
+
+        def _lemma_of(nid):
+            if not nid:
+                return None
+            try:
+                fam = list(self.archivist.kind_family(nid) or [nid])
+            except Exception:
+                fam = [nid]
+            for n in fam:
+                nd = graph.nodes.get(n, {}) or {}
+                if nd.get("node_type") not in ("schema", "epistemic_schema") and not nd.get("is_schema"):
+                    return n
+            # strip epistemic_of_
+            s = str(nid)
+            if s.startswith("epistemic_of_"):
+                tail = s[len("epistemic_of_"):].replace("_", " ")
+                for n in graph.nodes:
+                    if str(n).casefold() == tail.casefold():
+                        nd = graph.nodes.get(n, {}) or {}
+                        if nd.get("node_type") not in ("schema", "epistemic_schema"):
+                            return n
+            return nid
+
+        parent = _lemma_of(fid) or _lemma_of(goals[0] if goals else None) or fid
 
         if op == "RETURN" and goals:
-            target = goals[0]
+            target = _lemma_of(goals[0]) or goals[0]
             try:
-                fam = list(self.archivist.kind_family(target) or [target])
-                lemma = None
-                for n in fam:
-                    nd = graph.nodes.get(n, {})
-                    if nd.get("node_type") not in ("schema", "epistemic_schema"):
-                        lemma = n
-                        break
-                target = lemma or target
-            except Exception:
-                pass
-            try:
-                self.focus.boost_residual(target, amount=1.4)
-                for mid in list(self.archivist.kind_family(target) or [])[:12]:
-                    self.focus.boost_residual(mid, amount=0.35)
+                # Mild pull — avoid fighting focus every pulse
+                self.focus.boost_residual(target, amount=0.55)
+                for mid in list(self.archivist.kind_family(target) or [])[:8]:
+                    self.focus.boost_residual(mid, amount=0.15)
                 detail = "return->" + str(target)
             except Exception as e:
                 detail = "return_failed"
@@ -2956,20 +2969,26 @@ class Prometheus:
                 pass
 
         elif op == "EXPAND":
-            if parent:
+            # Prefer expanding the goal hub when focus is a side-schema
+            expand_target = parent
+            if goals:
+                g_lemma = _lemma_of(goals[0])
+                if g_lemma:
+                    expand_target = g_lemma
+            if expand_target:
                 try:
-                    self.focus.boost_residual(parent, amount=0.5)
-                    detail = "expand_under=" + str(parent)
+                    self.focus.boost_residual(expand_target, amount=0.5)
+                    detail = "expand_under=" + str(expand_target)
                     if self.state == "Learning":
                         before = self.archivist.graph.number_of_nodes()
-                        placed = self._expand_under_parent(parent)
+                        placed = self._expand_under_parent(expand_target)
                         after = self.archivist.graph.number_of_nodes()
                         detail += " placed=" + str(placed) + " nodes+" + str(after - before)
                 except Exception as e:
                     detail = "expand_failed:" + str(e)[:60]
             try:
                 self.self_narrative.stream_interrupt(
-                    "expand", target_id=parent or "", detail=detail, pulse=self.pulse_count,
+                    "expand", target_id=expand_target or parent or "", detail=detail, pulse=self.pulse_count,
                 )
             except Exception:
                 pass
