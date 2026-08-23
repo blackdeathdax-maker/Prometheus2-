@@ -444,6 +444,8 @@ class ArchivistModule:
         """
         promotions, demotions = 0, 0
         for node in list(self.graph.nodes):
+            if node not in self.graph:
+                continue
             if node == SELF_NODE:
                 continue  # permanent axiom, never re-evaluated (§2.1b item 1)
             data = self.graph.nodes[node]
@@ -1140,6 +1142,71 @@ class ArchivistModule:
             self.co_activation[(a, b)] = self.co_activation.get((a, b), 0) + w
         self.record_schema_co_activation(unique, amount=w)
 
+
+
+    def merge_case_variant_lemmas(self) -> int:
+        """Collapse Color/color (and similar) into one lemma node.
+
+        Prefer the variant with higher activation, user source, or Title case
+        if tied. Rewire edges from loser → winner.
+        """
+        graph = self.graph
+        by_low = {}
+        for n, d in list(graph.nodes(data=True)):
+            if d.get("node_type") in (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA, NODE_BASIN):
+                continue
+            if d.get("is_schema"):
+                continue
+            key = str(n).casefold().strip()
+            if not key or " " in key and len(key) > 24:
+                continue
+            by_low.setdefault(key, []).append(n)
+        merged = 0
+        for key, ids in by_low.items():
+            if len(ids) < 2:
+                continue
+            def score(nid):
+                d = graph.nodes.get(nid, {})
+                return (
+                    10.0 if d.get("source") == "user" else 0.0,
+                    float(d.get("activation") or 0.0),
+                    1.0 if str(nid)[:1].isupper() else 0.0,
+                    -len(str(nid)),
+                )
+            ids_sorted = sorted(ids, key=score, reverse=True)
+            winner = ids_sorted[0]
+            for loser in ids_sorted[1:]:
+                if loser not in graph or winner not in graph:
+                    continue
+                # rewire edges
+                for u, v, k, ed in list(graph.in_edges(loser, keys=True, data=True)):
+                    if u == winner:
+                        continue
+                    try:
+                        graph.add_edge(u, winner, key=k, **dict(ed))
+                    except Exception:
+                        pass
+                for u, v, k, ed in list(graph.out_edges(loser, keys=True, data=True)):
+                    if v == winner:
+                        continue
+                    try:
+                        graph.add_edge(winner, v, key=k, **dict(ed))
+                    except Exception:
+                        pass
+                # copy useful attrs
+                ld = graph.nodes[loser]
+                wd = graph.nodes[winner]
+                if ld.get("source") == "user":
+                    wd["source"] = "user"
+                if ld.get("pedagogical"):
+                    wd["pedagogical"] = True
+                wd["activation"] = max(float(wd.get("activation") or 0), float(ld.get("activation") or 0))
+                try:
+                    graph.remove_node(loser)
+                    merged += 1
+                except Exception:
+                    pass
+        return merged
 
     def kind_family(self, node_id: str) -> set:
         """Lemma + kind-schema ids that name the same concept (Color ↔ epistemic_of_Color).

@@ -2225,14 +2225,144 @@ class Prometheus:
 
 
 
+
+    def _promote_kind_associations(self) -> int:
+        """Under open/user kind hubs (Color), turn short associated-with
+        neighbors into is-a children so kind-schemas can form.
+
+        Fixes the failure mode where blue/yellow stay associated-with Color
+        forever and never join epistemic_of_Color.
+        """
+        graph = self.archivist.graph
+        hubs = set()
+        # Active focus/goal family
+        try:
+            hubs |= set(self._open_parent_ids() or [])
+        except Exception:
+            pass
+        # Explicit color-like / pedagogical hubs
+        for n, d in list(graph.nodes(data=True)):
+            if d.get("node_type") in ("schema", "epistemic_schema"):
+                continue
+            if d.get("source") == "user" or d.get("pedagogical"):
+                hubs.add(n)
+            if str(n).casefold() in {
+                "color", "colour", "animal", "emotion", "feeling", "tool",
+                "food", "plant", "vehicle", "body", "person",
+            }:
+                hubs.add(n)
+        # Normalize via kind_family
+        expanded = set()
+        for h in list(hubs):
+            try:
+                expanded |= set(self.archivist.kind_family(h) or [h])
+            except Exception:
+                expanded.add(h)
+        hubs = {h for h in expanded if h in graph and graph.nodes[h].get("node_type") not in ("schema", "epistemic_schema")}
+        promoted = 0
+        skip_words = {
+            "discolor", "colorise", "colorize", "colourise", "colourize",
+            "chromatic color", "visual property", "irregularly shaped spot",
+            "semblance", "property", "attribute",
+        }
+        for hub in hubs:
+            # associated-with either direction
+            nbrs = []
+            try:
+                for _u, v, ed in list(graph.out_edges(hub, data=True)):
+                    if ed.get("relation_type") in ("associated-with", "related-to"):
+                        nbrs.append(v)
+                for u, _v, ed in list(graph.in_edges(hub, data=True)):
+                    if ed.get("relation_type") in ("associated-with", "related-to"):
+                        nbrs.append(u)
+            except Exception:
+                continue
+            for child in nbrs:
+                if child not in graph or child == hub:
+                    continue
+                cd = graph.nodes.get(child, {})
+                if cd.get("node_type") in ("schema", "epistemic_schema"):
+                    continue
+                lab = str(cd.get("name") or child).strip()
+                low = lab.casefold()
+                if low in skip_words or low == str(hub).casefold():
+                    continue
+                # short lexical children only (not gloss phrases)
+                if len(lab.split()) > 2 or len(lab) > 24:
+                    continue
+                # already is-a to hub?
+                already = False
+                try:
+                    for _u, p, ed in list(graph.out_edges(child, data=True)):
+                        if ed.get("relation_type") == "is-a" and p == hub:
+                            already = True
+                            break
+                except Exception:
+                    pass
+                if already:
+                    continue
+                try:
+                    self.archivist.link(
+                        child, hub, "is-a",
+                        source="promote_kind", placement="assoc_to_isa",
+                    )
+                    promoted += 1
+                except Exception:
+                    pass
+            # Ensure epistemic_of_{hub} composes children
+            kind_id = f"epistemic_of_{hub}" if hub in graph else None
+            # also try lowercase hub name
+            for kid in (f"epistemic_of_{hub}", f"epistemic_of_{str(hub).casefold()}"):
+                if kid in graph:
+                    kind_id = kid
+                    break
+            if kind_id and kind_id in graph:
+                for child in nbrs:
+                    if child not in graph:
+                        continue
+                    lab = str(graph.nodes.get(child, {}).get("name") or child)
+                    if len(lab.split()) > 2:
+                        continue
+                    try:
+                        has = any(
+                            v == child and ed.get("relation_type") == "composed-of"
+                            for _u, v, ed in graph.out_edges(kind_id, data=True)
+                        )
+                        if not has and graph.nodes.get(child, {}).get("node_type") not in ("schema", "epistemic_schema"):
+                            graph.add_edge(
+                                kind_id, child, relation_type="composed-of",
+                                source="promote_kind",
+                            )
+                    except Exception:
+                        pass
+        return promoted
+
     def _expand_under_parent(self, parent: str, max_new: int = 3) -> int:
         """Directed lookup under a known parent (Color), not random self-study.
 
         Ignores the usual self-study target picker so EXPAND actually grows
         the focused family. Soft-cap per parent still applies.
         """
-        if not parent or parent not in self.archivist.graph:
+        if not parent:
             return 0
+        # Prefer merged lemma if case twin exists
+        try:
+            self.archivist.merge_case_variant_lemmas()
+        except Exception:
+            pass
+        if parent not in self.archivist.graph:
+            # try casefold match
+            low = str(parent).casefold()
+            for n in list(self.archivist.graph.nodes):
+                if str(n).casefold() == low:
+                    parent = n
+                    break
+        if parent not in self.archivist.graph:
+            return 0
+        try:
+            self._promote_kind_associations()
+        except Exception:
+            pass
         # Un-barren the parent for this directed expand
         try:
             self._barren_self_study_targets.discard(parent)
@@ -2786,11 +2916,23 @@ class Prometheus:
         merged_names = self.reflector.merge_schemas_sharing_name()
         print(f"Consolidation: merged same-name schemas {merged_names}")
         try:
+            merged_lemmas = self.archivist.merge_case_variant_lemmas()
+            if merged_lemmas:
+                print(f"Consolidation: merged case-variant lemmas {merged_lemmas}")
+        except Exception as e:
+            logger.warning("lemma case-merge failed: %s", e)
+        try:
             merged_case = self.reflector.merge_case_variant_kind_schemas()
             if merged_case:
                 print(f"Consolidation: merged case-variant kind schemas {merged_case}")
         except Exception as e:
             logger.warning("case-variant merge failed: %s", e)
+        try:
+            promoted = self._promote_kind_associations()
+            if promoted:
+                print(f"Consolidation: promoted associated-with → is-a under kinds {promoted}")
+        except Exception as e:
+            logger.warning("kind promote failed: %s", e)
         try:
             absorbed = self.reflector.absorb_hash_schemas_into_kind_parents()
             if absorbed:
