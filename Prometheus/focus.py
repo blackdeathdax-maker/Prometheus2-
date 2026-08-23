@@ -606,13 +606,48 @@ class FocusModule:
 
 
     def schema_closure(self, graph, root_id: str, max_n: int = 48) -> Set[str]:
-        """Focus root + schema members + nested child schemas (depth ≤ 2)."""
+        """Focus root + lemma/schema family + members + nested schemas (depth ≤ 2)."""
         if not root_id or root_id not in graph:
             return set()
         out: Set[str] = {root_id}
+        # Color ↔ epistemic_of_Color share one window
+        try:
+            # Prefer archivist.kind_family if graph is the same MultiDiGraph held by archivist
+            # Walk graph nodes for dual naming when archivist not in scope
+            d0 = graph.nodes.get(root_id, {})
+            nm = str(d0.get("name") or d0.get("dominant_parent") or root_id)
+            low = nm.casefold()
+            rid_low = str(root_id).casefold()
+            for n, nd in graph.nodes(data=True):
+                if len(out) >= max_n:
+                    break
+                ntype = nd.get("node_type")
+                is_sch = ntype in (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA) or nd.get("is_schema")
+                sn = str(nd.get("name") or nd.get("dominant_parent") or "")
+                if str(n).casefold() == rid_low or str(n).casefold() == low:
+                    out.add(n)
+                if is_sch and sn.casefold() == low:
+                    out.add(n)
+                if is_sch and str(n).startswith("epistemic_of_"):
+                    tail = str(n)[len("epistemic_of_"):].replace("_", " ").casefold()
+                    if tail == low or tail == rid_low:
+                        out.add(n)
+                if not is_sch and low.startswith("epistemic"):
+                    pass
+                # lemma root: add matching schemas
+                if not (d0.get("node_type") in (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA)):
+                    if is_sch and (sn.casefold() == rid_low or tail == rid_low if is_sch and str(n).startswith("epistemic_of_") else False):
+                        out.add(n)
+        except Exception:
+            pass
         is_schema = graph.nodes.get(root_id, {}).get("node_type") in (
             NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA,
         )
+        # If any family member is a schema, expand composed-of from all schema roots
+        for seed in list(out):
+            if graph.nodes.get(seed, {}).get("node_type") in (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA):
+                is_schema = True
+                break
 
         def add_composed(schema_id: str, depth: int) -> None:
             if depth > 2 or schema_id not in graph or len(out) >= max_n:
@@ -629,7 +664,9 @@ class FocusModule:
                     add_composed(v, depth + 1)
 
         if is_schema:
-            add_composed(root_id, 0)
+            for seed in list(out):
+                if graph.nodes.get(seed, {}).get("node_type") in (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA):
+                    add_composed(seed, 0)
         else:
             for _u, v in list(graph.out_edges(root_id))[:12]:
                 out.add(v)

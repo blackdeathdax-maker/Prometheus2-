@@ -124,6 +124,24 @@ class GoalModule:
         if graph is None or not root_id or root_id not in graph:
             return set()
         out: Set[str] = {root_id}
+        # Lemma ↔ schema unity
+        try:
+            d0 = graph.nodes.get(root_id, {})
+            nm = str(d0.get("name") or d0.get("dominant_parent") or root_id).casefold()
+            rid = str(root_id).casefold()
+            for n, nd in graph.nodes(data=True):
+                if len(out) >= max_n:
+                    break
+                is_sch = nd.get("node_type") in (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA) or nd.get("is_schema")
+                sn = str(nd.get("name") or nd.get("dominant_parent") or "").casefold()
+                if str(n).casefold() in (rid, nm) or (is_sch and sn in (rid, nm)):
+                    out.add(n)
+                if is_sch and str(n).startswith("epistemic_of_"):
+                    tail = str(n)[len("epistemic_of_"):].replace("_", " ").casefold()
+                    if tail in (rid, nm):
+                        out.add(n)
+        except Exception:
+            pass
 
         def walk(sid: str, depth: int) -> None:
             if depth > 2 or len(out) >= max_n or sid not in graph:
@@ -139,8 +157,9 @@ class GoalModule:
                 if self._is_schema(graph, v):
                     walk(v, depth + 1)
 
-        if self._is_schema(graph, root_id):
-            walk(root_id, 0)
+        for seed in list(out):
+            if self._is_schema(graph, seed):
+                walk(seed, 0)
         return out
 
     def observe_focus(self, focus_id: Optional[str], pulse: int, graph=None) -> None:

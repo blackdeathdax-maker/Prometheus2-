@@ -1243,7 +1243,10 @@ class Prometheus:
         self._dict_lookups_this_wake = 0
 
     def _open_parent_ids(self) -> set:
-        """Parents currently 'open' (phase window): focus closure, WM, goals."""
+        """Parents currently 'open' (phase window): focus closure, WM, goals.
+
+        Lemma and kind-schema (Color ↔ epistemic_of_Color) share one window.
+        """
         open_ids = set()
         try:
             fid = self.focus.focus_id if self.focus else None
@@ -1262,7 +1265,14 @@ class Prometheus:
                 open_ids |= set(self.goals.protected_ids(self.archivist.graph) or [])
         except Exception:
             pass
-        return open_ids
+        # Expand each id to its kind family (lemma ↔ schema)
+        expanded = set(open_ids)
+        for nid in list(open_ids):
+            try:
+                expanded |= set(self.archivist.kind_family(nid) or [])
+            except Exception:
+                pass
+        return expanded
 
     def _may_dictionary_lookup(self, term: str, source: str = "dictionary",
                                context_node=None) -> bool:

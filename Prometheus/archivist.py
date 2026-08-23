@@ -1140,6 +1140,75 @@ class ArchivistModule:
             self.co_activation[(a, b)] = self.co_activation.get((a, b), 0) + w
         self.record_schema_co_activation(unique, amount=w)
 
+
+    def kind_family(self, node_id: str) -> set:
+        """Lemma + kind-schema ids that name the same concept (Color ↔ epistemic_of_Color).
+
+        Used so phase windows, focus, and goals treat them as one open target.
+        """
+        if not node_id or node_id not in self.graph:
+            return set()
+        out = {node_id}
+        d = self.graph.nodes.get(node_id, {})
+        nt = d.get("node_type")
+        name = str(d.get("name") or d.get("dominant_parent") or "").strip()
+        low_name = name.casefold() if name else ""
+        low_id = str(node_id).casefold()
+
+        def is_schema(nid: str) -> bool:
+            nd = self.graph.nodes.get(nid, {})
+            return bool(
+                nd.get("is_schema")
+                or nd.get("node_type") in (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA)
+            )
+
+        # Schema → lemma(s)
+        if is_schema(node_id):
+            lemma_candidates = []
+            if name:
+                lemma_candidates.append(name)
+            if str(node_id).startswith("epistemic_of_"):
+                lemma_candidates.append(str(node_id)[len("epistemic_of_"):].replace("_", " "))
+            if d.get("dominant_parent"):
+                lemma_candidates.append(str(d.get("dominant_parent")))
+            for lem in lemma_candidates:
+                if not lem:
+                    continue
+                if lem in self.graph:
+                    out.add(lem)
+                ll = lem.casefold()
+                for n in self.graph.nodes:
+                    if str(n).casefold() == ll:
+                        out.add(n)
+            # sibling schemas with same name/parent
+            for n, nd in self.graph.nodes(data=True):
+                if not is_schema(n):
+                    continue
+                sn = str(nd.get("name") or nd.get("dominant_parent") or "")
+                if low_name and sn.casefold() == low_name:
+                    out.add(n)
+                if str(n).startswith("epistemic_of_"):
+                    tail = str(n)[len("epistemic_of_"):].replace("_", " ").casefold()
+                    if low_name and tail == low_name:
+                        out.add(n)
+                    if low_id.startswith("epistemic_of_") and tail == low_id[len("epistemic_of_"):].replace("_", " "):
+                        out.add(n)
+        else:
+            # Lemma → schemas that cover it or are named after it
+            for sid in self.schemas_covering(node_id):
+                out.add(sid)
+            for n, nd in self.graph.nodes(data=True):
+                if not is_schema(n):
+                    continue
+                sn = str(nd.get("name") or nd.get("dominant_parent") or "")
+                if sn.casefold() == low_id:
+                    out.add(n)
+                if str(n).startswith("epistemic_of_"):
+                    tail = str(n)[len("epistemic_of_"):].replace("_", " ").casefold()
+                    if tail == low_id:
+                        out.add(n)
+        return out
+
     def schemas_covering(self, node_id: str) -> List[str]:
         """Return schema node ids that claim `node_id` via composed-of (in-edge)."""
         if node_id not in self.graph:
