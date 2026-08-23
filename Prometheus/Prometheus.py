@@ -1120,6 +1120,17 @@ class Prometheus:
         except Exception as e:
             logger.warning("cognition operators failed: %s", e)
 
+        # hierarchy micro-repair when focused on a kind hub
+        try:
+            fid = self.focus.focus_id if self.focus else None
+            if fid and str(fid).casefold() in ("color", "colour") and self.pulse_count % 5 == 0:
+                r = self._repair_hierarchy_edges()
+                if r and any(r.values()):
+                    print(f"Micro-repair: {r}")
+        except Exception as e:
+            logger.debug("micro-repair failed: %s", e)
+
+
 
 
         # Working-memory co-presence → co-activation (§14 / kind schemas).
@@ -2226,6 +2237,188 @@ class Prometheus:
 
 
 
+
+
+    def _repair_hierarchy_edges(self) -> dict:
+        """Fix inverted is-a and wrong composed-of membership.
+
+        Observed: color --is-a--> green (wrong); color member of epistemic_of_blue.
+        """
+        graph = self.archivist.graph
+        summary = {"isa_flipped": 0, "isa_dropped": 0, "composed_dropped": 0}
+
+        BASIC_COLORS = {
+            "red", "blue", "green", "yellow", "orange", "purple", "violet",
+            "pink", "brown", "black", "white", "gray", "grey", "cyan", "magenta",
+            "navy", "teal", "maroon", "olive", "lime", "aqua", "silver", "gold",
+            "indigo", "beige", "tan", "coral", "crimson", "scarlet", "azure",
+        }
+        KIND_HUBS = {"color", "colour"}
+
+        def is_schema(nid):
+            d = graph.nodes.get(nid, {}) or {}
+            return d.get("node_type") in ("schema", "epistemic_schema") or bool(d.get("is_schema"))
+
+        def low(nid):
+            d = graph.nodes.get(nid, {}) or {}
+            return str(d.get("name") or nid).casefold().strip()
+
+        def remove_rel(u, v, rel):
+            if u not in graph or v not in graph:
+                return False
+            removed = False
+            try:
+                data = graph.get_edge_data(u, v)
+                if data is None:
+                    return False
+                # MultiDiGraph: data is {key: attrdict}
+                if graph.is_multigraph():
+                    for key in list(data.keys()):
+                        attr = data[key] or {}
+                        if attr.get("relation_type") == rel:
+                            graph.remove_edge(u, v, key)
+                            removed = True
+                else:
+                    if (data or {}).get("relation_type") == rel:
+                        graph.remove_edge(u, v)
+                        removed = True
+            except Exception:
+                return False
+            return removed
+
+        # Snapshot is-a pairs
+        pairs = []
+        try:
+            if graph.is_multigraph():
+                for u, v, key, ed in list(graph.edges(keys=True, data=True)):
+                    if (ed or {}).get("relation_type") == "is-a":
+                        pairs.append((u, v))
+            else:
+                for u, v, ed in list(graph.edges(data=True)):
+                    if (ed or {}).get("relation_type") == "is-a":
+                        pairs.append((u, v))
+        except Exception:
+            pairs = []
+
+        pair_set = set(pairs)
+
+        # Drop 2-cycles prefer specific→general
+        seen = set()
+        for u, v in pairs:
+            if (u, v) in seen:
+                continue
+            if (v, u) not in pair_set:
+                continue
+            seen.add((u, v))
+            seen.add((v, u))
+            u_l, v_l = low(u), low(v)
+            # keep green→color, drop color→green
+            drop_uv = False
+            if u_l in KIND_HUBS and v_l in BASIC_COLORS:
+                drop_uv = True
+            elif v_l in KIND_HUBS and u_l in BASIC_COLORS:
+                drop_uv = False  # drop reverse only
+                remove_rel(v, u, "is-a")
+                summary["isa_dropped"] += 1
+                continue
+            elif is_schema(u) or is_schema(v):
+                # drop lemma↔schema is-a both ways; composed-of owns that
+                remove_rel(u, v, "is-a")
+                remove_rel(v, u, "is-a")
+                summary["isa_dropped"] += 2
+                continue
+            if drop_uv:
+                remove_rel(u, v, "is-a")
+                summary["isa_dropped"] += 1
+            else:
+                remove_rel(v, u, "is-a")
+                summary["isa_dropped"] += 1
+
+        # One-way: color → basic color is-a → flip
+        for u, v in list(pairs):
+            if u not in graph or v not in graph:
+                continue
+            u_l, v_l = low(u), low(v)
+            if u_l in KIND_HUBS and v_l in BASIC_COLORS:
+                if remove_rel(u, v, "is-a"):
+                    try:
+                        self.archivist.link(v, u, "is-a", source="repair", placement="flip_isa")
+                        summary["isa_flipped"] += 1
+                    except Exception:
+                        pass
+            if (not is_schema(u)) and is_schema(v):
+                if remove_rel(u, v, "is-a"):
+                    summary["isa_dropped"] += 1
+
+        # composed-of: drop color hub from child schemas
+        try:
+            edge_iter = (
+                list(graph.edges(keys=True, data=True))
+                if graph.is_multigraph()
+                else [(u, v, None, ed) for u, v, ed in graph.edges(data=True)]
+            )
+            for u, v, key, ed in edge_iter:
+                if (ed or {}).get("relation_type") != "composed-of":
+                    continue
+                if not is_schema(u):
+                    continue
+                if low(v) not in KIND_HUBS:
+                    continue
+                u_tail = low(u)
+                if u_tail.startswith("epistemic_of_"):
+                    u_tail = u_tail[len("epistemic_of_"):].replace("_", " ")
+                bad = (
+                    u_tail in BASIC_COLORS
+                    or u_tail in {"jet", "semblance", "wash", "spot"}
+                    or any(bc == u_tail or bc in u_tail.split() for bc in BASIC_COLORS)
+                )
+                if bad:
+                    try:
+                        if key is not None:
+                            graph.remove_edge(u, v, key)
+                        else:
+                            graph.remove_edge(u, v)
+                        summary["composed_dropped"] += 1
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Ensure basic colors is-a color when related
+        color_ids = [
+            n for n in list(graph.nodes)
+            if low(n) in KIND_HUBS and not is_schema(n)
+        ]
+        for cid in color_ids:
+            for n in list(graph.nodes):
+                if n not in graph or is_schema(n):
+                    continue
+                if low(n) not in BASIC_COLORS:
+                    continue
+                has = False
+                try:
+                    for _u, p, ed in list(graph.out_edges(n, data=True)):
+                        if (ed or {}).get("relation_type") == "is-a" and p == cid:
+                            has = True
+                            break
+                except Exception:
+                    pass
+                if has:
+                    continue
+                related = False
+                try:
+                    related = graph.has_edge(n, cid) or graph.has_edge(cid, n)
+                except Exception:
+                    pass
+                d = graph.nodes.get(n, {}) or {}
+                if related or d.get("source") == "user" or d.get("pedagogical"):
+                    try:
+                        self.archivist.link(n, cid, "is-a", source="repair", placement="ensure_isa")
+                        summary["isa_flipped"] += 1
+                    except Exception:
+                        pass
+        return summary
+
     def _promote_kind_associations(self) -> int:
         """Under open/user kind hubs (Color), turn short associated-with
         neighbors into is-a children so kind-schemas can form.
@@ -2361,6 +2554,10 @@ class Prometheus:
             return 0
         try:
             self._promote_kind_associations()
+        except Exception:
+            pass
+        try:
+            self._repair_hierarchy_edges()
         except Exception:
             pass
         # Un-barren the parent for this directed expand
@@ -2680,29 +2877,36 @@ class Prometheus:
 
 
     def node_neighborhood(self, node_id: str, max_each: int = 20) -> dict:
-        """Parents/children for search expand — list only, not full graph render."""
+        """Parents/children for search expand — list only, not full graph render.
+
+        Taxonomy convention:
+          is-a:      child → parent
+          composed-of: schema → member
+        """
         graph = self.archivist.graph
         if not node_id or node_id not in graph:
-            return {"id": node_id, "parents": [], "children": [], "related": []}
+            return {
+                "id": node_id, "parents": [], "children": [], "related": [],
+                "member_of_schemas": [], "schema_members": [],
+            }
         parents, children, related = [], [], []
-        # Out edges from node = often child→parent for is-a, or parent→child for composed-of
-        for _, v, data in graph.out_edges(node_id, data=True):
+        member_of_schemas, schema_members = [], []
+        for _, v, data in list(graph.out_edges(node_id, data=True)):
             rel = data.get("relation_type") or "associated-with"
             row = {"id": str(v), "relation": rel, "name": graph.nodes[v].get("name")}
             if rel in ("is-a", "part-of"):
-                parents.append(row)  # yellow is-a color → color is parent-ish endpoint
-            elif rel in ("composed-of", "member-of"):
-                children.append(row)
+                parents.append(row)  # this → parent
+            elif rel == "composed-of":
+                schema_members.append(row)  # this schema → member
             else:
                 related.append(row)
-        for u, _, data in graph.in_edges(node_id, data=True):
+        for u, _, data in list(graph.in_edges(node_id, data=True)):
             rel = data.get("relation_type") or "associated-with"
             row = {"id": str(u), "relation": rel, "name": graph.nodes[u].get("name")}
             if rel in ("is-a", "part-of"):
-                # incoming is-a means u is-a node → u is child
-                children.append(row)
-            elif rel in ("composed-of",):
-                parents.append(row)
+                children.append(row)  # child → this
+            elif rel == "composed-of":
+                member_of_schemas.append(row)  # schema claims this
             else:
                 related.append(row)
         return {
@@ -2710,6 +2914,8 @@ class Prometheus:
             "parents": parents[:max_each],
             "children": children[:max_each],
             "related": related[:max_each],
+            "member_of_schemas": member_of_schemas[:max_each],
+            "schema_members": schema_members[:max_each],
             "parent_count": len(parents),
             "child_count": len(children),
             "related_count": len(related),
@@ -2933,6 +3139,12 @@ class Prometheus:
                 print(f"Consolidation: promoted associated-with → is-a under kinds {promoted}")
         except Exception as e:
             logger.warning("kind promote failed: %s", e)
+        try:
+            repaired = self._repair_hierarchy_edges()
+            if repaired and any(repaired.values()):
+                print(f"Consolidation: hierarchy repair {repaired}")
+        except Exception as e:
+            logger.warning("hierarchy repair failed: %s", e)
         try:
             absorbed = self.reflector.absorb_hash_schemas_into_kind_parents()
             if absorbed:

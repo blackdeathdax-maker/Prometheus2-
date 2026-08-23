@@ -321,6 +321,38 @@ class ArchivistModule:
                                      last_reinforced=datetime.now(),
                                      regulatory_efficacy=0.5, tier0_cycles=0,
                                      node_type=NODE_STANDARD, activation=0.0, valence_coloring=0.0)
+        
+        # --- Hierarchy direction guards (Color/green inversion fix) ---
+        if relation_type == "is-a":
+            BASIC = {
+                "red", "blue", "green", "yellow", "orange", "purple", "violet",
+                "pink", "brown", "black", "white", "gray", "grey", "cyan",
+                "magenta", "navy", "teal", "maroon", "olive", "lime", "indigo",
+            }
+            HUBS = {"color", "colour"}
+            a_l = str(node_a).casefold()
+            b_l = str(node_b).casefold()
+            # If hub is-a basic, flip to basic is-a hub
+            if a_l in HUBS and b_l in BASIC:
+                node_a, node_b = node_b, node_a
+            # Refuse lemma is-a schema (membership is composed-of)
+            b_data = self.graph.nodes.get(node_b, {})
+            if b_data.get("node_type") in (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA) or b_data.get("is_schema"):
+                return  # no lemma → schema is-a
+        if relation_type == "composed-of":
+            # Schema of a basic color must not claim the color hub as member
+            BASIC = {
+                "red", "blue", "green", "yellow", "orange", "purple", "violet",
+                "pink", "brown", "black", "white", "gray", "grey",
+            }
+            HUBS = {"color", "colour"}
+            a_l = str(node_a).casefold().replace("epistemic_of_", "").replace("_", " ")
+            b_l = str(node_b).casefold()
+            a_data = self.graph.nodes.get(node_a, {})
+            if (a_data.get("node_type") in (NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA) or a_data.get("is_schema")):
+                if b_l in HUBS and (a_l in BASIC or any(bc in a_l.split() for bc in BASIC) or a_l in {"jet", "semblance", "wash"}):
+                    return
+
         # Idempotent: MultiDiGraph otherwise stacks duplicate same-type edges
         # every pulse (WM is-a scaffolding / re-link), which draws "flower" graphs.
         if self.graph.has_edge(node_a, node_b):

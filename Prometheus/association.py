@@ -53,8 +53,8 @@ class AssociationEngine:
         """Explicit user-taught edge: ensure both nodes exist, link child→parent.
         Returns dict with node ids and edge type.
         """
-        child = (child or "").strip().lower()
-        parent = (parent or "").strip().lower()
+        child = (child or "").strip()
+        parent = (parent or "").strip()
         if not child or not parent or child == parent:
             return None
         # place without definition to avoid recursive hierarchy parse noise
