@@ -30,6 +30,10 @@ try:
     from .goals import GoalModule
 except ImportError:
     GoalModule = None
+try:
+    from .operators import OperatorModule
+except ImportError:
+    OperatorModule = None
 
 
 
@@ -235,6 +239,7 @@ class Prometheus:
         self.schema_felt = SchemaFeltBinder(threshold=3)
         self.others = OthersRegistry(self.archivist) if OthersRegistry is not None else None
         self.goals = GoalModule() if GoalModule is not None else None
+        self.operators = OperatorModule() if OperatorModule is not None else None
 
         # --- Learning policy (phase / inhibition / valence / lookup budgets) ---
         self.DICT_LOOKUPS_PER_PULSE = 6
@@ -1107,6 +1112,14 @@ class Prometheus:
             )
         except Exception as e:
             logger.debug("stream beat failed: %s", e)
+
+        try:
+            op_summary = self._run_cognition_operators()
+            if op_summary and op_summary.get("operator") not in (None, "HOLD"):
+                print(f"Operator: {op_summary}")
+        except Exception as e:
+            logger.warning("cognition operators failed: %s", e)
+
 
 
         # Working-memory co-presence → co-activation (§14 / kind schemas).
@@ -2188,6 +2201,190 @@ class Prometheus:
                 )
         elif self.state == "Sleep":
             self._run_sleep_pulse()
+
+
+    def _run_cognition_operators(self) -> dict:
+        """Prediction check + choose/apply one internal operator."""
+        if getattr(self, "operators", None) is None:
+            return {}
+        graph = self.archivist.graph
+        fid = self.focus.focus_id if self.focus else None
+        goals = []
+        goal_strength = 1.0
+        try:
+            if self.goals is not None:
+                goals = list(self.goals.active_target_ids() or [])
+                if goals and self.goals.active:
+                    gobj = self.goals.active.get(self.goals._gid(goals[0]))
+                    if gobj:
+                        goal_strength = float(gobj.strength or 1.0)
+        except Exception:
+            pass
+        wm_slots = []
+        try:
+            wm_slots = list(self.get_current_working_memory().get("slots") or [])
+        except Exception:
+            pass
+        residual_top = []
+        try:
+            items = sorted(
+                (self.focus.residuals or {}).items(),
+                key=lambda kv: -float(kv[1] or 0),
+            )[:6]
+            residual_top = [k for k, _ in items]
+        except Exception:
+            pass
+        bias = str(getattr(self.executive, "current_bias", "") or "")
+        fatigue = float(getattr(self, "fatigue", 0) or 0)
+        stagnation = False
+        try:
+            fs = self.last_focus_summary or {}
+            stagnation = bool(fs.get("stagnation_escape") or fs.get("force_switch"))
+        except Exception:
+            pass
+        open_ids = set()
+        try:
+            open_ids = set(self._open_parent_ids() or [])
+        except Exception:
+            pass
+        parent_open = bool(open_ids) or bool(fid)
+        lookup_ok = True
+        try:
+            lookup_ok = int(getattr(self, "_dict_lookups_this_pulse", 0) or 0) < int(
+                getattr(self, "DICT_LOOKUPS_PER_PULSE", 6) or 6
+            )
+        except Exception:
+            pass
+
+        dec = self.operators.choose(
+            graph=graph,
+            focus_id=fid,
+            goal_targets=goals,
+            wm_slots=wm_slots,
+            residual_top=residual_top,
+            bias=bias,
+            fatigue=fatigue,
+            stagnation=stagnation,
+            lookup_budget_ok=lookup_ok,
+            parent_open=parent_open,
+            goal_strength=goal_strength,
+        )
+        detail = ""
+        op = dec.operator
+        parent = fid or (goals[0] if goals else None)
+
+        if op == "RETURN" and goals:
+            target = goals[0]
+            try:
+                fam = list(self.archivist.kind_family(target) or [target])
+                lemma = None
+                for n in fam:
+                    nd = graph.nodes.get(n, {})
+                    if nd.get("node_type") not in ("schema", "epistemic_schema"):
+                        lemma = n
+                        break
+                target = lemma or target
+            except Exception:
+                pass
+            try:
+                self.focus.boost_residual(target, amount=1.4)
+                for mid in list(self.archivist.kind_family(target) or [])[:12]:
+                    self.focus.boost_residual(mid, amount=0.35)
+                detail = "return->" + str(target)
+            except Exception as e:
+                detail = "return_failed"
+            try:
+                self.self_narrative.stream_interrupt(
+                    "return", target_id=target, detail=detail, pulse=self.pulse_count,
+                )
+            except Exception:
+                pass
+
+        elif op == "EXPAND":
+            if parent:
+                try:
+                    self.focus.boost_residual(parent, amount=0.5)
+                    detail = "expand_under=" + str(parent)
+                    if self.state == "Learning":
+                        before = self.archivist.graph.number_of_nodes()
+                        self._self_study()
+                        after = self.archivist.graph.number_of_nodes()
+                        detail += " nodes+" + str(after - before)
+                except Exception:
+                    detail = "expand_failed"
+            try:
+                self.self_narrative.stream_interrupt(
+                    "expand", target_id=parent or "", detail=detail, pulse=self.pulse_count,
+                )
+            except Exception:
+                pass
+
+        elif op == "RELEASE":
+            try:
+                if fid:
+                    self.focus.residuals[fid] = float(self.focus.residuals.get(fid, 0) or 0) * 0.3
+                detail = "release_focus=" + str(fid)
+            except Exception:
+                pass
+            try:
+                self.self_narrative.stream_interrupt(
+                    "release", target_id=fid or "", detail=detail, pulse=self.pulse_count,
+                )
+            except Exception:
+                pass
+
+        elif op == "SETTLE":
+            try:
+                if hasattr(self.executive, "current_bias"):
+                    self.executive.current_bias = "BIAS_STABILIZE"
+                detail = "bias=STABILIZE"
+            except Exception:
+                detail = "settle"
+            try:
+                self.self_narrative.stream_interrupt(
+                    "settle", target_id=fid or "", detail=detail, pulse=self.pulse_count,
+                )
+            except Exception:
+                pass
+
+        else:
+            try:
+                if fid:
+                    self.focus.boost_residual(fid, amount=0.15)
+                detail = "hold=" + str(fid)
+            except Exception:
+                pass
+
+        if dec.predict and not dec.predict.match:
+            try:
+                self.self_narrative.stream_interrupt(
+                    "predict_violate",
+                    target_id=dec.predict.expected_family,
+                    detail=dec.predict.reason,
+                    pulse=self.pulse_count,
+                )
+            except Exception:
+                pass
+
+        self.operators.record_episode(
+            pulse=self.pulse_count,
+            decision=dec,
+            focus_id=fid,
+            goal=goals[0] if goals else None,
+            detail=detail,
+        )
+        return {
+            "operator": op,
+            "note": dec.note,
+            "detail": detail,
+            "predict_match": dec.predict.match if dec.predict else None,
+        }
+
+    def get_operators_report(self) -> dict:
+        if getattr(self, "operators", None) is None:
+            return {}
+        return self.operators.report()
+
 
     def get_current_working_memory(self) -> dict:
         """§14 convenience wrapper -- supplies the current epoch and basin

@@ -686,6 +686,16 @@ class NarrativeModule:
                 line = f"It settles — {tgt or 'that'} has come far enough for now."
             elif ev in ("failed", "fail"):
                 line = f"I let go of {tgt or 'that'}; it will not hold."
+            elif ev in ("return",):
+                line = f"I pull back to {tgt or 'what I meant'}."
+            elif ev in ("expand",):
+                line = f"I look further under {tgt or 'this'}."
+            elif ev in ("release",):
+                line = f"I loosen my grip on {tgt or 'that'}."
+            elif ev in ("settle",):
+                line = "I try to settle what is already known."
+            elif ev in ("predict_violate", "violate"):
+                line = f"I expected to stay with {tgt or 'that'}, but attention slipped."
             else:
                 line = f"A shift around {tgt or 'something'}: {event}."
             return self._append_stream_beat(
