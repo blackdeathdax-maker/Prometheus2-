@@ -1,5 +1,6 @@
 import logging
 import re
+import threading
 from typing import List, Optional, Tuple
 
 from .core import Message
@@ -31,6 +32,29 @@ try:
 except ImportError:
     logger.warning("nltk not installed, self-study lookups disabled.")
     _WORDNET_AVAILABLE = False
+    wordnet = None
+
+try:
+    import networkx as nx
+except ImportError:
+    nx = None
+
+# NLTK WordNet zip reader is not re-entrant / thread-safe. Streamlit
+# auto-pulse + concurrent lookups can hit: assert self.fp is None.
+# Serialize all corpus reads through this lock and swallow assert errors.
+_WORDNET_LOCK = threading.RLock()
+
+
+def _safe_synsets(term: str):
+    """Thread-safe wordnet.synsets; returns [] on any failure."""
+    if not _WORDNET_AVAILABLE or not term or wordnet is None:
+        return []
+    try:
+        with _WORDNET_LOCK:
+            return list(wordnet.synsets(term))
+    except Exception as e:
+        logger.warning("WordNet synsets(%r) failed: %s", term[:80], e)
+        return []
 
 
 # §2.3 mechanism 1: dictionary-pattern parsing. Definitional phrasing often
@@ -71,6 +95,119 @@ _EXPANSION_STOPWORDS = frozenset({
     "used", "back", "then", "before", "remember", "when",
     "someone", "another", "person", "friend", "sister", "brother",
 })
+
+
+
+def _topology_filter_hyponyms(parent_term: str, max_keep: int = 8, threshold: float = 0.25):
+    """Filter WordNet hyponyms by local clustering — no domain lists.
+
+    Builds a small graph of *direct* hyponyms + sister links under each
+    parent synset. Keeps nodes with clustering >= threshold (dense
+    neighborhoods). Falls back to degree rank if networkx missing.
+    """
+    if not _WORDNET_AVAILABLE or wordnet is None:
+        return []
+    parent_term = (parent_term or "").strip()
+    if not parent_term:
+        return []
+    try:
+        with _WORDNET_LOCK:
+            syns = list(wordnet.synsets(parent_term))
+    except Exception:
+        return []
+    if not syns:
+        return []
+
+    # Prefer noun synsets; score by number of direct hyponyms (richer sense)
+    def sense_key(s):
+        try:
+            return (0 if s.pos() == "n" else 1, -len(s.hyponyms()))
+        except Exception:
+            return (2, 0)
+    syns = sorted(syns, key=sense_key)
+
+    scored_lemmas = {}  # lemma -> best clustering/score
+
+    for syn in syns[:3]:  # top few senses only
+        try:
+            direct = list(syn.hyponyms())
+        except Exception:
+            continue
+        if not direct:
+            continue
+
+        if nx is not None:
+            G = nx.Graph()
+            for child in direct:
+                G.add_node(child)
+            # tree edges among direct if any nested in set
+            for child in direct:
+                try:
+                    for gc in child.hyponyms():
+                        if gc in G:
+                            G.add_edge(child, gc)
+                except Exception:
+                    pass
+            # sister edges: all direct hyponyms of same parent are sisters
+            for i, a in enumerate(direct):
+                for b in direct[i + 1:]:
+                    G.add_edge(a, b)
+            try:
+                clustering = nx.clustering(G)
+            except Exception:
+                clustering = {n: 0.0 for n in G.nodes}
+            for child in direct:
+                cval = float(clustering.get(child, 0.0))
+                # also boost by local degree
+                deg = G.degree(child) if child in G else 0
+                score = cval + 0.05 * deg
+                try:
+                    for lemma in child.lemmas():
+                        name = lemma.name().replace("_", " ").casefold()
+                        if not name or name == parent_term.casefold():
+                            continue
+                        if name not in scored_lemmas or score > scored_lemmas[name][0]:
+                            scored_lemmas[name] = (score, lemma.name().replace("_", " "))
+                except Exception:
+                    continue
+        else:
+            # no networkx: keep direct hyponyms, prefer shorter names
+            for child in direct:
+                try:
+                    for lemma in child.lemmas():
+                        name = lemma.name().replace("_", " ")
+                        key = name.casefold()
+                        if not key or key == parent_term.casefold():
+                            continue
+                        score = 1.0 / max(1, len(key))
+                        if key not in scored_lemmas or score > scored_lemmas[key][0]:
+                            scored_lemmas[key] = (score, name)
+                except Exception:
+                    continue
+
+    if not scored_lemmas:
+        return []
+
+    # Keep above threshold; if too few, take top by score
+    above = [(sc, name) for sc, name in scored_lemmas.values() if sc >= threshold]
+    if len(above) < 2:
+        above = list(scored_lemmas.values())
+    above.sort(key=lambda x: -x[0])
+    out = []
+    seen = set()
+    for sc, name in above:
+        k = name.casefold()
+        if k in seen:
+            continue
+        # drop very long multiword sludge
+        if len(name) > 28 or name.count(" ") >= 2:
+            continue
+        seen.add(k)
+        out.append(name)
+        if len(out) >= max_keep:
+            break
+    return out
+
 
 
 def _first_noun_phrase(remainder: str) -> str:
@@ -381,7 +518,7 @@ class SensoryModule:
         investigating "self-study never expands nodes connected to
         SELF"). Any node created from real typed input (association.
         place_node() uses the whole message as the node name, §2.2) is a
-        full sentence, and wordnet.synsets() has no entry for a full
+        full sentence, and _safe_synsets() has no entry for a full
         sentence -- it always returned [] for these, silently marking
         every such node barren after one self-study attempt and
         permanently excluding it. This wasn't actually SELF-specific: it
@@ -402,11 +539,32 @@ class SensoryModule:
             return []
 
         def hyponyms_for(candidate: str) -> List[str]:
+            if not candidate:
+                return []
+            try:
+                filtered = _topology_filter_hyponyms(candidate, max_keep=8, threshold=0.25)
+                if filtered:
+                    return filtered
+            except Exception as e:
+                logger.warning("topology hyponym filter(%r) failed: %s", candidate[:80], e)
+            # fallback: raw direct hyponyms (still capped)
             found = []
-            for syn in wordnet.synsets(candidate):
-                for hyponym in syn.hyponyms():
-                    for lemma in hyponym.lemmas():
-                        found.append(lemma.name().replace("_", " "))
+            try:
+                with _WORDNET_LOCK:
+                    syns = list(wordnet.synsets(candidate)) if (_WORDNET_AVAILABLE and wordnet) else []
+                    for syn in syns[:2]:
+                        try:
+                            for hyponym in syn.hyponyms()[:12]:
+                                for lemma in hyponym.lemmas():
+                                    name = lemma.name().replace("_", " ")
+                                    if name and name.casefold() != candidate.casefold():
+                                        found.append(name)
+                        except Exception:
+                            continue
+            except Exception as e:
+                logger.warning("hyponyms_for(%r) failed: %s", candidate[:80], e)
+            # light structural cap: short names first
+            found = sorted(set(found), key=lambda s: (len(s), s))[:8]
             return found
 
         children = hyponyms_for(node)
@@ -419,7 +577,11 @@ class SensoryModule:
                 if children:
                     break
 
-        return list(set(children))[:5]
+        return list(dict.fromkeys(children))[:8]
+
+    def lookup_hyponyms(self, node: str):
+        """Topology-filtered direct hyponyms for expand/self-study."""
+        return _topology_filter_hyponyms(node or "", max_keep=8, threshold=0.25)
 
     def lookup_synonyms(self, node: str):
         """Same-synset synonyms (e.g. "color" -> "colour," "coloring").
@@ -434,9 +596,16 @@ class SensoryModule:
         if not _WORDNET_AVAILABLE:
             return []
         synonyms = []
-        for syn in wordnet.synsets(node):
-            for lemma in syn.lemmas():
-                synonyms.append(lemma.name().replace("_", " "))
+        try:
+            with _WORDNET_LOCK:
+                for syn in list(wordnet.synsets(node) if wordnet else []):
+                    try:
+                        for lemma in syn.lemmas():
+                            synonyms.append(lemma.name().replace("_", " "))
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.warning("lookup_synonyms(%r) failed: %s", (node or "")[:80], e)
         return list(set(synonyms))[:5]
 
     def lookup_hypernym(self, node: str) -> Optional[str]:
@@ -448,24 +617,34 @@ class SensoryModule:
         gives the answer directly, no pattern-matching needed. Returns
         None if there's no hypernym (already a root concept) or WordNet
         is unavailable."""
-        if not _WORDNET_AVAILABLE:
+        if not _WORDNET_AVAILABLE or wordnet is None:
             return None
-        synsets = wordnet.synsets(node)
-        if not synsets:
+        try:
+            with _WORDNET_LOCK:
+                synsets = list(wordnet.synsets(node))
+                if not synsets:
+                    return None
+                hypernyms = synsets[0].hypernyms()
+                if not hypernyms:
+                    return None
+                return hypernyms[0].lemmas()[0].name().replace("_", " ")
+        except Exception as e:
+            logger.warning("lookup_hypernym(%r) failed: %s", (node or "")[:80], e)
             return None
-        hypernyms = synsets[0].hypernyms()
-        if not hypernyms:
-            return None
-        return hypernyms[0].lemmas()[0].name().replace("_", " ")
 
     def lookup_definition(self, node: str) -> Optional[str]:
         """WordNet gloss for `node`, used as the definitional text
         parse_hierarchy() runs against during self-study expansion (§5.1)
         so autonomously-added nodes get hierarchy placement too, not just
         user/dictionary-triggered ones."""
-        if not _WORDNET_AVAILABLE:
+        if not _WORDNET_AVAILABLE or wordnet is None:
             return None
-        synsets = wordnet.synsets(node)
-        if not synsets:
+        try:
+            with _WORDNET_LOCK:
+                synsets = list(wordnet.synsets(node))
+                if not synsets:
+                    return None
+                return synsets[0].definition()
+        except Exception as e:
+            logger.warning("lookup_definition(%r) failed: %s", (node or "")[:80], e)
             return None
-        return synsets[0].definition()

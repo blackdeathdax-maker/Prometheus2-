@@ -1123,10 +1123,18 @@ class Prometheus:
         # hierarchy micro-repair when focused on a kind hub
         try:
             fid = self.focus.focus_id if self.focus else None
-            if fid and str(fid).casefold() in ("color", "colour") and self.pulse_count % 5 == 0:
+            hubs = set()
+            try:
+                hubs = self._kind_hub_ids()
+            except Exception:
+                pass
+            if fid and (fid in hubs or str(fid).casefold() in {str(h).casefold() for h in hubs}) and self.pulse_count % 5 == 0:
                 r = self._repair_hierarchy_edges()
                 if r and any(r.values()):
                     print(f"Micro-repair: {r}")
+                g = self._grow_kind_schema_membership()
+                if g and g.get("members_linked"):
+                    print(f"Micro-grow: {g}")
         except Exception as e:
             logger.debug("micro-repair failed: %s", e)
 
@@ -2239,21 +2247,79 @@ class Prometheus:
 
 
 
-    def _repair_hierarchy_edges(self) -> dict:
-        """Fix inverted is-a and wrong composed-of membership.
 
-        Observed: color --is-a--> green (wrong); color member of epistemic_of_blue.
+
+    def _kind_hub_ids(self) -> set:
+        """Structural kind hubs — no hardcoded ontology.
+
+        A hub is any non-schema node that is:
+          - current focus / open parent / active goal family, or
+          - user / pedagogical, or
+          - already has ≥2 is-a children (emergent kind).
         """
         graph = self.archivist.graph
-        summary = {"isa_flipped": 0, "isa_dropped": 0, "composed_dropped": 0}
+        hubs = set()
 
-        BASIC_COLORS = {
-            "red", "blue", "green", "yellow", "orange", "purple", "violet",
-            "pink", "brown", "black", "white", "gray", "grey", "cyan", "magenta",
-            "navy", "teal", "maroon", "olive", "lime", "aqua", "silver", "gold",
-            "indigo", "beige", "tan", "coral", "crimson", "scarlet", "azure",
+        def is_schema(nid):
+            d = graph.nodes.get(nid, {}) or {}
+            return d.get("node_type") in ("schema", "epistemic_schema") or bool(d.get("is_schema"))
+
+        try:
+            for hid in (self._open_parent_ids() or []):
+                if hid in graph and not is_schema(hid):
+                    hubs.add(hid)
+        except Exception:
+            pass
+        try:
+            fid = getattr(self.focus, "focus_id", None) if self.focus else None
+            if fid and fid in graph and not is_schema(fid):
+                hubs.add(fid)
+                try:
+                    hubs |= set(self.archivist.kind_family(fid) or [])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if self.goals:
+                for g in (self.goals.open_goals() if hasattr(self.goals, "open_goals") else []):
+                    nid = getattr(g, "node_id", None) or (g.get("node_id") if isinstance(g, dict) else None)
+                    if nid and nid in graph and not is_schema(nid):
+                        hubs.add(nid)
+        except Exception:
+            pass
+        for n, d in list(graph.nodes(data=True)):
+            if is_schema(n):
+                continue
+            if d.get("source") == "user" or d.get("pedagogical") or d.get("user_linked"):
+                hubs.add(n)
+            # emergent: 2+ inbound is-a
+            try:
+                isa_in = 0
+                for u, _, ed in list(graph.in_edges(n, data=True)):
+                    if (ed or {}).get("relation_type") == "is-a":
+                        isa_in += 1
+                        if isa_in >= 2:
+                            hubs.add(n)
+                            break
+            except Exception:
+                pass
+        return {h for h in hubs if h in graph and not is_schema(h)}
+
+    def _repair_hierarchy_edges(self) -> dict:
+        """Generic hierarchy hygiene — no domain word lists.
+
+        Rules (structural only):
+          1. Break is-a 2-cycles; prefer higher-act / higher in-degree endpoint as parent.
+          2. Never lemma ↔ schema is-a (membership is composed-of).
+          3. Under kind hubs, drop weak dictionary is-a children (not user/pedagogical,
+             low activation, dictionary/self_study source) — keep strong/user ones.
+          4. Drop composed-of from schemas that are *children* of a hub onto that hub.
+        """
+        graph = self.archivist.graph
+        summary = {
+            "isa_flipped": 0, "isa_dropped": 0, "composed_dropped": 0, "noise_pruned": 0,
         }
-        KIND_HUBS = {"color", "colour"}
 
         def is_schema(nid):
             d = graph.nodes.get(nid, {}) or {}
@@ -2263,6 +2329,19 @@ class Prometheus:
             d = graph.nodes.get(nid, {}) or {}
             return str(d.get("name") or nid).casefold().strip()
 
+        def act(nid):
+            return float((graph.nodes.get(nid) or {}).get("activation") or 0)
+
+        def isa_in_degree(nid):
+            c = 0
+            try:
+                for _, _, ed in list(graph.in_edges(nid, data=True)):
+                    if (ed or {}).get("relation_type") == "is-a":
+                        c += 1
+            except Exception:
+                pass
+            return c
+
         def remove_rel(u, v, rel):
             if u not in graph or v not in graph:
                 return False
@@ -2271,7 +2350,6 @@ class Prometheus:
                 data = graph.get_edge_data(u, v)
                 if data is None:
                     return False
-                # MultiDiGraph: data is {key: attrdict}
                 if graph.is_multigraph():
                     for key in list(data.keys()):
                         attr = data[key] or {}
@@ -2286,7 +2364,8 @@ class Prometheus:
                 return False
             return removed
 
-        # Snapshot is-a pairs
+        hubs = self._kind_hub_ids()
+
         pairs = []
         try:
             if graph.is_multigraph():
@@ -2299,58 +2378,54 @@ class Prometheus:
                         pairs.append((u, v))
         except Exception:
             pairs = []
-
         pair_set = set(pairs)
 
-        # Drop 2-cycles prefer specific→general
+        # 2-cycles
         seen = set()
         for u, v in pairs:
-            if (u, v) in seen:
+            if (u, v) in seen or (v, u) not in pair_set:
                 continue
-            if (v, u) not in pair_set:
-                continue
-            seen.add((u, v))
-            seen.add((v, u))
-            u_l, v_l = low(u), low(v)
-            # keep green→color, drop color→green
-            drop_uv = False
-            if u_l in KIND_HUBS and v_l in BASIC_COLORS:
-                drop_uv = True
-            elif v_l in KIND_HUBS and u_l in BASIC_COLORS:
-                drop_uv = False  # drop reverse only
-                remove_rel(v, u, "is-a")
-                summary["isa_dropped"] += 1
-                continue
-            elif is_schema(u) or is_schema(v):
-                # drop lemma↔schema is-a both ways; composed-of owns that
-                remove_rel(u, v, "is-a")
-                remove_rel(v, u, "is-a")
+            seen.add((u, v)); seen.add((v, u))
+            if is_schema(u) or is_schema(v):
+                remove_rel(u, v, "is-a"); remove_rel(v, u, "is-a")
                 summary["isa_dropped"] += 2
                 continue
-            if drop_uv:
-                remove_rel(u, v, "is-a")
+            # Prefer parent = higher hub-ness / in-degree / activation
+            score_u = (1 if u in hubs else 0) * 10 + isa_in_degree(u) + act(u)
+            score_v = (1 if v in hubs else 0) * 10 + isa_in_degree(v) + act(v)
+            # keep lower→higher (child → parent)
+            if score_v >= score_u:
+                remove_rel(v, u, "is-a")  # drop reverse
                 summary["isa_dropped"] += 1
             else:
-                remove_rel(v, u, "is-a")
+                remove_rel(u, v, "is-a")
                 summary["isa_dropped"] += 1
 
-        # One-way: color → basic color is-a → flip
+        # One-way cleanups
         for u, v in list(pairs):
             if u not in graph or v not in graph:
                 continue
-            u_l, v_l = low(u), low(v)
-            if u_l in KIND_HUBS and v_l in BASIC_COLORS:
-                if remove_rel(u, v, "is-a"):
-                    try:
-                        self.archivist.link(v, u, "is-a", source="repair", placement="flip_isa")
-                        summary["isa_flipped"] += 1
-                    except Exception:
-                        pass
-            if (not is_schema(u)) and is_schema(v):
+            # lemma is-a schema / schema is-a lemma → drop
+            if is_schema(u) ^ is_schema(v):  # xor: one is schema
                 if remove_rel(u, v, "is-a"):
                     summary["isa_dropped"] += 1
+                continue
+            # weak child under hub
+            if v in hubs and not is_schema(u):
+                d = graph.nodes.get(u, {}) or {}
+                strong = (
+                    d.get("source") == "user"
+                    or d.get("pedagogical")
+                    or d.get("user_linked")
+                    or act(u) >= 1.0
+                    or u in hubs
+                )
+                weak = d.get("source") in ("dictionary", "schema", "self_study", None, "repair")
+                if weak and not strong:
+                    if remove_rel(u, v, "is-a"):
+                        summary["noise_pruned"] += 1
 
-        # composed-of: drop color hub from child schemas
+        # composed-of: schema that is itself an is-a child of hub must not claim hub
         try:
             edge_iter = (
                 list(graph.edges(keys=True, data=True))
@@ -2360,19 +2435,31 @@ class Prometheus:
             for u, v, key, ed in edge_iter:
                 if (ed or {}).get("relation_type") != "composed-of":
                     continue
-                if not is_schema(u):
+                if not is_schema(u) or v not in hubs:
                     continue
-                if low(v) not in KIND_HUBS:
-                    continue
-                u_tail = low(u)
-                if u_tail.startswith("epistemic_of_"):
-                    u_tail = u_tail[len("epistemic_of_"):].replace("_", " ")
-                bad = (
-                    u_tail in BASIC_COLORS
-                    or u_tail in {"jet", "semblance", "wash", "spot"}
-                    or any(bc == u_tail or bc in u_tail.split() for bc in BASIC_COLORS)
-                )
-                if bad:
+                # if schema's lemma-name is-a the hub, or schema has is-a to hub, drop
+                schema_child_of_hub = False
+                try:
+                    for _s, p, e2 in list(graph.out_edges(u, data=True)):
+                        if e2.get("relation_type") == "is-a" and p == v:
+                            schema_child_of_hub = True
+                            break
+                except Exception:
+                    pass
+                # also: name of schema looks like child of hub (epistemic_of_X where X is-a hub)
+                tail = low(u)
+                if tail.startswith("epistemic_of_"):
+                    tail = tail[len("epistemic_of_"):].replace("_", " ")
+                for n in list(graph.nodes):
+                    if low(n) == tail and not is_schema(n):
+                        try:
+                            for _a, p, e2 in list(graph.out_edges(n, data=True)):
+                                if e2.get("relation_type") == "is-a" and p == v:
+                                    schema_child_of_hub = True
+                                    break
+                        except Exception:
+                            pass
+                if schema_child_of_hub:
                     try:
                         if key is not None:
                             graph.remove_edge(u, v, key)
@@ -2383,40 +2470,133 @@ class Prometheus:
                         pass
         except Exception:
             pass
+        return summary
 
-        # Ensure basic colors is-a color when related
-        color_ids = [
-            n for n in list(graph.nodes)
-            if low(n) in KIND_HUBS and not is_schema(n)
-        ]
-        for cid in color_ids:
-            for n in list(graph.nodes):
-                if n not in graph or is_schema(n):
-                    continue
-                if low(n) not in BASIC_COLORS:
-                    continue
-                has = False
+    def _grow_kind_schema_membership(self) -> dict:
+        """For each structural kind hub, ensure a kind schema owns its is-a children.
+
+        No domain lists: hub set from _kind_hub_ids(); members = current is-a children.
+        """
+        graph = self.archivist.graph
+        summary = {"hubs": 0, "members_linked": 0, "isa_cleared": 0, "schemas": []}
+
+        def is_schema(nid):
+            d = graph.nodes.get(nid, {}) or {}
+            return d.get("node_type") in ("schema", "epistemic_schema") or bool(d.get("is_schema"))
+
+        def low(nid):
+            d = graph.nodes.get(nid, {}) or {}
+            return str(d.get("name") or nid).casefold().strip()
+
+        hubs = self._kind_hub_ids()
+        if not hubs:
+            return summary
+
+        for lemma in list(hubs):
+            if lemma not in graph or is_schema(lemma):
+                continue
+            # find or create epistemic schema for this lemma
+            schema_id = None
+            prefer = f"epistemic_of_{str(lemma).casefold().replace(' ', '_')}"
+            for cand in (prefer, f"epistemic_of_{lemma}"):
+                if cand in graph and is_schema(cand):
+                    schema_id = cand
+                    break
+            if schema_id is None:
+                for n, d in list(graph.nodes(data=True)):
+                    if not is_schema(n):
+                        continue
+                    if d.get("kind_of") == lemma:
+                        schema_id = n
+                        break
+                    nm = low(n).replace("epistemic_of_", "").replace("_", " ")
+                    if nm == low(lemma):
+                        schema_id = n
+                        break
+            if schema_id is None:
+                schema_id = prefer
                 try:
-                    for _u, p, ed in list(graph.out_edges(n, data=True)):
-                        if (ed or {}).get("relation_type") == "is-a" and p == cid:
-                            has = True
-                            break
+                    if schema_id not in graph:
+                        self.archivist.store(schema_id, source="schema")
+                    if schema_id in graph:
+                        graph.nodes[schema_id]["node_type"] = "epistemic_schema"
+                        graph.nodes[schema_id]["is_schema"] = True
+                        graph.nodes[schema_id]["name"] = low(lemma)
+                        graph.nodes[schema_id]["kind_of"] = lemma
+                except Exception:
+                    continue
+            summary["hubs"] += 1
+            summary["schemas"].append(schema_id)
+
+            # lemma as member
+            try:
+                has_mem = any(
+                    ed.get("relation_type") == "composed-of" and v == lemma
+                    for _, v, ed in list(graph.out_edges(schema_id, data=True))
+                )
+                if not has_mem:
+                    self.archivist.link(
+                        schema_id, lemma, "composed-of",
+                        source="schema", placement="kind_schema",
+                    )
+                    summary["members_linked"] += 1
+            except Exception:
+                pass
+
+            # is-a children of lemma → schema members
+            children = []
+            try:
+                for u, _, ed in list(graph.in_edges(lemma, data=True)):
+                    if (ed or {}).get("relation_type") == "is-a" and not is_schema(u):
+                        children.append(u)
+            except Exception:
+                pass
+            for child in children:
+                try:
+                    has_c = any(
+                        ed.get("relation_type") == "composed-of" and v == child
+                        for _, v, ed in list(graph.out_edges(schema_id, data=True))
+                    )
+                    if not has_c:
+                        self.archivist.link(
+                            schema_id, child, "composed-of",
+                            source="schema", placement="kind_member",
+                        )
+                        summary["members_linked"] += 1
                 except Exception:
                     pass
-                if has:
-                    continue
-                related = False
-                try:
-                    related = graph.has_edge(n, cid) or graph.has_edge(cid, n)
-                except Exception:
-                    pass
-                d = graph.nodes.get(n, {}) or {}
-                if related or d.get("source") == "user" or d.get("pedagogical"):
-                    try:
-                        self.archivist.link(n, cid, "is-a", source="repair", placement="ensure_isa")
-                        summary["isa_flipped"] += 1
-                    except Exception:
-                        pass
+
+            # clear schema ↔ lemma is-a
+            try:
+                for u, v, ed in list(graph.out_edges(schema_id, data=True)):
+                    if ed.get("relation_type") != "is-a":
+                        continue
+                    data = graph.get_edge_data(schema_id, v)
+                    if graph.is_multigraph() and data:
+                        for key in list(data.keys()):
+                            if (data[key] or {}).get("relation_type") == "is-a":
+                                graph.remove_edge(schema_id, v, key)
+                                summary["isa_cleared"] += 1
+                    elif data:
+                        graph.remove_edge(schema_id, v)
+                        summary["isa_cleared"] += 1
+                for u, v, ed in list(graph.in_edges(schema_id, data=True)):
+                    if ed.get("relation_type") != "is-a":
+                        continue
+                    data = graph.get_edge_data(u, schema_id)
+                    if graph.is_multigraph() and data:
+                        for key in list(data.keys()):
+                            if (data[key] or {}).get("relation_type") == "is-a":
+                                graph.remove_edge(u, schema_id, key)
+                                summary["isa_cleared"] += 1
+                    elif data:
+                        graph.remove_edge(u, schema_id)
+                        summary["isa_cleared"] += 1
+            except Exception:
+                pass
+            if schema_id in graph:
+                graph.nodes[schema_id]["kind_of"] = lemma
+                graph.nodes[schema_id]["is_schema"] = True
         return summary
 
     def _promote_kind_associations(self) -> int:
@@ -2439,11 +2619,6 @@ class Prometheus:
                 continue
             if d.get("source") == "user" or d.get("pedagogical"):
                 hubs.add(n)
-            if str(n).casefold() in {
-                "color", "colour", "animal", "emotion", "feeling", "tool",
-                "food", "plant", "vehicle", "body", "person",
-            }:
-                hubs.add(n)
         # Normalize via kind_family
         expanded = set()
         for h in list(hubs):
@@ -2454,9 +2629,8 @@ class Prometheus:
         hubs = {h for h in expanded if h in graph and graph.nodes[h].get("node_type") not in ("schema", "epistemic_schema")}
         promoted = 0
         skip_words = {
-            "discolor", "colorise", "colorize", "colourise", "colourize",
-            "chromatic color", "visual property", "irregularly shaped spot",
-            "semblance", "property", "attribute",
+            "property", "attribute", "thing", "entity", "object", "stuff",
+            "something", "anything", "nothing",
         }
         for hub in hubs:
             # associated-with either direction
@@ -2560,6 +2734,10 @@ class Prometheus:
             self._repair_hierarchy_edges()
         except Exception:
             pass
+        try:
+            self._grow_kind_schema_membership()
+        except Exception:
+            pass
         # Un-barren the parent for this directed expand
         try:
             self._barren_self_study_targets.discard(parent)
@@ -2582,6 +2760,42 @@ class Prometheus:
                 plan = [("hyponym", h) for h in hypos if h]
             except Exception:
                 plan = []
+        # Structural EXPAND filter under kind hubs: drop obvious noise sources,
+        # prefer short lemmas / already-in-graph / user-linked — no domain lists.
+        hubs = set()
+        try:
+            hubs = self._kind_hub_ids()
+        except Exception:
+            pass
+        if parent in hubs or str(parent).casefold() in {str(h).casefold() for h in hubs}:
+            filtered, seen = [], set()
+            for kind, child in plan:
+                c = str(child).casefold().strip()
+                if not c or c in seen or c == str(parent).casefold():
+                    continue
+                # skip multiword dictionary sludge and very long names
+                if len(c) > 24 or c.count(" ") >= 2:
+                    continue
+                if c.startswith("epistemic_"):
+                    continue
+                seen.add(c)
+                filtered.append((kind, child))
+            # prefer children already related in graph
+            related = []
+            rest = []
+            for kind, child in filtered:
+                ch = child if child in self.archivist.graph else None
+                if ch is None:
+                    for n in self.archivist.graph.nodes:
+                        if str(n).casefold() == str(child).casefold():
+                            ch = n
+                            break
+                if ch is not None and (self.archivist.graph.has_edge(ch, parent) or self.archivist.graph.has_edge(parent, ch)):
+                    related.append((kind, child))
+                else:
+                    rest.append((kind, child))
+            plan = (related + rest)[:12]
+
         soft = int(getattr(self, "SELF_STUDY_SOFT_CAP", 8) or 8)
         for kind, child in plan[: max_new + 2]:
             if placed >= max_new:
@@ -3145,6 +3359,12 @@ class Prometheus:
                 print(f"Consolidation: hierarchy repair {repaired}")
         except Exception as e:
             logger.warning("hierarchy repair failed: %s", e)
+        try:
+            grown = self._grow_kind_schema_membership()
+            if grown and grown.get("members_linked"):
+                print(f"Consolidation: kind schema growth {grown}")
+        except Exception as e:
+            logger.warning("kind schema growth failed: %s", e)
         try:
             absorbed = self.reflector.absorb_hash_schemas_into_kind_parents()
             if absorbed:
