@@ -232,15 +232,25 @@ if st.session_state.prom is not None:
                                 f"related {nb.get('related_count', 0)} (showing up to 15 each)"
                             )
                             if nb.get("parents"):
-                                st.markdown("**Parents / is-a targets**")
+                                st.markdown("**Parents (this is-a …)**")
                                 for row in nb["parents"]:
                                     nm = row.get("name") or row["id"]
                                     st.write(f"- `{row['id']}` ({nm}) · {row.get('relation')}")
                             if nb.get("children"):
-                                st.markdown("**Children / inbound**")
+                                st.markdown("**Children (… is-a this)**")
                                 for row in nb["children"]:
                                     nm = row.get("name") or row["id"]
                                     st.write(f"- `{row['id']}` ({nm}) · {row.get('relation')}")
+                            if nb.get("member_of_schemas"):
+                                st.markdown("**Member of schemas**")
+                                for row in nb["member_of_schemas"]:
+                                    nm = row.get("name") or row["id"]
+                                    st.write(f"- `{row['id']}` ({nm})")
+                            if nb.get("schema_members"):
+                                st.markdown("**Schema members (if this is a schema)**")
+                                for row in nb["schema_members"]:
+                                    nm = row.get("name") or row["id"]
+                                    st.write(f"- `{row['id']}` ({nm})")
                             if nb.get("related"):
                                 st.markdown("**Other edges**")
                                 for row in nb["related"]:
