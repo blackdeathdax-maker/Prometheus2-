@@ -503,6 +503,70 @@ class ReflectorModule:
                     pass
         return removed
 
+
+    def absorb_hash_schemas_into_kind_parents(self) -> int:
+        """Fold anonymous epistemic_* hashes into epistemic_of_{parent} when
+        a clear dominant parent exists among members (focus-family hygiene)."""
+        graph = self.archivist.graph
+        absorbed = 0
+        for n, d in list(graph.nodes(data=True)):
+            if d.get("node_type") != NODE_EPISTEMIC_SCHEMA:
+                continue
+            if str(n).startswith("epistemic_of_"):
+                continue
+            if d.get("named") and d.get("formation") == "is_a_kind":
+                continue
+            # members via composed-of
+            members = [
+                v for _u, v, ed in graph.out_edges(n, data=True)
+                if ed.get("relation_type") == EDGE_COMPOSED_OF
+            ]
+            if len(members) < 2:
+                continue
+            # dominant is-a parent among members
+            parent_counts = {}
+            for m in members:
+                for _u, p, ed in graph.out_edges(m, data=True):
+                    if ed.get("relation_type") == "is-a" and p in graph:
+                        parent_counts[p] = parent_counts.get(p, 0) + 1
+            if not parent_counts:
+                continue
+            parent, cnt = max(parent_counts.items(), key=lambda kv: kv[1])
+            if cnt < max(2, len(members) // 2):
+                continue
+            kind_id = f"epistemic_of_{parent}"
+            if kind_id not in graph:
+                graph.add_node(
+                    kind_id,
+                    node_type=NODE_EPISTEMIC_SCHEMA,
+                    name=str(parent),
+                    named=True,
+                    dominant_parent=parent,
+                    formation="is_a_kind",
+                    source="schema",
+                    member_count=0,
+                )
+            for m in members:
+                if not any(
+                    vv == m and eed.get("relation_type") == EDGE_COMPOSED_OF
+                    for _uu, vv, eed in graph.out_edges(kind_id, data=True)
+                ):
+                    graph.add_edge(
+                        kind_id, m, relation_type=EDGE_COMPOSED_OF,
+                        source="schema", placement="hash_absorb",
+                    )
+            try:
+                graph.remove_node(n)
+                absorbed += 1
+            except Exception:
+                pass
+            if kind_id in graph:
+                graph.nodes[kind_id]["member_count"] = sum(
+                    1 for _u, v, ed in graph.out_edges(kind_id, data=True)
+                    if ed.get("relation_type") == EDGE_COMPOSED_OF
+                )
+        return absorbed
+
     def merge_case_variant_kind_schemas(self) -> int:
         """Merge epistemic_of_Color / epistemic_of_color and weak parents
         (tinge) into the richest same-lemma schema.
@@ -753,12 +817,28 @@ class ReflectorModule:
 
         def neighbors(n):
             out = set()
-            for u, v, ed in list(graph.in_edges(n, data=True)) + list(graph.out_edges(n, data=True)):
-                if ed.get("relation_type") in rel_ok:
-                    out.add(u if v == n else v)
+            try:
+                edges = []
+                try:
+                    edges.extend(list(graph.in_edges(n, data=True)))
+                except Exception:
+                    pass
+                try:
+                    edges.extend(list(graph.out_edges(n, data=True)))
+                except Exception:
+                    pass
+                for u, v, ed in edges:
+                    if (ed or {}).get("relation_type") in rel_ok:
+                        out.add(u if v == n else v)
+            except RuntimeError:
+                # graph mutated mid-iteration (parallel consolidation side effects)
+                return set()
             return out
 
-        return neighbors(a) & neighbors(b) - {a, b}
+        try:
+            return neighbors(a) & neighbors(b) - {a, b}
+        except RuntimeError:
+            return set()
 
     def _best_edge_weight(self, a: str, b: str) -> float:
         """Strongest typed relation weight between a and b (either direction)."""

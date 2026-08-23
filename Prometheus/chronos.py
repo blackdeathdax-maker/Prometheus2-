@@ -122,7 +122,7 @@ class ChronosModule:
         floor (§6.1, §5 stability requirement) hasn't been met yet --
         callers must treat that as "not eligible", not "failed".
         """
-        occurrences = [n for (_, k, n) in self.felt_state_links if k == basin_key][-window:]
+        occurrences = [n for (_, k, n) in list(self.felt_state_links) if k == basin_key][-window:]
         if len(occurrences) < min_occurrences:
             return None, 0.0, len(occurrences)
         counts = Counter(occurrences)
@@ -133,7 +133,7 @@ class ChronosModule:
         """Distinct basin keys that have at least one recorded link, for
         callers that need to sweep every candidate rather than check one
         basin at a time."""
-        return list({k for (_, k, _n) in self.felt_state_links})
+        return list({k for (_, k, _n) in list(self.felt_state_links)})
 
     # ------------------------------------------------------------------
     # §2.1b temporal-contrast support

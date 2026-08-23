@@ -214,8 +214,9 @@ class WorkingMemoryModule:
         user_priority = self._effective_user_priority(epoch_value)
         if self.is_user_linked(node):
             score += user_priority * self.USER_PRIORITY_WEIGHT
-            # Extra stickiness so user Color/Green/… are not washed out
             score += 2.0
+        if data.get("pedagogical"):
+            score += 3.0
         else:
             score += (1.0 - user_priority) * self.USER_PRIORITY_WEIGHT
 
@@ -233,7 +234,9 @@ class WorkingMemoryModule:
             elif str(node).startswith("epistemic_of_"):
                 score += 1.0
             else:
-                score -= 2.0  # hash schemas
+                score -= 8.0  # anonymous hash schemas — keep out of WM
+            if str(node).startswith("epistemic_") and not str(node).startswith("epistemic_of_"):
+                score -= 6.0
             if len(name.split()) > 3 or len(name) > 32:
                 score -= 4.0
 

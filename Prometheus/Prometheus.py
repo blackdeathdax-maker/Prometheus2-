@@ -1355,23 +1355,20 @@ class Prometheus:
             d["basin_tag"] = key
 
     def _coact_weight_for_nodes(self, nodes) -> float:
-        """Phase + valence + pedagogical gating for kind evidence."""
+        """Phase + valence + pedagogical + goal-family gating for kind evidence."""
         nodes = [n for n in nodes if n in self.archivist.graph]
         if len(nodes) < 2:
             return 0.0
         w = 1.0
         open_ids = self._open_parent_ids()
-        # Phase: if none of the nodes are under an open parent/focus, weaken
         if open_ids and not any(n in open_ids for n in nodes):
             w *= self.CLOSED_PARENT_COACT_WEIGHT
-        # Valence: prefer shared basin tag with current climate
         cur = self._current_basin_key()
         if cur:
             tags = [self._node_basin_tag(n) for n in nodes]
             tagged = [t for t in tags if t]
             if tagged and not any(t == cur for t in tagged):
                 w *= self.OFF_BASIN_COACT_WEIGHT
-        # Pedagogical boost
         ped = 0
         for n in nodes:
             if self.archivist.graph.nodes.get(n, {}).get("pedagogical"):
@@ -1380,6 +1377,30 @@ class Prometheus:
             w *= self.PEDAGOGICAL_COACT_WEIGHT
         elif ped == 1:
             w *= 1.4
+
+        # Active goal family: strongly suppress off-family pair evidence
+        # (stops Color+baby+child mud clusters while Color goal is open)
+        try:
+            if getattr(self, "goals", None) is not None:
+                gts = list(self.goals.active_target_ids() or [])
+                if gts:
+                    fam = set()
+                    for g in gts[:3]:
+                        fam |= set(self.archivist.kind_family(g) or [])
+                        try:
+                            fam |= set(self.focus.schema_closure(self.archivist.graph, g) or [])
+                        except Exception:
+                            pass
+                    if fam:
+                        on = sum(1 for n in nodes if n in fam)
+                        if on == 0:
+                            w *= 0.05  # pure off-family
+                        elif on < len(nodes):
+                            w *= 0.25  # mixed pair
+                        else:
+                            w *= 1.6   # pure on-family
+        except Exception:
+            pass
         return w
 
     def _record_co_activation_gated(self, nodes) -> None:
@@ -1694,7 +1715,7 @@ class Prometheus:
             if inten >= 0.55:
                 h["testosterone"] = min(1.0, h["testosterone"] + self.SELF_STUDY_TESTOSTERONE_BUMP)
 
-    def _select_self_study_target(self, hard_cap: int = 3):
+    def _select_self_study_target(self, hard_cap: int = 8):
         """(a) active/trusted nodes with few children, or (b) emotionally
         salient nodes weighted by *current* felt state (§5.1) -- historical
         emotional weighting stays inside Consolidation, not here.
@@ -2203,6 +2224,99 @@ class Prometheus:
             self._run_sleep_pulse()
 
 
+
+    def _expand_under_parent(self, parent: str, max_new: int = 3) -> int:
+        """Directed lookup under a known parent (Color), not random self-study.
+
+        Ignores the usual self-study target picker so EXPAND actually grows
+        the focused family. Soft-cap per parent still applies.
+        """
+        if not parent or parent not in self.archivist.graph:
+            return 0
+        # Un-barren the parent for this directed expand
+        try:
+            self._barren_self_study_targets.discard(parent)
+        except Exception:
+            pass
+        placed = 0
+        try:
+            plan = self._ordered_self_study_expansions(parent)
+        except Exception as e:
+            logger.warning("expand plan failed for %r: %s", parent, e)
+            plan = []
+        if not plan:
+            # Fallback: sensory hyponyms directly
+            try:
+                hypos = []
+                if hasattr(self.sensory, "lookup_hyponyms"):
+                    hypos = list(self.sensory.lookup_hyponyms(parent) or [])[:6]
+                elif hasattr(self.sensory, "hyponyms_for"):
+                    hypos = list(self.sensory.hyponyms_for(parent) or [])[:6]
+                plan = [("hyponym", h) for h in hypos if h]
+            except Exception:
+                plan = []
+        soft = int(getattr(self, "SELF_STUDY_SOFT_CAP", 8) or 8)
+        for kind, child in plan[: max_new + 2]:
+            if placed >= max_new:
+                break
+            if not child or child == parent:
+                continue
+            if child in self.archivist.graph:
+                # Reinforce is-a toward parent if missing
+                if kind == "hyponym":
+                    try:
+                        self.archivist.link(
+                            child, parent, "is-a",
+                            source="dictionary", placement="expand_under",
+                        )
+                    except Exception:
+                        pass
+                continue
+            try:
+                definition = ""
+                try:
+                    definition = self.sensory.lookup_definition(child) or ""
+                except Exception:
+                    pass
+                result = self.association.place_node(
+                    child,
+                    definition=definition,
+                    source="dictionary",
+                    context_node=parent,
+                    max_parent_children=soft,
+                    force_lookup=True,
+                )
+                term_id = result.get("term") if isinstance(result, dict) else result
+                if not term_id:
+                    continue
+                placed += 1
+                if kind == "hyponym" and term_id != parent:
+                    try:
+                        self.archivist.link(
+                            term_id, parent, "is-a",
+                            source="dictionary", placement="expand_under",
+                        )
+                    except Exception:
+                        pass
+                try:
+                    self.archivist.bump_activation(term_id, getattr(self, "ACTIVATION_BOOST_SELF_STUDY", 0.4))
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.debug("expand place %r failed: %s", child, e)
+        if placed:
+            try:
+                self.archivist.bump_activation(parent, getattr(self, "ACTIVATION_BOOST_SELF_STUDY", 0.4))
+                self._record_co_activation_gated(
+                    [parent] + [
+                        c for _k, c in plan[:placed]
+                        if c in self.archivist.graph
+                    ]
+                )
+            except Exception:
+                pass
+        return placed
+
     def _run_cognition_operators(self) -> dict:
         """Prediction check + choose/apply one internal operator."""
         if getattr(self, "operators", None) is None:
@@ -2307,11 +2421,11 @@ class Prometheus:
                     detail = "expand_under=" + str(parent)
                     if self.state == "Learning":
                         before = self.archivist.graph.number_of_nodes()
-                        self._self_study()
+                        placed = self._expand_under_parent(parent)
                         after = self.archivist.graph.number_of_nodes()
-                        detail += " nodes+" + str(after - before)
-                except Exception:
-                    detail = "expand_failed"
+                        detail += " placed=" + str(placed) + " nodes+" + str(after - before)
+                except Exception as e:
+                    detail = "expand_failed:" + str(e)[:60]
             try:
                 self.self_narrative.stream_interrupt(
                     "expand", target_id=parent or "", detail=detail, pulse=self.pulse_count,
@@ -2677,6 +2791,12 @@ class Prometheus:
                 print(f"Consolidation: merged case-variant kind schemas {merged_case}")
         except Exception as e:
             logger.warning("case-variant merge failed: %s", e)
+        try:
+            absorbed = self.reflector.absorb_hash_schemas_into_kind_parents()
+            if absorbed:
+                print(f"Consolidation: absorbed hash schemas into kind parents {absorbed}")
+        except Exception as e:
+            logger.warning("hash schema absorb failed: %s", e)
         try:
             hollow = self.reflector.prune_hollow_meta_schemas()
             if hollow:
