@@ -778,6 +778,27 @@ if st.session_state.prom is not None:
                 st.caption("No schema slots filled yet.")
 
             st.divider()
+            st.subheader("Operators / prediction")
+            st.caption("Internal moves: HOLD · RETURN · EXPAND · RELEASE · SETTLE")
+            try:
+                opr = prom.get_operators_report() if hasattr(prom, "get_operators_report") else {}
+            except Exception as e:
+                opr = {"error": str(e)}
+            if opr.get("last_operator"):
+                st.write(
+                    f"**{opr['last_operator']}** — {opr.get('last_note','')} "
+                    f"(predict: {opr.get('last_predict',{})})"
+                )
+            eps = opr.get("episodes") or []
+            if eps:
+                with st.expander(f"Recent episodes ({len(eps)})"):
+                    for e in reversed(eps[-12:]):
+                        st.write(
+                            f"p{e.get('pulse')} **{e.get('operator')}** "
+                            f"{e.get('predict')} focus=`{e.get('focus')}` "
+                            f"{e.get('detail') or ''}"
+                        )
+
             st.subheader("Stream of Consciousness")
             st.caption(
                 "Moment-to-moment trace from focus, felt state, working memory, "
