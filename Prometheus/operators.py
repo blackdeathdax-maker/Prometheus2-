@@ -47,6 +47,7 @@ class OperatorModule:
         self.episodes: List[dict] = []
         self.last_decision: Optional[OperatorDecision] = None
         self.last_predict: Optional[PredictResult] = None
+        self._op_ring: List[str] = []  # last operators, independent of episode payload
 
     # ------------------------------------------------------------------
     # Family helpers (graph-local; same spirit as kind_family)
@@ -177,86 +178,101 @@ class OperatorModule:
 
         scores = {op: 0.0 for op in OPS}
 
-        # Anti-oscillation: recent RETURN streak → prefer HOLD/EXPAND
-        recent_ops = [e.get("operator") for e in self.episodes[-6:]]
-        return_streak = 0
-        for o in reversed(recent_ops):
-            if o == "RETURN":
-                return_streak += 1
-            else:
-                break
-        same_return_target = False
-        if return_streak >= 2 and goal_targets:
-            # last RETURN details
-            for e in reversed(self.episodes[-6:]):
-                if e.get("operator") == "RETURN":
-                    if e.get("goal") and e.get("goal") == goal_targets[0]:
-                        same_return_target = True
-                    break
+        # Prefer ring buffer over episodes (survives partial resets)
+        ring = list(self._op_ring[-12:])
+        if not ring:
+            ring = [e.get("operator") for e in self.episodes[-12:] if e.get("operator")]
 
-        # HOLD: coherent focus or after RETURN streak
-        scores["HOLD"] = 1.0
-        if pred.match and focus_id and not pred.off_family_focus:
-            scores["HOLD"] += 2.0  # truly on-family
-        elif pred.match and focus_id:
-            scores["HOLD"] += 1.0  # family in WM but focus slightly off
+        def streak_of(name: str) -> int:
+            n = 0
+            for o in reversed(ring):
+                if o == name:
+                    n += 1
+                else:
+                    break
+            return n
+
+        return_streak = streak_of("RETURN")
+        expand_streak = streak_of("EXPAND")
+        hold_streak = streak_of("HOLD")
+        last_op = ring[-1] if ring else None
+
+        # ---- HARD GATES (beat any score stack) ----
+        force_hold = False
+        force_return = False
+        # Never EXPAND twice in a row
+        if last_op == "EXPAND":
+            force_hold = True
+        # After 2 expands in last 4, dwell
+        if sum(1 for o in ring[-4:] if o == "EXPAND") >= 2:
+            force_hold = True
+        # True drift → RETURN once
+        if goal_targets and pred.off_family_focus and not pred.match and last_op != "RETURN":
+            force_return = True
+            force_hold = False
+
+        # HOLD baseline — winning default when coherent
+        scores["HOLD"] = 3.0
+        if pred.match:
+            scores["HOLD"] += 1.5
+        if not pred.off_family_focus:
+            scores["HOLD"] += 1.0
         if bias == "BIAS_STABILIZE":
-            scores["HOLD"] += 0.4
-        if return_streak >= 2:
-            scores["HOLD"] += 2.5  # break RETURN loops
-        if return_streak >= 4:
+            scores["HOLD"] += 0.5
+        if expand_streak >= 1:
+            scores["HOLD"] += 3.0
+        if return_streak >= 1:
             scores["HOLD"] += 2.0
 
-        # RETURN: only when focus clearly off-family AND prediction violated
-        # or off-family with no WM family presence
+        # RETURN — only real absence / hard off-family
+        scores["RETURN"] = 0.1
         if goal_targets and pred.off_family_focus and not pred.match:
-            scores["RETURN"] += 3.0
-        elif goal_targets and pred.off_family_focus and pred.match:
-            # family in WM but focus drifted — mild RETURN once, not forever
-            if return_streak == 0:
-                scores["RETURN"] += 1.2
-            else:
-                scores["RETURN"] += 0.2  # damp after first
-        if goal_targets and not pred.match and not pred.off_family_focus:
-            scores["RETURN"] += 1.0
-        if goal_strength > 1.2 and pred.off_family_focus and return_streak == 0:
-            scores["RETURN"] += 0.3
+            scores["RETURN"] = 4.0
+        elif goal_targets and pred.off_family_focus and last_op != "RETURN":
+            scores["RETURN"] = 1.5
+        if return_streak >= 1:
+            scores["RETURN"] *= 0.15
 
-        # EXPAND: on-family or mild off with match — deepen schema
-        if parent_open or (pred.match and focus_id):
-            scores["EXPAND"] += 1.2
-        if pred.match and not pred.off_family_focus:
-            scores["EXPAND"] += 1.5  # deepen coherent goal family
-        if lookup_budget_ok and pred.match:
-            scores["EXPAND"] += 0.8
-        if bias == "BIAS_EXPLORE" or bias == "BIAS_FORCE_EXPLORE":
-            scores["EXPAND"] += 0.6
-        if return_streak >= 2:
-            scores["EXPAND"] += 1.8  # after RETURN loop, grow instead
+        # EXPAND — sparse, once then stop
+        scores["EXPAND"] = 0.2
+        if force_hold or expand_streak >= 1 or last_op == "EXPAND":
+            scores["EXPAND"] = 0.05
+        else:
+            # only if coherent + budget + not just returned
+            if lookup_budget_ok and pred.match and last_op != "RETURN":
+                scores["EXPAND"] = 2.2
+            if hold_streak >= 3 and lookup_budget_ok and pred.match:
+                scores["EXPAND"] = 2.8  # dwell then one deepen
+            if bias in ("BIAS_EXPLORE", "BIAS_FORCE_EXPLORE") and expand_streak == 0:
+                scores["EXPAND"] = max(scores["EXPAND"], 2.5)
+            if parent_open and pred.match and expand_streak == 0 and hold_streak >= 2:
+                scores["EXPAND"] = max(scores["EXPAND"], 2.0)
 
-        # RELEASE
+        # RELEASE / SETTLE
+        scores["RELEASE"] = 0.2
         if stagnation and not pred.match:
-            scores["RELEASE"] += 1.5
+            scores["RELEASE"] = 2.0
         if goal_targets and goal_strength < 0.45:
-            scores["RELEASE"] += 1.2
+            scores["RELEASE"] += 0.8
         if fatigue > 0.85:
-            scores["RELEASE"] += 0.4
-        if return_streak >= 5:
-            scores["RELEASE"] += 1.0  # give up sticky RETURN
+            scores["RELEASE"] += 0.5
 
-        # SETTLE
+        scores["SETTLE"] = 0.2
         if fatigue >= 0.7:
-            scores["SETTLE"] += 1.5
+            scores["SETTLE"] = 1.8
         if bias == "BIAS_STABILIZE":
-            scores["SETTLE"] += 0.8
+            scores["SETTLE"] += 0.6
         if fatigue >= 0.85:
             scores["SETTLE"] += 0.8
 
-        # Mutual exclusion
-        if scores["RETURN"] >= 2.5 and return_streak == 0:
-            scores["EXPAND"] *= 0.85
-        if return_streak >= 2:
-            scores["RETURN"] *= 0.3  # hard damp
+        if force_return:
+            scores["RETURN"] = 10.0
+            scores["EXPAND"] = 0.0
+            scores["HOLD"] = 0.5
+        elif force_hold:
+            scores["HOLD"] = 10.0
+            scores["EXPAND"] = 0.0
+            scores["RETURN"] = min(scores["RETURN"], 0.3)
 
         best = max(scores, key=lambda k: scores[k])
         note = {
@@ -272,6 +288,9 @@ class OperatorModule:
 
         dec = OperatorDecision(operator=best, scores=scores, predict=pred, note=note)
         self.last_decision = dec
+        self._op_ring.append(best)
+        if len(self._op_ring) > 24:
+            self._op_ring = self._op_ring[-24:]
         return dec
 
     def record_episode(
