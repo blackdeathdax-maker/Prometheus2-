@@ -75,10 +75,10 @@ class GoalModule:
     MAX_ACTIVE = 5
     COMMIT_AFTER_PULSES = 8
     SATISFY_RESIDUAL_BELOW = 1.15
-    SATISFY_MIN_DWELL = 6
-    SCHEMA_GROWTH_MEMBERS = 2
-    SCHEMA_GROWTH_NESTED = 1
-    SCHEMA_GROWTH_EVENTS = 2
+    SATISFY_MIN_DWELL = 12
+    SCHEMA_GROWTH_MEMBERS = 3
+    SCHEMA_GROWTH_NESTED = 2
+    SCHEMA_GROWTH_EVENTS = 5
     FAIL_ON_STAGNATION = True
     STAGNATION_OFF_FOCUS_MIN = 40   # must be off-focus this long before stagnation fails
     FORCE_SWITCH_OFF_FOCUS_MIN = 25
@@ -93,6 +93,7 @@ class GoalModule:
         self.active: Dict[str, Commitment] = {}
         self.history: List[Commitment] = []
         self._dwell: Dict[str, int] = {}
+        self._recently_satisfied: Dict[str, int] = {}  # gid -> pulse
         self._on_event = None  # optional callable(event, target, detail, pulse)
         self.load()
 
@@ -107,12 +108,70 @@ class GoalModule:
         )
 
     def _member_ids(self, graph, schema_id: str) -> List[str]:
+        """Structural children: composed-of members + inbound is-a hyponyms."""
         if graph is None or schema_id not in graph:
             return []
-        return [
-            v for _u, v, ed in graph.out_edges(schema_id, data=True)
-            if ed.get("relation_type") == EDGE_COMPOSED_OF
-        ]
+        out: List[str] = []
+        seen = set()
+
+        def add(n):
+            if n and n not in seen and n != schema_id and n in graph:
+                seen.add(n)
+                out.append(n)
+
+        def rel_of(ed):
+            return str(ed.get("relation_type") or ed.get("type") or "")
+
+        try:
+            for _u, v, ed in graph.out_edges(schema_id, data=True):
+                r = rel_of(ed)
+                if r in ("composed-of", "is-a"):
+                    add(v)
+        except Exception:
+            pass
+        try:
+            for u, _v, ed in graph.in_edges(schema_id, data=True):
+                r = rel_of(ed)
+                if r == "is-a":
+                    add(u)  # u is-a schema_id
+                elif r == "composed-of":
+                    add(u)
+        except Exception:
+            pass
+
+        # Also count under name-twin lemma and epistemic twin
+        twins = {schema_id}
+        try:
+            d0 = graph.nodes.get(schema_id, {}) or {}
+            nm = str(d0.get("name") or schema_id).casefold()
+            rid = str(schema_id).casefold()
+            for n, nd in list(graph.nodes(data=True)):
+                sn = str(nd.get("name") or "").casefold()
+                if sn == nm or str(n).casefold() == rid:
+                    twins.add(n)
+                if str(n).startswith("epistemic_of_"):
+                    tail = str(n)[len("epistemic_of_"):].replace("_", " ").casefold()
+                    if tail == nm or nm in tail or tail in nm:
+                        twins.add(n)
+        except Exception:
+            pass
+
+        for t in list(twins):
+            if t not in graph:
+                continue
+            try:
+                for _u, v, ed in graph.out_edges(t, data=True):
+                    if rel_of(ed) in ("composed-of", "is-a"):
+                        add(v)
+                for u, _v, ed in graph.in_edges(t, data=True):
+                    if rel_of(ed) == "is-a":
+                        add(u)
+                    elif rel_of(ed) == "composed-of":
+                        add(u)
+            except Exception:
+                pass
+
+        return out
 
     def _schema_stats(self, graph, schema_id: str) -> tuple:
         members = self._member_ids(graph, schema_id)
@@ -188,6 +247,11 @@ class GoalModule:
                     g.growth_events += 1
                 g.last_member_count = leaves
                 g.last_nested_count = nested
+            return
+
+        # Don't immediately re-OPEN a goal we just satisfied
+        last_sat = self._recently_satisfied.get(gid)
+        if last_sat is not None and (pulse - last_sat) < 80:
             return
 
         if len(self.active) >= self.MAX_ACTIVE:
@@ -324,10 +388,18 @@ class GoalModule:
                 if g.is_schema_goal:
                     member_delta = g.last_member_count - g.baseline_member_count
                     nested_delta = g.last_nested_count - g.baseline_nested_count
+                    # Require real content: leaf members preferred; nested-only
+                    # no longer satisfies an empty members=0 schema.
                     grew = (
                         member_delta >= self.SCHEMA_GROWTH_MEMBERS
-                        or nested_delta >= self.SCHEMA_GROWTH_NESTED
-                        or g.growth_events >= self.SCHEMA_GROWTH_EVENTS
+                        or (
+                            nested_delta >= self.SCHEMA_GROWTH_NESTED
+                            and g.last_member_count >= 2
+                        )
+                        or (
+                            g.growth_events >= self.SCHEMA_GROWTH_EVENTS
+                            and g.last_member_count >= 2
+                        )
                     )
                 if cooled or grew:
                     reason = []
@@ -391,6 +463,12 @@ class GoalModule:
             g.failed_pulse = pulse
             g.fail_reason = reason
         self.active.pop(g.goal_id, None)
+        if status == "satisfied":
+            self._recently_satisfied[g.goal_id] = pulse
+            # prune old
+            for k in list(self._recently_satisfied):
+                if pulse - self._recently_satisfied[k] > 200:
+                    del self._recently_satisfied[k]
         self.history.append(g)
         if len(self.history) > self.HISTORY_CAP:
             self.history = self.history[-self.HISTORY_CAP :]
