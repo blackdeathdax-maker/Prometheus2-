@@ -13,7 +13,7 @@ from .edge_types import (
     EDGE_COMPOSED_OF, EDGE_INSTANCE_OF, EDGE_ABSTRACTED_FROM, EDGE_ELABORATES,
     get_family, EXCLUSIVE_FAMILIES, FAMILY_RESIDUAL, FAMILY_MEMBERSHIP,
 )
-from .edge_types import is_body_channel_node, BODY_CHANNEL_NODE_IDS, body_channel_node_id, BODY_CHANNELS
+from .edge_types import is_body_channel_node, BODY_CHANNEL_NODE_IDS, body_channel_node_id, BODY_CHANNELS, is_felt_place_node, is_narrative_graph_node, is_somatic_infrastructure
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +233,33 @@ class ArchivistModule:
                 nd["body_channel"] = ch
 
 
+    def repair_identity_edges(self) -> dict:
+        """Strip illegal is-a involving SELF / body / felt / narr; one-shot hygiene."""
+        removed = 0
+        g = self.graph
+        to_remove = []
+        for u, v, k, d in list(g.edges(keys=True, data=True)):
+            rel = (d or {}).get("relation_type")
+            if rel != "is-a":
+                continue
+            if (
+                u == SELF_NODE or v == SELF_NODE
+                or is_somatic_infrastructure(u)
+                or is_somatic_infrastructure(v)
+            ):
+                to_remove.append((u, v, k))
+        for u, v, k in to_remove:
+            try:
+                g.remove_edge(u, v, k)
+                removed += 1
+            except Exception:
+                try:
+                    g.remove_edge(u, v)
+                    removed += 1
+                except Exception:
+                    pass
+        return {"removed_is_a": removed}
+
     def store(self, entity: str, metadata: Dict = None, source: str = "user", tier: int = TIER_PROVISIONAL):
         """
         source: 'dictionary' | 'user' | 'self_generated' (§2.2/§3.2) --
@@ -364,24 +391,28 @@ class ArchivistModule:
         
         # --- Hierarchy direction guards (domain-agnostic) ---
         
-        # Body channels are anatomy: may be parts of epistemic nodes, never
-        # is-a children/parents, and never hierarchy growth targets.
+        # Somatic + identity infrastructure:
+        # - body/felt/narr: never participate in is-a
+        # - SELF is never an is-a parent or child of knowledge lemmas
+        # - body/felt only as PARTS of epistemic wholes (composed-of / part-of)
         if relation_type == "is-a":
-            if is_body_channel_node(node_a) or is_body_channel_node(node_b):
+            if is_somatic_infrastructure(node_a) or is_somatic_infrastructure(node_b):
                 return
-        # Disallow growing knowledge "under" a body channel as parent of is-a
-        # (already returned). Also block inverted hierarchy tricks via part-of
-        # where a body channel would become a hypernym-like container: only
-        # allow part-of / composed-of with body on the PART side.
+            if node_a == SELF_NODE or node_b == SELF_NODE:
+                return  # identity is not a hypernym/hyponym of Anger etc.
         if relation_type in ("part-of", "composed-of"):
-            # composed-of: whole -> part  (anger --composed-of--> heart_rate)
-            # part-of:     part -> whole  (heart_rate --part-of--> anger)
-            if relation_type == "composed-of" and is_body_channel_node(node_a) and not is_body_channel_node(node_b):
-                # body cannot be the whole that is composed of knowledge
-                return
-            if relation_type == "part-of" and is_body_channel_node(node_b) and not is_body_channel_node(node_a):
-                # knowledge cannot be part of a body channel
-                return
+            # composed-of: whole -> part
+            # part-of:     part -> whole
+            if relation_type == "composed-of":
+                if is_body_channel_node(node_a) or is_felt_place_node(node_a):
+                    return  # body/felt cannot be the whole
+                if node_a == SELF_NODE and is_body_channel_node(node_b):
+                    return  # SELF senses body via associated-with, not composed-of body as only path — allow narr parts only
+            if relation_type == "part-of":
+                if is_body_channel_node(node_b) or is_felt_place_node(node_b):
+                    return  # cannot be part of a body channel / felt place
+                if node_b == SELF_NODE and is_body_channel_node(node_a):
+                    return  # body is not "part of SELF" via part-of hierarchy; use associated-with
         if relation_type == "is-a":
             a_data = self.graph.nodes.get(node_a, {}) or {}
             b_data = self.graph.nodes.get(node_b, {}) or {}

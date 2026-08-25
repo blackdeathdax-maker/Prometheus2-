@@ -321,3 +321,26 @@ def is_body_channel_node(node_id: str) -> bool:
         return True
     return False
 
+
+
+def is_felt_place_node(node_id: str) -> bool:
+    """PAD basin place nodes (felt:a_v_d) — somatic, not knowledge."""
+    if not node_id:
+        return False
+    n = str(node_id)
+    return n.startswith("felt:") or n.startswith("basin_")
+
+
+def is_narrative_graph_node(node_id: str) -> bool:
+    if not node_id:
+        return False
+    return str(node_id).startswith("narr:")
+
+
+def is_somatic_infrastructure(node_id: str) -> bool:
+    """Body channels, felt places — anatomy, not epistemic growth targets."""
+    return (
+        is_body_channel_node(node_id)
+        or is_felt_place_node(node_id)
+        or is_narrative_graph_node(node_id)
+    )

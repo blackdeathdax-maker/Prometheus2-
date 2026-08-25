@@ -138,6 +138,9 @@ class AssociationEngine:
                 if hasattr(self.archivist, "_seed_body_channels"):
                     self.archivist._seed_body_channels()
                 return {"term": term, "created": False, "body_channel": True}
+            from .archivist import SELF_NODE as _SELF
+            if context_node == _SELF:
+                context_node = None  # SELF is not an is-a parent
         except Exception:
             pass
 

@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 import networkx as nx
 
 from .archivist import SELF_NODE, TIER_PROVISIONAL, TIER_WORKING, TIER_TRUSTED
+from .edge_types import is_somatic_infrastructure, is_body_channel_node  # noqa: somatic guards
 from .edge_types import (
     RELATIONAL_EDGE_TYPES, EDGE_COMPOSED_OF, EDGE_IS_A, EDGE_PART_OF, EDGE_ASSOCIATED_WITH,
     NODE_SCHEMA, NODE_EPISTEMIC_SCHEMA, NODE_BASIN,
@@ -105,6 +106,23 @@ class ReflectorModule:
     SPINNING_VARIANCE = 0.15
     STAGNANT_THROUGHPUT = 0.2
     STAGNANT_VARIANCE = 0.05
+
+    def _epistemic_parent_allowed(self, parent: str) -> bool:
+        """Body/felt/narr/SELF are not knowledge kinds to build epistemic_of_* on."""
+        if not parent:
+            return False
+        try:
+            from .edge_types import is_somatic_infrastructure, is_body_channel_node
+            if is_somatic_infrastructure(parent) or is_body_channel_node(parent):
+                return False
+        except Exception:
+            pass
+        if parent in ("SELF", "OTHER") or str(parent).startswith("body:"):
+            return False
+        if str(parent).startswith("felt:") or str(parent).startswith("narr:"):
+            return False
+        return True
+
 
     def __init__(self, chronos, archivist):
         self.chronos = chronos
@@ -535,6 +553,8 @@ class ReflectorModule:
             if cnt < max(2, len(members) // 2):
                 continue
             kind_id = f"epistemic_of_{parent}"
+            if not self._epistemic_parent_allowed(parent):
+                continue
             if kind_id not in graph:
                 graph.add_node(
                     kind_id,
@@ -1006,6 +1026,8 @@ class ReflectorModule:
                 continue
 
             cluster_id = f"epistemic_of_{_slug_id_fragment(parent)}"
+            if not self._epistemic_parent_allowed(parent):
+                continue
             if cluster_id in graph:
                 existing = {
                     v for _u, v, edata in graph.out_edges(cluster_id, data=True)
@@ -1421,6 +1443,8 @@ class ReflectorModule:
                 continue  # still a genuine no-parent cluster -- leave it as-is
 
             target_id = f"epistemic_of_{_slug_id_fragment(dominant_parent)}"
+            if not self._epistemic_parent_allowed(dominant_parent):
+                continue
             if target_id not in graph:
                 graph.add_node(
                     target_id,

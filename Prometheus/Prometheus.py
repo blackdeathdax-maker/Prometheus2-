@@ -1094,6 +1094,11 @@ class Prometheus:
             self._sync_self_felt()
         except Exception as e:
             logger.warning("_sync_self_felt failed: %s", e)
+        try:
+            if hasattr(self.archivist, "repair_identity_edges") and self.pulse_count % 25 == 1:
+                self.archivist.repair_identity_edges()
+        except Exception as e:
+            logger.warning("repair_identity_edges: %s", e)
         intensity = self.synthesizer.get_current_intensity()
 
         bias = self.executive.bias_processing(intensity)
