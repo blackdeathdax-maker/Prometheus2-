@@ -98,7 +98,25 @@ class GoalModule:
         self.load()
 
     def _gid(self, target_id: str) -> str:
-        return f"goal_{target_id}"
+        # Collapse lemma / epistemic twin into one commitment key
+        t = str(target_id or "")
+        key = t
+        if t.startswith("epistemic_of_"):
+            key = t[len("epistemic_of_"):].replace("_", " ")
+        # strip hash suffixes like epistemic_of_Color_a1055f → Color handled above
+        if "_" in key and len(key) > 12:
+            # keep human-readable head
+            parts = key.replace("-", " ").split("_")
+            # drop pure hex tails
+            cleaned = []
+            for p in parts:
+                if len(p) >= 6 and all(c in "0123456789abcdef" for c in p.casefold()):
+                    continue
+                cleaned.append(p)
+            if cleaned:
+                key = " ".join(cleaned)
+        key = key.casefold().strip()
+        return f"goal_{key}"
 
     def _is_schema(self, graph, node_id: str) -> bool:
         if graph is None or node_id not in graph:
@@ -388,29 +406,33 @@ class GoalModule:
                 if g.is_schema_goal:
                     member_delta = g.last_member_count - g.baseline_member_count
                     nested_delta = g.last_nested_count - g.baseline_nested_count
-                    # Require real content: leaf members preferred; nested-only
-                    # no longer satisfies an empty members=0 schema.
+                    # Absolute richness, not noisy deltas (deltas can be negative
+                    # when counting method / graph changes).
+                    leaves_now = max(0, int(g.last_member_count or 0))
+                    nested_now = max(0, int(g.last_nested_count or 0))
                     grew = (
-                        member_delta >= self.SCHEMA_GROWTH_MEMBERS
-                        or (
-                            nested_delta >= self.SCHEMA_GROWTH_NESTED
-                            and g.last_member_count >= 2
-                        )
-                        or (
-                            g.growth_events >= self.SCHEMA_GROWTH_EVENTS
-                            and g.last_member_count >= 2
-                        )
+                        leaves_now >= self.SCHEMA_GROWTH_MEMBERS
+                        and (g.growth_events >= 1 or g.dwell_pulses >= self.SATISFY_MIN_DWELL * 2)
+                    ) or (
+                        leaves_now + nested_now >= 6
+                        and g.growth_events >= self.SCHEMA_GROWTH_EVENTS
+                    ) or (
+                        leaves_now >= 5 and nested_now >= self.SCHEMA_GROWTH_NESTED
                     )
-                if cooled or grew:
+                # Schema goals: require grew (content). Residual alone is for node goals.
+                can_close = grew if g.is_schema_goal else (cooled or grew)
+                if g.is_schema_goal and cooled and not grew:
+                    can_close = False  # stay open until real members
+                if can_close:
                     reason = []
-                    if cooled:
+                    if cooled and not g.is_schema_goal:
                         reason.append("residual_cooled")
                     if grew:
                         reason.append(
                             "schema_growth(members=%d,nested=%d,events=%d)"
                             % (
-                                g.last_member_count - g.baseline_member_count,
-                                g.last_nested_count - g.baseline_nested_count,
+                                max(0, g.last_member_count),
+                                max(0, g.last_nested_count),
                                 g.growth_events,
                             )
                         )
