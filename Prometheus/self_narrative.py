@@ -657,21 +657,55 @@ class NarrativeModule:
             return data.get("name") or n
 
         if etype in (ELEMENT_SOMATIC_SCHEMA, ELEMENT_EPISTEMIC_SCHEMA):
-            node = nodes[0]
-            data = graph.nodes.get(node, {})
-            if data.get("name"):
-                return f'named "{data["name"]}"'
-            if etype == ELEMENT_EPISTEMIC_SCHEMA:
+            # Prefer the schema node, not SELF, when both are linked
+            schema_nodes = [
+                n for n in nodes
+                if n not in (SELF_NODE, OTHER_NODE, "SELF", "OTHER")
+            ]
+            node = schema_nodes[0] if schema_nodes else (nodes[0] if nodes else "")
+            data = graph.nodes.get(node, {}) if node else {}
+            pretty = label(node) if node else "cluster"
+            # Strip epistemic_of_ for display
+            if pretty.startswith("epistemic_of_"):
+                pretty = pretty[len("epistemic_of_"):].replace("_", " ")
+            named = data.get("name") or data.get("dominant_parent")
+            if named and str(named).strip():
+                pretty = str(named).strip()
+
+            members = []
+            try:
                 members = [
                     v for _u, v, d in graph.out_edges(node, data=True)
                     if d.get("relation_type") == EDGE_COMPOSED_OF
                 ]
-                preview = ", ".join(label(m) for m in members[:4])
-                more = f" (+{len(members) - 4} more)" if len(members) > 4 else ""
-                return f"not yet named -- {data.get('member_count', len(members))} member(s): {preview}{more}"
-            relation_types = data.get("relation_types", [])
-            basin_label = self._pad_description(data.get("basin", ""))
-            return f"not yet named -- felt during {basin_label}, involving {', '.join(relation_types)}"
+            except Exception:
+                members = []
+            # Also count is-a children as content
+            if not members:
+                try:
+                    members = [
+                        v for _u, v, d in graph.out_edges(node, data=True)
+                        if d.get("relation_type") in (EDGE_IS_A, "is-a", "hyponym")
+                    ]
+                except Exception:
+                    pass
+            # Inbound is-a (specific -> this general)
+            if not members:
+                try:
+                    members = [
+                        u for u, _v, d in graph.in_edges(node, data=True)
+                        if d.get("relation_type") in (EDGE_IS_A, "is-a")
+                    ]
+                except Exception:
+                    pass
+            n_mem = int(data.get("member_count") or len(members) or 0)
+            preview = ", ".join(label(m) for m in members[:4] if m not in (SELF_NODE, "SELF"))
+            if n_mem > 0 and preview:
+                more = f" (+{n_mem - min(4, n_mem)} more)" if n_mem > 4 else ""
+                return f'"{pretty}" — {n_mem} member(s): {preview}{more}'
+            if named:
+                return f'named "{pretty}"'
+            return f'"{pretty}" (knowledge cluster)'
 
         if etype == ELEMENT_RELATIONAL_PATTERN:
             node = nodes[0]
@@ -875,13 +909,15 @@ class NarrativeModule:
             ]
             clauses.append(hold_bias[rot % 3])
 
-        # Narrative element echo (if any high-weight)
+        # Narrative element echo — only when description is meaningful
         try:
             tops = sorted(self.elements.values(), key=lambda el: el.get("weight", 0), reverse=True)
-            if tops and tops[0].get("weight", 0) >= 2.0:
+            if tops and tops[0].get("weight", 0) >= 2.0 and rot % 3 == 0:
                 desc = self._describe_element(tops[0])
-                if desc and rot % 2 == 0:
-                    clauses.append(f"it matters that {desc}")
+                if desc and "0 member" not in desc and "not yet named" not in desc:
+                    # shorten for stream
+                    short = desc if len(desc) < 60 else desc[:57] + "…"
+                    clauses.append(f"it matters that {short}")
         except Exception:
             pass
 
