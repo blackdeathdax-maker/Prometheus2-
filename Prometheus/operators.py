@@ -178,10 +178,9 @@ class OperatorModule:
 
         scores = {op: 0.0 for op in OPS}
 
-        # Prefer ring buffer over episodes (survives partial resets)
-        ring = list(self._op_ring[-12:])
+        ring = list(self._op_ring[-16:])
         if not ring:
-            ring = [e.get("operator") for e in self.episodes[-12:] if e.get("operator")]
+            ring = [e.get("operator") for e in self.episodes[-16:] if e.get("operator")]
 
         def streak_of(name: str) -> int:
             n = 0
@@ -196,59 +195,77 @@ class OperatorModule:
         expand_streak = streak_of("EXPAND")
         hold_streak = streak_of("HOLD")
         last_op = ring[-1] if ring else None
+        expands_recent = sum(1 for o in ring[-6:] if o == "EXPAND")
+        holds_recent = sum(1 for o in ring[-6:] if o == "HOLD")
 
-        # ---- HARD GATES (beat any score stack) ----
+        # Cadence intent: HOLD dwell, periodic EXPAND, rare RETURN
         force_hold = False
+        force_expand = False
         force_return = False
-        # Never EXPAND twice in a row
+
+        # No back-to-back EXPAND
         if last_op == "EXPAND":
             force_hold = True
-        # After 2 expands in last 4, dwell
-        if sum(1 for o in ring[-4:] if o == "EXPAND") >= 2:
+        # Too many expands lately
+        if expands_recent >= 2 and last_op != "HOLD":
             force_hold = True
-        # True drift → RETURN once
+        # After 3+ HOLDs while coherent → one EXPAND
+        if (
+            hold_streak >= 3
+            and pred.match
+            and lookup_budget_ok
+            and last_op == "HOLD"
+            and expands_recent == 0
+        ):
+            force_expand = True
+            force_hold = False
+        # True goal drift
         if goal_targets and pred.off_family_focus and not pred.match and last_op != "RETURN":
             force_return = True
             force_hold = False
+            force_expand = False
 
-        # HOLD baseline — winning default when coherent
-        scores["HOLD"] = 3.0
+        # Base scores
+        scores["HOLD"] = 2.0
         if pred.match:
-            scores["HOLD"] += 1.5
-        if not pred.off_family_focus:
             scores["HOLD"] += 1.0
+        if not pred.off_family_focus:
+            scores["HOLD"] += 0.8
         if bias == "BIAS_STABILIZE":
-            scores["HOLD"] += 0.5
+            scores["HOLD"] += 0.4
         if expand_streak >= 1:
-            scores["HOLD"] += 3.0
+            scores["HOLD"] += 2.5
         if return_streak >= 1:
-            scores["HOLD"] += 2.0
+            scores["HOLD"] += 1.5
+        # Don't lock HOLD forever — slight decay after long dwell
+        if hold_streak >= 5:
+            scores["HOLD"] *= 0.75
+        if hold_streak >= 8:
+            scores["HOLD"] *= 0.7
 
-        # RETURN — only real absence / hard off-family
-        scores["RETURN"] = 0.1
+        scores["RETURN"] = 0.15
         if goal_targets and pred.off_family_focus and not pred.match:
-            scores["RETURN"] = 4.0
+            scores["RETURN"] = 4.5
         elif goal_targets and pred.off_family_focus and last_op != "RETURN":
-            scores["RETURN"] = 1.5
+            scores["RETURN"] = 1.2
         if return_streak >= 1:
-            scores["RETURN"] *= 0.15
+            scores["RETURN"] *= 0.12
 
-        # EXPAND — sparse, once then stop
-        scores["EXPAND"] = 0.2
-        if force_hold or expand_streak >= 1 or last_op == "EXPAND":
+        scores["EXPAND"] = 0.3
+        if last_op == "EXPAND" or expand_streak >= 1:
             scores["EXPAND"] = 0.05
-        else:
-            # only if coherent + budget + not just returned
-            if lookup_budget_ok and pred.match and last_op != "RETURN":
-                scores["EXPAND"] = 2.2
-            if hold_streak >= 3 and lookup_budget_ok and pred.match:
-                scores["EXPAND"] = 2.8  # dwell then one deepen
-            if bias in ("BIAS_EXPLORE", "BIAS_FORCE_EXPLORE") and expand_streak == 0:
-                scores["EXPAND"] = max(scores["EXPAND"], 2.5)
-            if parent_open and pred.match and expand_streak == 0 and hold_streak >= 2:
-                scores["EXPAND"] = max(scores["EXPAND"], 2.0)
+        elif lookup_budget_ok and pred.match:
+            if hold_streak >= 3:
+                scores["EXPAND"] = 3.5  # due for deepen
+            elif hold_streak >= 2:
+                scores["EXPAND"] = 2.0
+            elif holds_recent >= 3 and expands_recent == 0:
+                scores["EXPAND"] = 2.8
+            if bias in ("BIAS_EXPLORE", "BIAS_FORCE_EXPLORE"):
+                scores["EXPAND"] = max(scores["EXPAND"], 2.4)
+            if parent_open and hold_streak >= 2:
+                scores["EXPAND"] = max(scores["EXPAND"], 1.8)
 
-        # RELEASE / SETTLE
         scores["RELEASE"] = 0.2
         if stagnation and not pred.match:
             scores["RELEASE"] = 2.0
@@ -268,7 +285,11 @@ class OperatorModule:
         if force_return:
             scores["RETURN"] = 10.0
             scores["EXPAND"] = 0.0
-            scores["HOLD"] = 0.5
+            scores["HOLD"] = 0.4
+        elif force_expand:
+            scores["EXPAND"] = 10.0
+            scores["HOLD"] = 1.0
+            scores["RETURN"] = 0.2
         elif force_hold:
             scores["HOLD"] = 10.0
             scores["EXPAND"] = 0.0
