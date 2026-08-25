@@ -1104,6 +1104,32 @@ class Prometheus:
                 residual_top = [k for k, _v in items]
             except Exception:
                 pass
+            # Pulse-time narrative elements (not only Consolidation)
+            try:
+                last_op = ""
+                expand_placed = 0
+                try:
+                    dec = getattr(getattr(self, "operators", None), "last_decision", None)
+                    if dec is not None:
+                        last_op = str(getattr(dec, "operator", "") or "")
+                    # last expand placement from episode if any
+                    eps = getattr(getattr(self, "operators", None), "episodes", None) or []
+                    if eps:
+                        last_ep = eps[-1]
+                        expand_placed = int(last_ep.get("placed") or last_ep.get("nodes_placed") or 0)
+                except Exception:
+                    pass
+                if hasattr(self.self_narrative, "observe_live"):
+                    self.self_narrative.observe_live(
+                        pulse=self.pulse_count,
+                        focus_id=fid,
+                        goal_targets=goals,
+                        wm_slots=wm_slots,
+                        operator=last_op,
+                        expand_placed=expand_placed,
+                    )
+            except Exception:
+                pass
             self.self_narrative.record_stream_beat(
                 pulse=self.pulse_count,
                 focus_id=fid,

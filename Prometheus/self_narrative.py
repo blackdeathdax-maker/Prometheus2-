@@ -79,7 +79,7 @@ class NarrativeModule:
     # so a Debug-tab slider could tune them live, matching the existing
     # pattern used everywhere else in this codebase.
     NARRATIVE_ELEMENT_CAP = 200
-    NARRATIVE_STICKINESS_THRESHOLD = 3          # co-activation-pair degree
+    NARRATIVE_STICKINESS_THRESHOLD = 2          # co-activation-pair degree
     NARRATIVE_COLORING_THRESHOLD = 0.5          # fraction of valence_coloring's 1.0 cap
     NARRATIVE_RELATIONAL_THRESHOLD = 2          # recurrence count, deliberately lower than schema stabilization (§16.3 trigger 5)
     NARRATIVE_BASIN_SHIFT_WINDOW = 20           # Consolidation passes
@@ -234,6 +234,76 @@ class NarrativeModule:
         except Exception as e:
             logger.warning("record_goal_event failed: %s", e)
             return False
+
+    def observe_live(
+        self,
+        pulse: int = 0,
+        focus_id: Optional[str] = None,
+        goal_targets: Optional[List[str]] = None,
+        wm_slots: Optional[List[str]] = None,
+        operator: str = "",
+        expand_placed: int = 0,
+    ) -> Dict[str, int]:
+        """Pulse-time narrative formation (not only Consolidation).
+
+        Consolidation is rare; without this, total_elements stays 0 during
+        long Childhood soaks. Creates/reinforces for focus schemas, goals,
+        WM schema slots, and successful EXPAND.
+        """
+        created = reinforced = 0
+        graph = getattr(self.archivist, "graph", None)
+        if graph is None:
+            return {"created": 0, "reinforced": 0}
+
+        def _is_schema(nid: str) -> bool:
+            if not nid or nid not in graph:
+                return False
+            nt = str(graph.nodes.get(nid, {}).get("node_type") or "")
+            return (
+                "schema" in nt
+                or str(nid).startswith("epistemic_of_")
+            )
+
+        def _credit(nid: str, el_type: str) -> None:
+            nonlocal created, reinforced
+            if not nid or nid not in graph:
+                return
+            nodes = [nid]
+            if "SELF" in graph:
+                nodes = ["SELF", nid]
+            was_new = self._reinforce_or_create(el_type, nodes)
+            if was_new:
+                created += 1
+            else:
+                reinforced += 1
+
+        if focus_id and _is_schema(focus_id):
+            el_t = (
+                ELEMENT_EPISTEMIC_SCHEMA
+                if (str(focus_id).startswith("epistemic") or "epistemic" in str(graph.nodes.get(focus_id, {}).get("node_type") or ""))
+                else ELEMENT_SOMATIC_SCHEMA
+            )
+            _credit(focus_id, el_t)
+
+        for g in (goal_targets or [])[:5]:
+            if g and g in graph:
+                _credit(g, ELEMENT_EPISTEMIC_SCHEMA if _is_schema(g) else ELEMENT_RELATIONAL_PATTERN)
+
+        for s in (wm_slots or [])[:8]:
+            if s and _is_schema(s):
+                _credit(s, ELEMENT_EPISTEMIC_SCHEMA)
+
+        if str(operator).upper() == "EXPAND" and int(expand_placed or 0) > 0 and focus_id:
+            _credit(focus_id, ELEMENT_EPISTEMIC_SCHEMA if _is_schema(focus_id) else ELEMENT_RELATIONAL_PATTERN)
+
+        if pulse and pulse % 40 == 0:
+            try:
+                self._decay_and_absorb()
+            except Exception:
+                pass
+
+        return {"created": created, "reinforced": reinforced}
+
 
     def _trigger_stickiness(self) -> tuple:
         """Trigger 3: co-activation-pair degree crossing threshold, using
@@ -716,24 +786,48 @@ class NarrativeModule:
                 break
 
         climate = self._felt_phrase(felt_state, basin_key)
+        # rotate phrasings by pulse so consecutive beats differ
+        rot = int(pulse or 0) % 5
+
         clauses = []
-
-        # Opening: body/climate
+        # Body / climate
         if not felt_state or felt_state == "Unformed":
-            clauses.append("Still forming — the body has no clear weather yet")
+            climate_lines = [
+                "Still forming — the body has no clear weather yet",
+                "Sensation is thin; nothing has settled into a mood",
+                "I am mostly blank weather right now",
+            ]
+            clauses.append(climate_lines[rot % 3])
         else:
-            clauses.append(f"Under {climate}")
+            climate_lines = [
+                f"Under {climate}",
+                f"Feeling runs {climate}",
+                f"The body reads as {climate}",
+            ]
+            clauses.append(climate_lines[rot % 3])
 
-        # Attention
+        # Attention / operator flavour (bias/state stand in for last op)
         if focus:
             if goals and focus in goals:
-                clauses.append(f"I keep returning to {focus}")
+                hold_lines = [
+                    f"I keep returning to {focus}",
+                    f"{focus} is the open commitment",
+                    f"I am still with {focus}",
+                    f"attention locks on {focus}",
+                ]
+                clauses.append(hold_lines[rot % 4])
             else:
-                clauses.append(f"my attention rests on {focus}")
+                att_lines = [
+                    f"my attention rests on {focus}",
+                    f"I am looking at {focus}",
+                    f"{focus} is in the foreground",
+                    f"notice lands on {focus}",
+                ]
+                clauses.append(att_lines[rot % 4])
         else:
             clauses.append("attention has nowhere firm to land")
 
-        # Intention
+        # Goals
         if goals:
             other = [g for g in goals if g != focus]
             if other:
@@ -746,9 +840,14 @@ class NarrativeModule:
             if len(mind) == 1:
                 clauses.append(f"{mind[0]} stays close in mind")
             else:
-                clauses.append("near at hand: " + ", ".join(mind[:4]))
+                wm_lines = [
+                    "near at hand: " + ", ".join(mind[:4]),
+                    "also present: " + ", ".join(mind[:3]),
+                    "clustered with " + ", ".join(mind[:3]),
+                ]
+                clauses.append(wm_lines[rot % 3])
 
-        # Residual pulls
+        # Residual
         tips = []
         for x in residual_top[:3]:
             lab = label(x)
@@ -757,20 +856,41 @@ class NarrativeModule:
         if tips:
             clauses.append("something tugs from " + " / ".join(tips[:2]))
 
-        # Mode
+        # Mode / bias
         stt = str(state or "")
         if "Sleep" in stt:
             clauses.append("the rest of me is offline, filing things away")
         elif bias in ("FORCE_EXPLORE", "BIAS_EXPLORE"):
-            clauses.append("restless enough to look further")
+            explore_lines = [
+                "restless enough to look further",
+                "I want to open one more layer",
+                "curiosity pulls outward",
+            ]
+            clauses.append(explore_lines[rot % 3])
         elif bias == "BIAS_STABILIZE":
-            clauses.append("inclined to hold what is already known")
+            hold_bias = [
+                "inclined to hold what is already known",
+                "steadying what is already held",
+                "no rush to leave this ground",
+            ]
+            clauses.append(hold_bias[rot % 3])
+
+        # Narrative element echo (if any high-weight)
+        try:
+            tops = sorted(self.elements.values(), key=lambda el: el.get("weight", 0), reverse=True)
+            if tops and tops[0].get("weight", 0) >= 2.0:
+                desc = self._describe_element(tops[0])
+                if desc and rot % 2 == 0:
+                    clauses.append(f"it matters that {desc}")
+        except Exception:
+            pass
 
         line = "; ".join(clauses) + "."
         return self._append_stream_beat(
             pulse, line, focus_id, felt_state, basin_key,
             mind, goal_targets, kind="pulse",
         )
+
 
     def _append_stream_beat(
         self, pulse, line, focus_id, felt_state, basin_key,
