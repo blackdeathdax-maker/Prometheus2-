@@ -128,6 +128,19 @@ class AssociationEngine:
 
         Returns a small dict describing what happened, for logging/tests.
         """
+        # Anatomy is not a growth parent: body channels never host is-a children
+        try:
+            from .edge_types import is_body_channel_node
+            if context_node and is_body_channel_node(context_node):
+                context_node = None
+            if is_body_channel_node(term):
+                # ensure node exists as fixed channel, do not hierarchy-expand it
+                if hasattr(self.archivist, "_seed_body_channels"):
+                    self.archivist._seed_body_channels()
+                return {"term": term, "created": False, "body_channel": True}
+        except Exception:
+            pass
+
         cap = self.PARENT_OUT_DEGREE_CAP if max_parent_children is None else max_parent_children
         # Quality gate: self_generated / expansion terms should look concept-like.
         # Full user sentences still allowed (source=user) so dialogue is recorded.

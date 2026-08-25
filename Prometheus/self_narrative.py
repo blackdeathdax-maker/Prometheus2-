@@ -79,6 +79,8 @@ class NarrativeModule:
     # so a Debug-tab slider could tune them live, matching the existing
     # pattern used everywhere else in this codebase.
     NARRATIVE_ELEMENT_CAP = 200
+    NARRATIVE_SELF_LINK_WEIGHT = 2.0
+    NARRATIVE_GRAPH_PREFIX = "narr:"
     NARRATIVE_STICKINESS_THRESHOLD = 2          # co-activation-pair degree
     NARRATIVE_COLORING_THRESHOLD = 0.5          # fraction of valence_coloring's 1.0 cap
     NARRATIVE_RELATIONAL_THRESHOLD = 2          # recurrence count, deliberately lower than schema stabilization (§16.3 trigger 5)
@@ -184,6 +186,10 @@ class NarrativeModule:
 
         absorbed, pruned = self._decay_and_absorb()
 
+        try:
+            self.sync_salient_to_self()
+        except Exception as e:
+            logger.warning("evaluate sync_salient_to_self: %s", e)
         return {
             "created": created, "reinforced": reinforced,
             "absorbed": absorbed, "pruned": pruned,
@@ -234,6 +240,107 @@ class NarrativeModule:
         except Exception as e:
             logger.warning("record_goal_event failed: %s", e)
             return False
+
+
+    def _narrative_graph_id(self, element_id: str) -> str:
+        prefix = getattr(self, "NARRATIVE_GRAPH_PREFIX", "narr:")
+        eid = str(element_id)
+        if eid.startswith(prefix):
+            return eid
+        return f"{prefix}{eid}"
+
+    def sync_element_to_self(self, element_id: str, force: bool = False) -> bool:
+        """Salient narrative element becomes a PART of SELF (composed-of)."""
+        el = self.elements.get(element_id)
+        if not el:
+            return False
+        floor = float(getattr(self, "NARRATIVE_SELF_LINK_WEIGHT", 2.0))
+        if not force and float(el.get("weight") or 0) < floor:
+            return False
+        graph = getattr(self.archivist, "graph", None)
+        if graph is None:
+            return False
+        try:
+            from .archivist import SELF_NODE, TIER_WORKING
+        except Exception:
+            SELF_NODE = "SELF"
+            TIER_WORKING = 1
+        if SELF_NODE not in graph:
+            try:
+                self.archivist._seed_self_node()
+            except Exception:
+                return False
+
+        nid = self._narrative_graph_id(element_id)
+        if nid not in graph:
+            try:
+                self.archivist.store(nid, source="narrative", tier=TIER_WORKING)
+            except Exception:
+                if nid not in graph:
+                    graph.add_node(nid)
+        nd = graph.nodes[nid]
+        nd["is_narrative_element"] = True
+        nd["growable"] = False
+        nd["element_type"] = el.get("element_type")
+        nd["narrative_weight"] = float(el.get("weight") or 0)
+        nd["linked_nodes"] = list(el.get("linked_nodes") or [])
+        nd["source"] = nd.get("source") or "narrative"
+
+        try:
+            from .edge_types import EDGE_COMPOSED_OF, EDGE_PART_OF, is_body_channel_node
+        except Exception:
+            EDGE_COMPOSED_OF, EDGE_PART_OF = "composed-of", "part-of"
+            def is_body_channel_node(x):
+                return False
+
+        try:
+            self.archivist.link(
+                SELF_NODE, nid, EDGE_COMPOSED_OF,
+                source="narrative", placement="self_narrative_part",
+            )
+        except Exception as e:
+            logger.warning("SELF composed-of narr failed: %s", e)
+            return False
+        try:
+            self.archivist.link(
+                nid, SELF_NODE, EDGE_PART_OF,
+                source="narrative", placement="self_narrative_part",
+            )
+        except Exception:
+            pass
+
+        for target in (el.get("linked_nodes") or [])[:6]:
+            if not target or target not in graph:
+                continue
+            if target in (SELF_NODE, "SELF", "OTHER"):
+                continue
+            try:
+                if is_body_channel_node(target):
+                    self.archivist.link(
+                        nid, target, "associated-with",
+                        source="narrative", placement="narr_body",
+                    )
+                else:
+                    self.archivist.link(
+                        nid, target, "associated-with",
+                        source="narrative", placement="narr_epistemic",
+                    )
+            except Exception:
+                pass
+
+        el["linked_to_self"] = True
+        el["graph_node"] = nid
+        return True
+
+    def sync_salient_to_self(self) -> int:
+        """Link all elements at/above floor to SELF. Returns count linked."""
+        floor = float(getattr(self, "NARRATIVE_SELF_LINK_WEIGHT", 2.0))
+        n = 0
+        for eid, el in list(self.elements.items()):
+            if float(el.get("weight") or 0) >= floor:
+                if self.sync_element_to_self(eid):
+                    n += 1
+        return n
 
     def observe_live(
         self,
@@ -302,7 +409,14 @@ class NarrativeModule:
             except Exception:
                 pass
 
-        return {"created": created, "reinforced": reinforced}
+        # Unified SELF: salient narrative elements become identity parts
+        linked = 0
+        try:
+            linked = self.sync_salient_to_self()
+        except Exception as e:
+            logger.warning("sync_salient_to_self failed: %s", e)
+
+        return {"created": created, "reinforced": reinforced, "self_linked": linked}
 
 
     def _trigger_stickiness(self) -> tuple:

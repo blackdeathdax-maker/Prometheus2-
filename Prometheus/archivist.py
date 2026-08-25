@@ -13,6 +13,7 @@ from .edge_types import (
     EDGE_COMPOSED_OF, EDGE_INSTANCE_OF, EDGE_ABSTRACTED_FROM, EDGE_ELABORATES,
     get_family, EXCLUSIVE_FAMILIES, FAMILY_RESIDUAL, FAMILY_MEMBERSHIP,
 )
+from .edge_types import is_body_channel_node, BODY_CHANNEL_NODE_IDS, body_channel_node_id, BODY_CHANNELS
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +148,7 @@ class ArchivistModule:
         self.graph = nx.MultiDiGraph()
         self.load()
         self._seed_self_node()
+        self._seed_body_channels()
         self._seed_other_node()
 
     # ------------------------------------------------------------------
@@ -164,6 +166,13 @@ class ArchivistModule:
                 node_type=NODE_SELF,
                 activation=ACTIVATION_CAP,  # SELF is always maximally active -- never excluded from working memory by low activation
                 valence_coloring=0.0,
+                # Pre-linguistic identity: filled every pulse by _sync_self_felt
+                felt_arousal=0.0,
+                felt_valence=0.0,
+                felt_dominance=0.0,
+                last_felt_label="Unformed",
+                last_felt_key=(0.0, 0.0, 0.0),
+                is_identity_hub=True,
             )
             self.save()
 
@@ -193,6 +202,37 @@ class ArchivistModule:
     # ------------------------------------------------------------------
     # Growth / storage
     # ------------------------------------------------------------------
+    def _seed_body_channels(self):
+        """Fixed somatic surface nodes. Linkable into epistemic graph as
+        parts only; never expanded, never is-a hierarchy participants.
+        """
+        from .edge_types import BODY_CHANNELS, body_channel_node_id
+        for ch in BODY_CHANNELS:
+            nid = body_channel_node_id(ch)
+            if nid not in self.graph:
+                self.graph.add_node(
+                    nid,
+                    last_reinforced=datetime.now(),
+                    source="axiom",
+                    tier=TIER_TRUSTED,
+                    regulatory_efficacy=0.5,
+                    tier0_cycles=0,
+                    node_type=NODE_BASIN,
+                    activation=0.0,
+                    valence_coloring=0.0,
+                    is_body_channel=True,
+                    is_felt_place=True,
+                    body_channel=ch,
+                    growable=False,
+                )
+            else:
+                nd = self.graph.nodes[nid]
+                nd["is_body_channel"] = True
+                nd["is_felt_place"] = True
+                nd["growable"] = False
+                nd["body_channel"] = ch
+
+
     def store(self, entity: str, metadata: Dict = None, source: str = "user", tier: int = TIER_PROVISIONAL):
         """
         source: 'dictionary' | 'user' | 'self_generated' (§2.2/§3.2) --
@@ -323,6 +363,25 @@ class ArchivistModule:
                                      node_type=NODE_STANDARD, activation=0.0, valence_coloring=0.0)
         
         # --- Hierarchy direction guards (domain-agnostic) ---
+        
+        # Body channels are anatomy: may be parts of epistemic nodes, never
+        # is-a children/parents, and never hierarchy growth targets.
+        if relation_type == "is-a":
+            if is_body_channel_node(node_a) or is_body_channel_node(node_b):
+                return
+        # Disallow growing knowledge "under" a body channel as parent of is-a
+        # (already returned). Also block inverted hierarchy tricks via part-of
+        # where a body channel would become a hypernym-like container: only
+        # allow part-of / composed-of with body on the PART side.
+        if relation_type in ("part-of", "composed-of"):
+            # composed-of: whole -> part  (anger --composed-of--> heart_rate)
+            # part-of:     part -> whole  (heart_rate --part-of--> anger)
+            if relation_type == "composed-of" and is_body_channel_node(node_a) and not is_body_channel_node(node_b):
+                # body cannot be the whole that is composed of knowledge
+                return
+            if relation_type == "part-of" and is_body_channel_node(node_b) and not is_body_channel_node(node_a):
+                # knowledge cannot be part of a body channel
+                return
         if relation_type == "is-a":
             a_data = self.graph.nodes.get(node_a, {}) or {}
             b_data = self.graph.nodes.get(node_b, {}) or {}

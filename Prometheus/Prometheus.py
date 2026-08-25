@@ -518,6 +518,13 @@ class Prometheus:
         actually was -- _self_study() has always called
         association.place_node() directly, bypassing this method
         entirely. Corrected here rather than left misleading."""
+        # Physical language → fixed body channels (parts of focus schema, not children)
+        if source == "user":
+            try:
+                self._note_body_from_text(text)
+            except Exception as e:
+                logger.warning("_note_body_from_text: %s", e)
+
         self.sensory.ingest(text)
         if source == "user" and hasattr(self, "modulators"):
             self.modulators.pulse("user_input", amount=0.08)
@@ -916,6 +923,139 @@ class Prometheus:
         }
 
 
+
+    def get_identity_hub_report(self) -> dict:
+        """Unified SELF: body parts, felt places, narrative parts, agency."""
+        from .archivist import SELF_NODE
+        from .edge_types import is_body_channel_node, BODY_CHANNEL_NODE_IDS, EDGE_COMPOSED_OF, EDGE_PART_OF, EDGE_ASSOCIATED_WITH
+        g = self.archivist.graph
+        out = {
+            "self_present": SELF_NODE in g,
+            "felt": {},
+            "body": [],
+            "narrative_parts": [],
+            "agency": [],
+            "self_edges": [],
+        }
+        if SELF_NODE not in g:
+            return out
+        nd = g.nodes[SELF_NODE]
+        out["felt"] = {
+            "arousal": nd.get("felt_arousal"),
+            "valence": nd.get("felt_valence"),
+            "dominance": nd.get("felt_dominance"),
+            "label": nd.get("last_felt_label"),
+            "key": nd.get("last_felt_key"),
+            "valence_coloring": nd.get("valence_coloring"),
+        }
+        for _u, v, ed in g.out_edges(SELF_NODE, data=True):
+            rel = ed.get("relation_type")
+            item = {"to": v, "relation": rel, "dwell": ed.get("dwell"), "source": ed.get("source")}
+            out["self_edges"].append(item)
+            if is_body_channel_node(v) or str(v).startswith("body:"):
+                out["body"].append({
+                    "node": v,
+                    "value": g.nodes.get(v, {}).get("body_value"),
+                    "relation": rel,
+                })
+            elif str(v).startswith("narr:") or g.nodes.get(v, {}).get("is_narrative_element"):
+                out["narrative_parts"].append({
+                    "node": v,
+                    "weight": g.nodes.get(v, {}).get("narrative_weight"),
+                    "type": g.nodes.get(v, {}).get("element_type"),
+                    "linked_nodes": g.nodes.get(v, {}).get("linked_nodes"),
+                })
+            elif str(v).startswith("felt:"):
+                out.setdefault("felt_places", []).append(v)
+            elif rel in (EDGE_ASSOCIATED_WITH, "associated-with") and g.nodes.get(v, {}).get("is_schema"):
+                out["agency"].append(v)
+        return out
+
+
+    def _note_body_from_text(self, text: str) -> list:
+        """Map plain physical language onto fixed body-channel nodes.
+
+        User may teach 'heart racing', 'sweating', etc. Those reinforce
+        anatomy nodes and, if focus/schema is active, part-link into it.
+        Does not create new channel types.
+        """
+        if not text:
+            return []
+        from .edge_types import (
+            BODY_CHANNELS, body_channel_node_id, EDGE_COMPOSED_OF, EDGE_PART_OF,
+            EDGE_ASSOCIATED_WITH, is_body_channel_node,
+        )
+        from .archivist import SELF_NODE, TIER_WORKING
+
+        t = text.lower()
+        aliases = {
+            "heart_rate": ["heart", "heartbeat", "heart rate", "pulse", "racing heart", "heart racing"],
+            "breath": ["breath", "breathing", "breathe", "respiration", "short of breath"],
+            "muscle_tension": ["tension", "tense", "muscle", "clench", "tight muscles", "tightness"],
+            "sweat_skin": ["sweat", "sweating", "sweaty", "perspir", "clammy"],
+            "gut": ["gut", "stomach", "nausea", "butterflies", "belly"],
+            "energy": ["energy", "energetic", "tired", "fatigue", "exhausted", "wired"],
+            "warmth": ["warm", "warmth", "hot", "cold", "chill", "flush"],
+        }
+        hit = []
+        for ch, words in aliases.items():
+            if any(w in t for w in words):
+                hit.append(ch)
+        if not hit:
+            return []
+
+        if hasattr(self.archivist, "_seed_body_channels"):
+            self.archivist._seed_body_channels()
+        g = self.archivist.graph
+        felt = None
+        try:
+            felt = self.synthesizer.get_current_felt_state()
+            if felt in ("Unformed", "None"):
+                felt = None
+        except Exception:
+            pass
+
+        # Focus / recent schema as whole for part links
+        wholes = []
+        try:
+            fid = None
+            if hasattr(self, "focus") and hasattr(self.focus, "get_focus"):
+                fid = self.focus.get_focus()
+            elif hasattr(self, "focus") and hasattr(self.focus, "current"):
+                fid = self.focus.current
+            if fid and fid in g and not is_body_channel_node(fid):
+                wholes.append(fid)
+        except Exception:
+            pass
+        try:
+            for n, d in g.nodes(data=True):
+                if d and (d.get("is_schema") or "epistemic" in str(d.get("node_type") or "")):
+                    if float(d.get("activation") or 0) >= 0.2 and not is_body_channel_node(n):
+                        wholes.append(n)
+            wholes = list(dict.fromkeys(wholes))[:5]
+        except Exception:
+            pass
+
+        for ch in hit:
+            nid = body_channel_node_id(ch)
+            if nid not in g:
+                continue
+            # bump as "noticed"
+            g.nodes[nid]["body_value"] = max(float(g.nodes[nid].get("body_value") or 0.5), 0.72)
+            g.nodes[nid]["last_reinforced"] = __import__("datetime").datetime.now()
+            try:
+                self.archivist.link(SELF_NODE, nid, EDGE_ASSOCIATED_WITH, source="user", placement="self_body_user")
+                self.archivist.bump_activation(nid)
+            except Exception:
+                pass
+            for whole in wholes:
+                try:
+                    self.archivist.link(whole, nid, EDGE_COMPOSED_OF, source="user", placement="body_part_of_schema", felt_state=felt)
+                    self.archivist.link(nid, whole, EDGE_PART_OF, source="user", placement="body_part_of_schema", felt_state=felt)
+                except Exception:
+                    pass
+        return hit
+
     def pulse(self):
         self.pulse_count += 1
         somatic = self.bio.step()
@@ -948,6 +1088,12 @@ class Prometheus:
             self.synthesizer.get_current_basin_key(),
             raw_body=body,
         )
+        # Pre-linguistic self-awareness: SELF is always bound to how the
+        # body feels right now (infants have this without words).
+        try:
+            self._sync_self_felt()
+        except Exception as e:
+            logger.warning("_sync_self_felt failed: %s", e)
         intensity = self.synthesizer.get_current_intensity()
 
         bias = self.executive.bias_processing(intensity)
@@ -1611,6 +1757,254 @@ class Prometheus:
 
         return plan
 
+
+    def _sync_self_felt(self):
+        """Bind SELF to the current somatic felt place every pulse.
+
+        Language is optional. The primary link is to a discrete PAD basin
+        node derived from the synthesizer key (already binned). When a
+        basin has stabilized into a named felt state, also link that
+        label so later narrative can talk about it. Updates SELF node
+        attributes with the live vector so identity is never an empty
+        unconnected pin.
+        """
+        from .archivist import SELF_NODE, NODE_BASIN, TIER_TRUSTED, TIER_WORKING
+        from .edge_types import EDGE_ASSOCIATED_WITH
+
+        g = self.archivist.graph
+        if SELF_NODE not in g:
+            try:
+                self.archivist._seed_self_node()
+            except Exception:
+                return
+        if SELF_NODE not in g:
+            return
+
+        key = self.synthesizer.get_current_basin_key()
+        if not key:
+            return
+        try:
+            arousal = float(key[0])
+            valence = float(key[1])
+            dominance = float(key[2])
+        except (TypeError, ValueError, IndexError):
+            return
+
+        felt_name = ""
+        try:
+            felt_name = (self.synthesizer.get_current_felt_state() or "").strip()
+        except Exception:
+            felt_name = ""
+
+        nd = g.nodes[SELF_NODE]
+        nd["last_felt_key"] = (arousal, valence, dominance)
+        nd["felt_arousal"] = arousal
+        nd["felt_valence"] = valence
+        nd["felt_dominance"] = dominance
+        nd["last_felt_label"] = felt_name or "Unformed"
+        # Small continuous coloring toward live valence (identity carries mood)
+        try:
+            self.archivist.nudge_valence_coloring(SELF_NODE, valence * 0.04)
+        except Exception:
+            pass
+        try:
+            self.archivist.bump_activation(SELF_NODE)
+        except Exception:
+            pass
+
+        # Discrete pre-verbal felt place (finite because key is already binned)
+        basin_id = f"felt:{arousal:.2f}_{valence:.2f}_{dominance:.2f}"
+        if basin_id not in g:
+            self.archivist.store(
+                basin_id,
+                source="somatic",
+                tier=TIER_WORKING,
+            )
+            if basin_id in g:
+                g.nodes[basin_id]["node_type"] = NODE_BASIN
+                g.nodes[basin_id]["is_felt_place"] = True
+                g.nodes[basin_id]["basin_key"] = (arousal, valence, dominance)
+        else:
+            g.nodes[basin_id]["last_reinforced"] = __import__(
+                "datetime"
+            ).datetime.now()
+            g.nodes[basin_id]["is_felt_place"] = True
+
+        stamp = felt_name if felt_name and felt_name not in ("Unformed", "None") else None
+        try:
+            self.archivist.link(
+                SELF_NODE,
+                basin_id,
+                EDGE_ASSOCIATED_WITH,
+                source="somatic",
+                placement="self_felt",
+                felt_state=stamp,
+            )
+        except Exception as e:
+            logger.warning("SELF↔basin link failed: %s", e)
+            return
+
+        # Reinforce dwell on the edge if present (pre-linguistic habit strength)
+        try:
+            edata = g.get_edge_data(SELF_NODE, basin_id) or {}
+            for _k, attr in edata.items():
+                if isinstance(attr, dict) and attr.get("relation_type") == EDGE_ASSOCIATED_WITH:
+                    attr["dwell"] = float(attr.get("dwell") or 0.0) + 1.0
+                    attr["source"] = attr.get("source") or "somatic"
+                    break
+        except Exception:
+            pass
+
+        # Named felt quality once the body has a stable word for this place
+        if stamp:
+            label = stamp.lower().replace(" ", "_")
+            if label and label not in ("unformed", "none"):
+                if label not in g:
+                    self.archivist.store(label, source="somatic", tier=TIER_WORKING)
+                    if label in g:
+                        g.nodes[label]["is_felt_quality"] = True
+                try:
+                    self.archivist.link(
+                        SELF_NODE,
+                        label,
+                        EDGE_ASSOCIATED_WITH,
+                        source="somatic",
+                        placement="self_felt_named",
+                        felt_state=stamp,
+                    )
+                except Exception:
+                    pass
+                try:
+                    edata = g.get_edge_data(SELF_NODE, label) or {}
+                    for _k, attr in edata.items():
+                        if isinstance(attr, dict) and attr.get("relation_type") == EDGE_ASSOCIATED_WITH:
+                            attr["dwell"] = float(attr.get("dwell") or 0.0) + 1.0
+                            break
+                except Exception:
+                    pass
+
+
+        # --- Physical body surface (heart, sweat, …) ---
+        # Fixed channels: linkable into epistemic graph as PARTS only,
+        # never grown, never is-a. SELF owns the live readings; salient
+        # channels can become composed-of parts of active epistemic hubs.
+        try:
+            from .edge_types import (
+                BODY_CHANNELS, body_channel_node_id, EDGE_COMPOSED_OF,
+                EDGE_PART_OF, EDGE_ASSOCIATED_WITH, is_body_channel_node,
+            )
+            body = {}
+            if hasattr(self, "bio") and hasattr(self.bio, "get_raw_variables"):
+                body = self.bio.get_raw_variables() or {}
+            # Ensure seeds exist
+            if hasattr(self.archivist, "_seed_body_channels"):
+                self.archivist._seed_body_channels()
+
+            salient = []
+            for ch in BODY_CHANNELS:
+                raw = body.get(ch, body.get(ch.replace("_", ""), 0.5))
+                try:
+                    val = float(raw)
+                except (TypeError, ValueError):
+                    val = 0.5
+                nid = body_channel_node_id(ch)
+                if nid not in g:
+                    continue
+                g.nodes[nid]["body_value"] = val
+                g.nodes[nid]["last_reinforced"] = __import__("datetime").datetime.now()
+                # SELF always senses the body (associated-with, not hierarchy)
+                try:
+                    self.archivist.link(
+                        SELF_NODE, nid, EDGE_ASSOCIATED_WITH,
+                        source="somatic", placement="self_body",
+                        felt_state=stamp,
+                    )
+                except Exception:
+                    pass
+                try:
+                    edata = g.get_edge_data(SELF_NODE, nid) or {}
+                    for _k, attr in edata.items():
+                        if isinstance(attr, dict) and attr.get("relation_type") == EDGE_ASSOCIATED_WITH:
+                            attr["dwell"] = float(attr.get("dwell") or 0.0) + 1.0
+                            attr["last_value"] = val
+                            break
+                except Exception:
+                    pass
+                # Salience: extreme or mid-high activation (not quiet baseline)
+                if val >= 0.62 or val <= 0.28:
+                    salient.append((ch, nid, val))
+
+            # Link salient channels as PARTS of active epistemic schemas
+            # anger --composed-of--> body:heart_rate  (part, not child)
+            active_schemas = []
+            try:
+                for n, d in g.nodes(data=True):
+                    if not d:
+                        continue
+                    if d.get("is_schema") or d.get("node_type") in (
+                        "schema", "epistemic_schema", "NODE_SCHEMA",
+                    ):
+                        # only currently relevant
+                        act = float(d.get("activation") or 0.0)
+                        if act >= 0.15 or d.get("user_linked"):
+                            active_schemas.append(n)
+                    nt = str(d.get("node_type") or "")
+                    if "epistemic" in nt.lower() or nt in ("schema",):
+                        if n not in active_schemas:
+                            active_schemas.append(n)
+            except Exception:
+                active_schemas = []
+            # Cap: focus neighborhood schemas preferred
+            try:
+                local = set(self.focus_neighborhood_ids(cap=24) or [])
+                active_schemas = [s for s in active_schemas if s in local] or active_schemas[:6]
+            except Exception:
+                active_schemas = active_schemas[:6]
+
+            for ch, nid, val in salient[:4]:
+                for sid in active_schemas[:4]:
+                    if is_body_channel_node(sid):
+                        continue
+                    try:
+                        # whole --composed-of--> body part
+                        self.archivist.link(
+                            sid, nid, EDGE_COMPOSED_OF,
+                            source="somatic", placement="body_part_of_schema",
+                            felt_state=stamp,
+                        )
+                        # body --part-of--> whole (symmetric reading)
+                        self.archivist.link(
+                            nid, sid, EDGE_PART_OF,
+                            source="somatic", placement="body_part_of_schema",
+                            felt_state=stamp,
+                        )
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.warning("body-channel self sync failed: %s", e)
+
+        # Agency residue: open goals are part of "what I am doing" (weak)
+        try:
+            if hasattr(self, "goals") and self.goals is not None:
+                open_goals = []
+                if hasattr(self.goals, "open_goals"):
+                    open_goals = list(self.goals.open_goals() or [])
+                elif hasattr(self.goals, "active"):
+                    open_goals = list(getattr(self.goals, "active", []) or [])
+                for gid in open_goals[:3]:
+                    if not gid or gid not in g:
+                        continue
+                    self.archivist.link(
+                        SELF_NODE,
+                        gid,
+                        EDGE_ASSOCIATED_WITH,
+                        source="self",
+                        placement="self_agency",
+                        felt_state=stamp,
+                    )
+        except Exception:
+            pass
+
     def _self_study(self):
         """During Learning, when no external input is queued, self-
         initiate dictionary expansion rather than sitting idle. Does NOT
@@ -1839,6 +2233,18 @@ class Prometheus:
         in_scope_nodes = self.working_memory.reachable_nodes(wm)
 
         def has_room(n, d):
+            # Body channels are fixed anatomy: never self-study growth targets
+            try:
+                from .edge_types import is_body_channel_node
+                if is_body_channel_node(n) or d.get("is_body_channel") or d.get("growable") is False:
+                    return False
+                if d.get("is_narrative_element") or str(n).startswith("narr:"):
+                    return False
+            except Exception:
+                if d.get("is_body_channel") or d.get("growable") is False:
+                    return False
+                if d.get("is_narrative_element") or str(n).startswith("narr:"):
+                    return False
             return (
                 self.archivist.categorical_out_degree(n) < hard_cap
                 and not d.get("is_schema")

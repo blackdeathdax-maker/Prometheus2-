@@ -279,3 +279,45 @@ def basin_color(valence: float) -> str:
         g = 90
         b = int(200 - 40 * v)
     return f"#{max(0,min(255,r)):02x}{max(0,min(255,g)):02x}{max(0,min(255,b)):02x}"
+
+
+# ---------------------------------------------------------------------
+# Somatic body surface (fixed infrastructure — not world knowledge)
+# ---------------------------------------------------------------------
+# Phenomenological channels cognition may sense. Hardcoded anatomy, not
+# emergent lemmas. Linkable into the epistemic graph only as PARTS
+# (composed-of / part-of), never as is-a children/parents, and never
+# expanded by self-study / WordNet.
+BODY_CHANNELS = (
+    "heart_rate",
+    "breath",
+    "muscle_tension",
+    "sweat_skin",
+    "gut",
+    "energy",
+    "warmth",
+)
+
+# Canonical node ids in the graph (prefix keeps them out of lemma space)
+def body_channel_node_id(channel: str) -> str:
+    ch = (channel or "").strip().lower()
+    if ch.startswith("body:"):
+        return ch
+    return f"body:{ch}"
+
+BODY_CHANNEL_NODE_IDS = tuple(body_channel_node_id(c) for c in BODY_CHANNELS)
+
+
+def is_body_channel_node(node_id: str) -> bool:
+    if not node_id:
+        return False
+    n = str(node_id)
+    if n in BODY_CHANNEL_NODE_IDS:
+        return True
+    if n.startswith("body:") and n[5:] in BODY_CHANNELS:
+        return True
+    # bare channel name
+    if n in BODY_CHANNELS:
+        return True
+    return False
+
