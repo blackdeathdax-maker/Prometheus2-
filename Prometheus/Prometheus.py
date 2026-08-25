@@ -1067,6 +1067,20 @@ class Prometheus:
                 self.modulators.apply_medium_bias(self.bio._hormones)
             except Exception:
                 pass
+            # Ongoing micro-motion (stand-in until live head / speech drive felt)
+            try:
+                self.modulators.ambient_tick(self.pulse_count)
+            except Exception:
+                pass
+            # Optional external / synthetic stimulus engine
+            try:
+                if hasattr(self, "stimulus") and self.stimulus is not None:
+                    for meth in ("tick", "step", "pulse"):
+                        if hasattr(self.stimulus, meth):
+                            getattr(self.stimulus, meth)()
+                            break
+            except Exception as e:
+                logger.warning("stimulus tick failed: %s", e)
             fast_delta = self.modulators.body_delta()
         else:
             fast_delta = None
@@ -3353,6 +3367,11 @@ class Prometheus:
         except Exception:
             pass
 
+        body_for_pred = {}
+        try:
+            body_for_pred = dict(self.bio.get_raw_variables() or {})
+        except Exception:
+            body_for_pred = {}
         dec = self.operators.choose(
             graph=graph,
             focus_id=fid,
@@ -3365,6 +3384,7 @@ class Prometheus:
             lookup_budget_ok=lookup_ok,
             parent_open=parent_open,
             goal_strength=goal_strength,
+            body=body_for_pred,
         )
         detail = ""
         op = dec.operator
@@ -3509,6 +3529,43 @@ class Prometheus:
                 )
             except Exception:
                 pass
+        # Felt motion from prediction: family and/or body-part mismatch
+        try:
+            pred = dec.predict
+            if pred is not None and hasattr(self, "modulators"):
+                fam_bad = (not pred.match) or bool(getattr(pred, "off_family_focus", False))
+                berr = float(getattr(pred, "body_error", 0.0) or 0.0)
+                body_bad = not bool(getattr(pred, "body_match", True))
+                if fam_bad or body_bad or berr > 0.12:
+                    self.modulators.apply_prediction_error(
+                        family_mismatch=fam_bad, body_error=berr if body_bad else 0.0
+                    )
+                # Mild medium-layer nudge (opaque hormones → body next ticks)
+                if hasattr(self, "bio") and hasattr(self.bio, "_hormones"):
+                    h = self.bio._hormones
+                    if fam_bad:
+                        h["adrenaline"] = min(1.0, float(h.get("adrenaline", 0.5)) + 0.01)
+                        h["cortisol"] = min(1.0, float(h.get("cortisol", 0.5)) + 0.008)
+                    if body_bad and berr > 0.12:
+                        h["adrenaline"] = min(1.0, float(h.get("adrenaline", 0.5)) + min(0.02, berr * 0.04))
+                    if pred.match and getattr(pred, "overall_match", True):
+                        h["serotonin"] = min(1.0, float(h.get("serotonin", 0.5)) + 0.004)
+        except Exception as e:
+            logger.warning("predict→felt coupling failed: %s", e)
+
+        # Operator → felt texture (speech/live-head will add more later)
+        try:
+            if hasattr(self, "modulators"):
+                if op == "RETURN":
+                    self.modulators.pulse("novelty", amount=0.07)
+                elif op == "EXPAND":
+                    self.modulators.pulse("self_study_hit", amount=0.06)
+                elif op == "RELEASE":
+                    self.modulators.pulse("focus_stagnant", amount=0.05)
+                elif op == "SETTLE":
+                    self.modulators.pulse("sleep_enter", amount=0.04)
+        except Exception:
+            pass
 
         self.operators.record_episode(
             pulse=self.pulse_count,

@@ -42,7 +42,7 @@ class FastModulators:
       settle   — stay / raise switch cost
     """
 
-    DECAY = 0.12
+    DECAY = 0.09  # slower settle so events leave a longer body trace
     BASELINE = {
         "salience": 0.35,
         "encode": 0.40,
@@ -50,7 +50,7 @@ class FastModulators:
         "settle": 0.45,
     }
     # Cap total body gust so map stays readable
-    BODY_GUST_CAP = 0.18
+    BODY_GUST_CAP = 0.28
 
     # Conflict (ambivalence) influence — tuned as placeholders
     CONFLICT_ALERT_GAIN = 0.35
@@ -135,6 +135,33 @@ class FastModulators:
     def alert_level(self) -> float:
         return self.levels.get("alert", 0.3)
 
+
+    def apply_prediction_error(self, family_mismatch: bool = False, body_error: float = 0.0) -> None:
+        """Cognitive predict violate → alert/salience (feeds body gusts next tick)."""
+        amt = 0.06
+        if family_mismatch:
+            amt += 0.08
+        if body_error and body_error > 0.12:
+            amt += min(0.12, float(body_error) * 0.25)
+        if amt > 0.05:
+            self.pulse("prediction_error", amount=min(0.28, amt))
+
+    def ambient_tick(self, pulse: int = 0) -> None:
+        """Tiny ongoing motion so PAD is not a frozen climate without a live head.
+
+        Deterministic (no RNG dependency on global seed): low-amplitude
+        oscillation from pulse index so soaks still show basin drift.
+        """
+        import math
+        # slow wander ~ period 17 / 29 pulses
+        w1 = math.sin(pulse * 0.37) * 0.025
+        w2 = math.cos(pulse * 0.21) * 0.02
+        self.levels["alert"] = _clamp(self.levels["alert"] + w1)
+        self.levels["salience"] = _clamp(self.levels["salience"] + w2)
+        self.levels["settle"] = _clamp(self.levels["settle"] - 0.5 * w1)
+        # micro encode breathe
+        self.levels["encode"] = _clamp(self.levels["encode"] + 0.5 * w2)
+
     def body_delta(self) -> Dict[str, float]:
         """Phenomenological gusts only — added on top of hormone→body map."""
         s = self.levels.get("salience", 0.35)
@@ -144,13 +171,14 @@ class FastModulators:
         # Conflict adds a little gut/tension texture
         c = self._last_conflict
         raw = {
-            "heart_rate": 0.55 * a + 0.20 * s - 0.15 * t + 0.15 * c,
-            "breath": 0.50 * a + 0.15 * s - 0.20 * t + 0.10 * c,
-            "muscle_tension": 0.45 * a + 0.25 * s - 0.25 * t + 0.20 * c,
-            "sweat_skin": 0.40 * a + 0.20 * s + 0.10 * c,
-            "gut": 0.35 * a - 0.15 * t + 0.10 * s + 0.25 * c,
-            "energy": 0.35 * s + 0.25 * e - 0.15 * a - 0.10 * c,
-            "warmth": 0.30 * t + 0.20 * e - 0.15 * a - 0.10 * c,
+            # Gains raised so modulator swings actually move PAD basins
+            "heart_rate": 0.70 * a + 0.25 * s - 0.18 * t + 0.20 * c,
+            "breath": 0.65 * a + 0.18 * s - 0.22 * t + 0.12 * c,
+            "muscle_tension": 0.58 * a + 0.28 * s - 0.28 * t + 0.25 * c,
+            "sweat_skin": 0.52 * a + 0.25 * s + 0.12 * c,
+            "gut": 0.48 * a - 0.18 * t + 0.12 * s + 0.30 * c,
+            "energy": 0.40 * s + 0.30 * e - 0.18 * a - 0.12 * c,
+            "warmth": 0.38 * t + 0.24 * e - 0.18 * a - 0.12 * c,
         }
         # center around 0 and cap magnitude
         out = {}
