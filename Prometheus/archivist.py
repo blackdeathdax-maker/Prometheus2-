@@ -234,31 +234,114 @@ class ArchivistModule:
 
 
     def repair_identity_edges(self) -> dict:
-        """Strip illegal is-a involving SELF / body / felt / narr; one-shot hygiene."""
-        removed = 0
+        """Strip illegal hierarchy involving SELF / body / felt / narr / epistemic_of_self.
+
+        - is-a never involves SELF or somatic infrastructure
+        - part-of / composed-of never put Anger etc. under SELF or under
+          epistemic_of_self as taxonomic children
+        - remove illegal epistemic shells (epistemic_of_self, epistemic_of_body*, …)
+        """
+        removed_edges = 0
+        removed_nodes = 0
         g = self.graph
-        to_remove = []
-        for u, v, k, d in list(g.edges(keys=True, data=True)):
-            rel = (d or {}).get("relation_type")
-            if rel != "is-a":
-                continue
+        try:
+            from .edge_types import (
+                is_somatic_infrastructure,
+                is_forbidden_epistemic_parent,
+                is_body_channel_node,
+                is_felt_place_node,
+            )
+        except Exception:
+            is_somatic_infrastructure = lambda n: str(n).startswith(("body:", "felt:", "basin_", "narr:"))
+            is_forbidden_epistemic_parent = is_somatic_infrastructure
+            is_body_channel_node = lambda n: str(n).startswith("body:")
+            is_felt_place_node = lambda n: str(n).startswith(("felt:", "basin_"))
+
+        def _is_selfish(n):
+            s = str(n)
+            return s == SELF_NODE or s.upper() == "SELF" or s.lower().startswith("epistemic_of_self")
+
+        # 1) Drop illegal epistemic shell nodes entirely
+        for node in list(g.nodes()):
+            low = str(node).lower()
             if (
-                u == SELF_NODE or v == SELF_NODE
-                or is_somatic_infrastructure(u)
-                or is_somatic_infrastructure(v)
+                is_forbidden_epistemic_parent(node)
+                and (low.startswith("epistemic_") or g.nodes.get(node, {}).get("node_type") in (
+                    "epistemic_schema", "schema"
+                ))
             ):
-                to_remove.append((u, v, k))
-        for u, v, k in to_remove:
+                # only remove if it is the shell itself, not a legitimate knowledge lemma
+                if low.startswith("epistemic_"):
+                    try:
+                        g.remove_node(node)
+                        removed_nodes += 1
+                    except Exception:
+                        pass
+
+        # 2) Strip illegal edges
+        to_remove = []
+        for edge in list(g.edges(keys=True, data=True)):
+            if len(edge) == 4:
+                u, v, k, d = edge
+            else:
+                u, v, d = edge
+                k = None
+            rel = (d or {}).get("relation_type") or ""
+            # is-a involving self/somatic
+            if rel == "is-a":
+                if _is_selfish(u) or _is_selfish(v) or is_somatic_infrastructure(u) or is_somatic_infrastructure(v):
+                    to_remove.append((u, v, k))
+                    continue
+            # hierarchy-ish edges that wrongly nest knowledge under SELF / epistemic_of_self
+            if rel in ("is-a", "part-of", "composed-of", "member-of"):
+                if _is_selfish(u) or _is_selfish(v):
+                    # Allow only associated-with style later; hierarchy is banned
+                    # Exception: narr: parts of SELF via associated-with only — drop part-of knowledge lemmas
+                    other = v if _is_selfish(u) else u
+                    if not str(other).startswith("narr:"):
+                        # body/felt should be associated-with, not part-of SELF
+                        to_remove.append((u, v, k))
+                        continue
+            # part-of / composed-of with body as whole or felt as taxonomic parent
+            if rel in ("part-of", "composed-of"):
+                if is_body_channel_node(u) or is_body_channel_node(v):
+                    # body channels only as leaves of knowledge schemas via composed-of
+                    # FROM knowledge TO body is ok for composed-of (Anger composed-of body:hr)
+                    # FROM body TO anything hierarchical is not
+                    if rel == "part-of" and is_body_channel_node(v):
+                        to_remove.append((u, v, k))
+                    if rel == "composed-of" and is_body_channel_node(u):
+                        to_remove.append((u, v, k))
+                if is_felt_place_node(u) or is_felt_place_node(v):
+                    # felt places bind via felt-bind / associated-with, not is-a hierarchy
+                    if rel in ("part-of", "composed-of", "is-a"):
+                        to_remove.append((u, v, k))
+
+        seen = set()
+        for item in to_remove:
+            u, v, k = item
+            key = (u, v, k)
+            if key in seen:
+                continue
+            seen.add(key)
             try:
-                g.remove_edge(u, v, k)
-                removed += 1
+                if k is not None:
+                    g.remove_edge(u, v, k)
+                else:
+                    g.remove_edge(u, v)
+                removed_edges += 1
             except Exception:
                 try:
                     g.remove_edge(u, v)
-                    removed += 1
+                    removed_edges += 1
                 except Exception:
                     pass
-        return {"removed_is_a": removed}
+
+        return {
+            "removed_edges": removed_edges,
+            "removed_nodes": removed_nodes,
+            "removed_is_a": removed_edges,  # backward compat key
+        }
 
     def store(self, entity: str, metadata: Dict = None, source: str = "user", tier: int = TIER_PROVISIONAL):
         """
@@ -400,19 +483,31 @@ class ArchivistModule:
                 return
             if node_a == SELF_NODE or node_b == SELF_NODE:
                 return  # identity is not a hypernym/hyponym of Anger etc.
+            # epistemic_of_self is not a knowledge kind either
+            for n in (node_a, node_b):
+                low = str(n).lower()
+                if low.startswith("epistemic_of_self") or low.startswith("epistemic_of_body"):
+                    return
+                if low.startswith("epistemic_of_felt") or low.startswith("epistemic_of_basin"):
+                    return
         if relation_type in ("part-of", "composed-of"):
             # composed-of: whole -> part
             # part-of:     part -> whole
+            a_low, b_low = str(node_a).lower(), str(node_b).lower()
+            if a_low.startswith("epistemic_of_self") or b_low.startswith("epistemic_of_self"):
+                return  # SELF shell is not a knowledge container
             if relation_type == "composed-of":
                 if is_body_channel_node(node_a) or is_felt_place_node(node_a):
                     return  # body/felt cannot be the whole
-                if node_a == SELF_NODE and is_body_channel_node(node_b):
-                    return  # SELF senses body via associated-with, not composed-of body as only path — allow narr parts only
+                if node_a == SELF_NODE:
+                    return  # SELF is not a composed-of whole for knowledge/body
             if relation_type == "part-of":
                 if is_body_channel_node(node_b) or is_felt_place_node(node_b):
                     return  # cannot be part of a body channel / felt place
-                if node_b == SELF_NODE and is_body_channel_node(node_a):
-                    return  # body is not "part of SELF" via part-of hierarchy; use associated-with
+                if node_b == SELF_NODE or b_low.startswith("epistemic_of_self"):
+                    return  # nothing is "part of SELF" via hierarchy; use associated-with
+                if node_a == SELF_NODE or a_low.startswith("epistemic_of_self"):
+                    return
         if relation_type == "is-a":
             a_data = self.graph.nodes.get(node_a, {}) or {}
             b_data = self.graph.nodes.get(node_b, {}) or {}

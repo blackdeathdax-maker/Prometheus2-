@@ -112,15 +112,15 @@ class ReflectorModule:
         if not parent:
             return False
         try:
-            from .edge_types import is_somatic_infrastructure, is_body_channel_node
-            if is_somatic_infrastructure(parent) or is_body_channel_node(parent):
+            from .edge_types import is_forbidden_epistemic_parent
+            if is_forbidden_epistemic_parent(parent):
                 return False
         except Exception:
-            pass
-        if parent in ("SELF", "OTHER") or str(parent).startswith("body:"):
-            return False
-        if str(parent).startswith("felt:") or str(parent).startswith("narr:"):
-            return False
+            # fallback
+            if parent in ("SELF", "OTHER") or str(parent).startswith(
+                ("body:", "felt:", "narr:", "basin_", "epistemic_of_self", "epistemic_of_body")
+            ):
+                return False
         return True
 
 
@@ -945,12 +945,40 @@ class ReflectorModule:
 
     def prune_garbage_epistemic_schemas(self) -> int:
         """Remove low-quality epistemic schemas: low coherence, low lemma ratio,
-        or majority sentence-like members. Members are left intact.
+        or majority sentence-like members. Also strip illegal self/body/felt shells.
+        Members are left intact.
         """
         graph = self.archivist.graph
         removed = 0
         for node in list(graph.nodes()):
-            data = graph.nodes.get(node, {})
+            data = graph.nodes.get(node, {}) or {}
+            is_ep = data.get("node_type") == NODE_EPISTEMIC_SCHEMA or str(node).startswith("epistemic_")
+            if not is_ep:
+                continue
+            # Illegal identity/anatomy shells
+            low = str(node).lower()
+            illegal = (
+                low.startswith("epistemic_of_self")
+                or low.startswith("epistemic_of_other")
+                or low.startswith("epistemic_of_body")
+                or low.startswith("epistemic_of_felt")
+                or low.startswith("epistemic_of_basin")
+                or low.startswith("epistemic_of_narr")
+                or low.startswith("epistemic_of_heart")
+                or low.startswith("epistemic_of_breath")
+                or low.startswith("epistemic_of_energy")
+                or low.startswith("epistemic_of_warmth")
+                or low.startswith("epistemic_of_gut")
+                or low.startswith("epistemic_of_sweat")
+                or low.startswith("epistemic_of_muscle")
+            )
+            if illegal:
+                try:
+                    graph.remove_node(node)
+                    removed += 1
+                except Exception:
+                    pass
+                continue
             if data.get("node_type") != NODE_EPISTEMIC_SCHEMA:
                 continue
             members = [
@@ -1269,17 +1297,37 @@ class ReflectorModule:
             # check, not after, so a component that's only "big enough"
             # because of uncorroborated Provisional padding is correctly
             # excluded, not trimmed-and-accepted.
+            try:
+                from .edge_types import is_eligible_epistemic_member
+            except Exception:
+                is_eligible_epistemic_member = lambda n: n not in ("SELF", "OTHER") and not str(n).startswith(
+                    ("body:", "felt:", "basin_", "narr:", "epistemic_")
+                )
             members = sorted(
                 n for n in component
                 if graph.nodes.get(n, {}).get("tier", TIER_PROVISIONAL) >= TIER_WORKING
                 and graph.nodes.get(n, {}).get("node_type") not in (
                     NODE_EPISTEMIC_SCHEMA, NODE_SCHEMA, NODE_BASIN
                 )
+                and is_eligible_epistemic_member(n)
+                and self._epistemic_parent_allowed(n)  # also ban SELF/body as *members*
             )
             if len(members) < self.EPISTEMIC_MIN_CLUSTER_SIZE:
                 continue
 
             dominant_parent, _coverage = self._dominant_parent(members)
+            if dominant_parent and not self._epistemic_parent_allowed(dominant_parent):
+                dominant_parent = None
+            # Never mint epistemic_of_self / body / felt shells
+            trial_id = self._epistemic_cluster_id(members, dominant_parent) if members else ""
+            if trial_id and not self._epistemic_parent_allowed(
+                (dominant_parent or trial_id.replace("epistemic_of_", "", 1))
+            ):
+                continue
+            if trial_id.lower().startswith("epistemic_of_self") or trial_id.lower().startswith("epistemic_of_body"):
+                continue
+            if trial_id.lower().startswith("epistemic_of_felt") or trial_id.lower().startswith("epistemic_of_basin"):
+                continue
 
             # Quality gates: reject nonsense clusters before they enter cortex
             coh = self.cluster_coherence(members)
@@ -1375,7 +1423,7 @@ class ReflectorModule:
             # Primary: member -is-a-> parent
             for _u, v, edata in graph.out_edges(member, data=True):
                 if edata.get("relation_type") == EDGE_IS_A:
-                    if v not in members:  # parent should not be a peer member
+                    if v not in members and self._epistemic_parent_allowed(v):
                         parent_counts[v] += 1
         if not parent_counts:
             return None, 0

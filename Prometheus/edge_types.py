@@ -344,3 +344,45 @@ def is_somatic_infrastructure(node_id: str) -> bool:
         or is_felt_place_node(node_id)
         or is_narrative_graph_node(node_id)
     )
+
+
+def is_forbidden_epistemic_parent(node_id: str) -> bool:
+    """Nodes that must never become epistemic_of_* hubs or cluster parents.
+
+    SELF, body channels, felt places, basins, narrative nodes — identity
+    and anatomy, not world-knowledge kinds.
+    """
+    if not node_id:
+        return True
+    n = str(node_id)
+    low = n.lower()
+    if n in ("SELF", "OTHER") or low in ("self", "other"):
+        return True
+    if is_somatic_infrastructure(n):
+        return True
+    if n.startswith(("body:", "felt:", "basin_", "narr:")):
+        return True
+    # Already-formed illegal epistemic shells
+    if low.startswith("epistemic_of_self") or low.startswith("epistemic_of_other"):
+        return True
+    if low.startswith("epistemic_of_body") or low.startswith("epistemic_of_felt"):
+        return True
+    if low.startswith("epistemic_of_basin") or low.startswith("epistemic_of_narr"):
+        return True
+    # slug forms: epistemic_of_heart_rate, epistemic_of_0_5_0_4_0_7, etc.
+    for ch in BODY_CHANNELS:
+        if low == f"epistemic_of_{ch}" or low.startswith(f"epistemic_of_{ch}"):
+            return True
+    return False
+
+
+def is_eligible_epistemic_member(node_id: str) -> bool:
+    """Knowledge lemmas only — not identity/anatomy infrastructure."""
+    if not node_id:
+        return False
+    if is_forbidden_epistemic_parent(node_id):
+        return False
+    n = str(node_id)
+    if n.startswith("epistemic_"):
+        return False  # schemas are not members of other epistemic clusters here
+    return True
