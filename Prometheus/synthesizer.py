@@ -33,7 +33,7 @@ class SynthesizerModule:
 
     # Grid resolution for the dwell-time histogram. Not yet tuned per spec
     # §10 item 11 -- 1 decimal place is a placeholder, revisit empirically.
-    GRID_RESOLUTION = 1
+    GRID_RESOLUTION = 1  # 0.1 bins; amplitude/contrast is the lever for distinct climates
     # Minimum revisits before a candidate basin counts as stabilized.
     # Placeholder per §10 item 11 (not yet numeric in the spec either).
     STABILIZATION_THRESHOLD = 3
@@ -101,12 +101,18 @@ class SynthesizerModule:
         energy = raw.get("energy", 0.5)
         warmth = raw.get("warmth", 0.5)
 
-        # Activated body → arousal
-        arousal = max(0.0, min(1.0, 0.35 * heart + 0.30 * breath + 0.20 * sweat + 0.15 * energy))
-        # Pleasant settled vs distressed gut/cold — valence in [-1, 1]
-        valence = max(-1.0, min(1.0, (0.45 * warmth + 0.35 * energy) - (0.40 * gut + 0.25 * sweat)))
-        # Stance: energy + inverse overwhelm (tension+gut high → low dominance)
-        dominance = max(0.0, min(1.0, 0.40 * energy + 0.30 * (1.0 - tension) + 0.30 * (1.0 - gut)))
+        # Activated body → arousal (gains raised so mid-body still spans bins)
+        a_raw = 0.40 * heart + 0.28 * breath + 0.18 * sweat + 0.14 * energy
+        # Stretch away from 0.5 so climates don't collapse to one bin
+        arousal = max(0.0, min(1.0, 0.5 + 1.35 * (a_raw - 0.5)))
+
+        # Valence: warmth/energy vs gut/sweat/tension — bipolar
+        v_raw = (0.40 * warmth + 0.30 * energy) - (0.35 * gut + 0.22 * sweat + 0.18 * tension)
+        valence = max(-1.0, min(1.0, 1.40 * v_raw))
+
+        # Dominance: energy vs overwhelm
+        d_raw = 0.42 * energy + 0.28 * (1.0 - tension) + 0.30 * (1.0 - gut)
+        dominance = max(0.0, min(1.0, 0.5 + 1.30 * (d_raw - 0.5)))
         return arousal, valence, dominance
 
     def _bin_key(self, arousal: float, valence: float, dominance: float) -> Tuple[float, float, float]:

@@ -1072,6 +1072,23 @@ class Prometheus:
                 self.modulators.ambient_tick(self.pulse_count)
             except Exception:
                 pass
+            # Bipolar climate shove: without live head, force hormones to
+            # visit high-arousal and low-arousal poles so basins can form.
+            try:
+                import math
+                h = self.bio._hormones
+                p = self.pulse_count
+                # slow carrier ~80 pulses: adrenaline/cortisol vs serotonin
+                phase = math.sin(p * 0.0785)  # ~80-pulse period
+                phase2 = math.sin(p * 0.041)
+                # amplitude large enough to move body map across bins
+                h["adrenaline"] = max(0.05, min(0.95, float(h.get("adrenaline", 0.5)) + 0.012 * phase))
+                h["cortisol"] = max(0.05, min(0.95, float(h.get("cortisol", 0.5)) + 0.010 * phase))
+                h["serotonin"] = max(0.05, min(0.95, float(h.get("serotonin", 0.5)) + 0.012 * (-phase)))
+                h["dopamine"] = max(0.05, min(0.95, float(h.get("dopamine", 0.5)) + 0.008 * phase2))
+                h["oxytocin"] = max(0.05, min(0.95, float(h.get("oxytocin", 0.5)) + 0.006 * (-phase2)))
+            except Exception:
+                pass
             # Optional external / synthetic stimulus engine
             try:
                 if hasattr(self, "stimulus") and self.stimulus is not None:
@@ -3544,12 +3561,15 @@ class Prometheus:
                 if hasattr(self, "bio") and hasattr(self.bio, "_hormones"):
                     h = self.bio._hormones
                     if fam_bad:
-                        h["adrenaline"] = min(1.0, float(h.get("adrenaline", 0.5)) + 0.01)
-                        h["cortisol"] = min(1.0, float(h.get("cortisol", 0.5)) + 0.008)
+                        h["adrenaline"] = min(1.0, float(h.get("adrenaline", 0.5)) + 0.035)
+                        h["cortisol"] = min(1.0, float(h.get("cortisol", 0.5)) + 0.025)
+                        h["serotonin"] = max(0.0, float(h.get("serotonin", 0.5)) - 0.02)
                     if body_bad and berr > 0.12:
-                        h["adrenaline"] = min(1.0, float(h.get("adrenaline", 0.5)) + min(0.02, berr * 0.04))
+                        h["adrenaline"] = min(1.0, float(h.get("adrenaline", 0.5)) + min(0.05, berr * 0.12))
+                        h["cortisol"] = min(1.0, float(h.get("cortisol", 0.5)) + min(0.04, berr * 0.08))
                     if pred.match and getattr(pred, "overall_match", True):
-                        h["serotonin"] = min(1.0, float(h.get("serotonin", 0.5)) + 0.004)
+                        h["serotonin"] = min(1.0, float(h.get("serotonin", 0.5)) + 0.015)
+                        h["adrenaline"] = max(0.0, float(h.get("adrenaline", 0.5)) - 0.01)
         except Exception as e:
             logger.warning("predict→felt coupling failed: %s", e)
 

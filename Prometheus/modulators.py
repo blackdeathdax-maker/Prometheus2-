@@ -50,7 +50,7 @@ class FastModulators:
         "settle": 0.45,
     }
     # Cap total body gust so map stays readable
-    BODY_GUST_CAP = 0.28
+    BODY_GUST_CAP = 0.40
 
     # Conflict (ambivalence) influence — tuned as placeholders
     CONFLICT_ALERT_GAIN = 0.35
@@ -144,7 +144,7 @@ class FastModulators:
         if body_error and body_error > 0.12:
             amt += min(0.12, float(body_error) * 0.25)
         if amt > 0.05:
-            self.pulse("prediction_error", amount=min(0.28, amt))
+            self.pulse("prediction_error", amount=min(0.40, amt * 1.4))
 
     def ambient_tick(self, pulse: int = 0) -> None:
         """Tiny ongoing motion so PAD is not a frozen climate without a live head.
@@ -154,13 +154,14 @@ class FastModulators:
         """
         import math
         # slow wander ~ period 17 / 29 pulses
-        w1 = math.sin(pulse * 0.37) * 0.025
-        w2 = math.cos(pulse * 0.21) * 0.02
-        self.levels["alert"] = _clamp(self.levels["alert"] + w1)
+        # Larger wander so PAD visits multiple 0.1 bins over a few hundred pulses
+        w1 = math.sin(pulse * 0.37) * 0.055
+        w2 = math.cos(pulse * 0.21) * 0.045
+        w3 = math.sin(pulse * 0.11) * 0.035
+        self.levels["alert"] = _clamp(self.levels["alert"] + w1 + 0.3 * w3)
         self.levels["salience"] = _clamp(self.levels["salience"] + w2)
-        self.levels["settle"] = _clamp(self.levels["settle"] - 0.5 * w1)
-        # micro encode breathe
-        self.levels["encode"] = _clamp(self.levels["encode"] + 0.5 * w2)
+        self.levels["settle"] = _clamp(self.levels["settle"] - 0.6 * w1 + 0.4 * w2)
+        self.levels["encode"] = _clamp(self.levels["encode"] + 0.5 * w2 - 0.2 * w1)
 
     def body_delta(self) -> Dict[str, float]:
         """Phenomenological gusts only — added on top of hormone→body map."""
