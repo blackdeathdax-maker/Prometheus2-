@@ -1403,30 +1403,83 @@ class Prometheus:
         # Schema ↔ felt-anchor co-occurrence (implicit; no emotion taxonomy)
         try:
             active_schemas = []
-            fid = getattr(self.focus, "focus_id", None)
-            if fid and fid in self.archivist.graph:
-                nd = self.archivist.graph.nodes[fid]
+            graph = self.archivist.graph
+
+            def _maybe_schema(nid):
+                if not nid or nid not in graph:
+                    return
+                nd = graph.nodes.get(nid) or {}
+                nt = nd.get("node_type")
                 if (
-                    str(fid).startswith("epistemic_")
-                    or str(fid).startswith("schema_")
+                    str(nid).startswith("epistemic_")
+                    or str(nid).startswith("schema_")
                     or nd.get("is_schema")
-                    or nd.get("somatic")
-                    or nd.get("node_type") in ("schema", "epistemic_schema")
+                    or nt in ("schema", "epistemic_schema")
                 ):
-                    active_schemas.append(fid)
+                    active_schemas.append(nid)
+                    return
+                # Knowledge lemmas (Anger, Color) count when focused —
+                # binding should not require only formal schema nodes.
+                if nt in ("lemma", "concept", "entity", None) or nd.get("name"):
+                    # Skip pure body/felt/narr infrastructure
+                    s = str(nid)
+                    if s.startswith(("body:", "felt_", "felt:", "narr:", "SELF")):
+                        return
+                    if nd.get("is_felt_place") or nd.get("body_channel"):
+                        return
+                    active_schemas.append(nid)
+
+            fid = getattr(self.focus, "focus_id", None)
+            _maybe_schema(fid)
+
+            # Active goals
+            try:
+                if hasattr(self, "goals") and self.goals is not None:
+                    for g in (self.goals.active_list() if hasattr(self.goals, "active_list") else []) or []:
+                        tid = g.get("target") if isinstance(g, dict) else getattr(g, "target", None)
+                        _maybe_schema(tid)
+                    # common alternate APIs
+                    for attr in ("active_targets", "targets", "list_active"):
+                        if hasattr(self.goals, attr):
+                            vals = getattr(self.goals, attr)
+                            vals = vals() if callable(vals) else vals
+                            for tid in (vals or []):
+                                if isinstance(tid, dict):
+                                    tid = tid.get("target") or tid.get("id")
+                                _maybe_schema(tid)
+            except Exception:
+                pass
+
             if hasattr(self, "working_memory") and self.working_memory is not None:
                 try:
                     wm = self.working_memory.get_current_working_memory()
                     for sid in (wm.get("slots") or []):
-                        if sid in self.archivist.graph:
-                            nt = self.archivist.graph.nodes[sid].get("node_type")
-                            if nt in ("schema", "epistemic_schema") or str(sid).startswith("epistemic_"):
-                                active_schemas.append(sid)
+                        _maybe_schema(sid)
                 except Exception:
                     pass
+
+            # Dedupe preserve order
+            seen = set()
+            deduped = []
+            for s in active_schemas:
+                if s not in seen:
+                    seen.add(s)
+                    deduped.append(s)
+            active_schemas = deduped
+
             cur = self.felt_anchors.current()
-            if cur is not None:
+            if cur is not None and active_schemas:
                 self.schema_felt.note(active_schemas, cur.anchor_id)
+                # Live promote when any pair crosses threshold so UI fills
+                # without waiting only for sleep consolidation
+                try:
+                    for sid in active_schemas:
+                        c = int(self.schema_felt.cooccur.get(sid, {}).get(cur.anchor_id, 0))
+                        if c >= self.schema_felt.threshold and cur.anchor_id not in self.schema_felt.binds.get(sid, ()):
+                            self.schema_felt.promote(self.archivist.graph)
+                            break
+                except Exception:
+                    pass
             # Schema–schema co-activation: schemas sharing WM/focus get paired
             # so Tier-2 stacking has stabilized fuel (not only leaf co-touch).
             if len(active_schemas) >= 2 and hasattr(self.archivist, "record_schema_co_activation"):
