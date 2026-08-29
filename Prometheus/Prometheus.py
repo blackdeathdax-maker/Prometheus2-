@@ -2475,84 +2475,145 @@ class Prometheus:
 
         return None
 
-    def _weighted_choice_by_activation(self, pool: List[str], bias: str = "BIAS_NEUTRAL",
-                                        boost_set: Optional[set] = None) -> Optional[str]:
-        """Activation-weighted random choice (§11 pull-forward) --
-        replaces uniform random.choice() for self-study target selection
-        so recently-touched nodes are preferentially re-expanded, giving
-        self-study something closer to genuine attention/focus. An
-        epsilon floor (0.1) on every weight keeps untouched nodes
-        selectable at nonzero probability -- this stays exploration-with-
-        a-bias, not pure exploitation of whatever's already active, which
-        would risk narrowing the graph's growth to an ever-smaller hot
-        set over time.
+    def _self_study_importance_sets(self) -> dict:
+        """Collect the sets that define 'what actually matters' for self-study.
 
-        `bias` (§13.1): under BIAS_EXPLORE, the weighting is inverted --
-        low-activation (novel, rarely-touched) nodes are preferred
-        instead, using ACTIVATION_CAP minus each node's activation as the
-        weight, same epsilon floor for the opposite reason (keeps a
-        saturated node selectable at nonzero probability rather than
-        fully excluded). BIAS_STABILIZE and BIAS_NEUTRAL both keep the
-        original high-activation-preferring weighting -- NEUTRAL
-        reproduces prior behavior exactly; STABILIZE reads as "deepen
-        what's already active," which is what the un-inverted weighting
-        already does.
-
-        `boost_set` (new, this revision -- §14): a multiplicative bonus
-        for nodes reachable from current working memory, used outside
-        Childhood (which hard-gates the candidate pools instead, so
-        nothing needs boosting there -- see _select_self_study_target).
-        Multiplicative rather than additive so it composes with whatever
-        the bias weighting already computed instead of overriding it --
-        a boosted node under BIAS_EXPLORE still respects the inverted
-        preference, just scaled up within it."""
-        if not pool:
-            return None
-        if bias == "BIAS_EXPLORE":
-            cap = self.archivist.ACTIVATION_CAP
-            weights = [
-                (cap - self.archivist.graph.nodes[n].get("activation", 0.0)) + 0.1 for n in pool
-            ]
-        else:
-            weights = [self.archivist.graph.nodes[n].get("activation", 0.0) + 0.1 for n in pool]
-        if boost_set:
-            weights = [w * 3.0 if n in boost_set else w for n, w in zip(pool, weights)]
-        # User / WM priority (not absolute): stronger than general boost
+        Priority floors (P1): user-linked + active goals + narrative ≫ distant WordNet.
+        Built once per selection so weighted choice stays cheap.
+        """
+        graph = self.archivist.graph
+        out = {
+            "wm": set(),
+            "user": set(),
+            "goal": set(),
+            "narrative": set(),
+            "focus_local": set(),
+            "focus_id": None,
+        }
         try:
             wm = self.get_current_working_memory()
-            wm_slots = set(wm.get("slots") or [])
-        except Exception:
-            wm_slots = set()
-        if wm_slots:
-            weights = [w * 5.0 if n in wm_slots else w for n, w in zip(pool, weights)]
-        for i, n in enumerate(pool):
-            src = self.archivist.graph.nodes.get(n, {}).get("source", "")
-            if src == "user":
-                weights[i] *= 2.5
-        try:
-            local = self.focus_neighborhood_ids(cap=48)
-            weights = [w * 4.0 if n in local else w for n, w in zip(pool, weights)]
-            fid = getattr(self.focus, "focus_id", None)
-            if fid:
-                weights = [w * 2.5 if n == fid else w for n, w in zip(pool, weights)]
+            out["wm"] = set(wm.get("slots") or [])
         except Exception:
             pass
+        try:
+            for n, d in list(graph.nodes(data=True)):
+                if d.get("source") == "user" or d.get("user_linked") or d.get("pedagogical"):
+                    out["user"].add(n)
+        except Exception:
+            pass
+        try:
+            if getattr(self, "goals", None) is not None:
+                for tid in list(self.goals.active_target_ids() or []):
+                    out["goal"].add(tid)
+                    if hasattr(self.goals, "schema_closure_ids"):
+                        out["goal"] |= set(self.goals.schema_closure_ids(graph, tid) or [])
+                    if hasattr(self.goals, "protected_ids"):
+                        out["goal"] |= set(self.goals.protected_ids(graph) or [])
+        except Exception:
+            pass
+        try:
+            if getattr(self, "self_narrative", None) is not None:
+                if hasattr(self.self_narrative, "linked_nodes_above_floor"):
+                    out["narrative"] |= set(self.self_narrative.linked_nodes_above_floor() or [])
+                # narr:* element nodes and anything they point at
+                for n, d in list(graph.nodes(data=True)):
+                    if str(n).startswith("narr:") or d.get("is_narrative_element"):
+                        out["narrative"].add(n)
+                        for linked in (d.get("linked_nodes") or []):
+                            out["narrative"].add(linked)
+        except Exception:
+            pass
+        try:
+            out["focus_local"] = set(self.focus_neighborhood_ids(cap=48) or [])
+            out["focus_id"] = getattr(self.focus, "focus_id", None)
+            if out["focus_id"]:
+                out["focus_local"].add(out["focus_id"])
+        except Exception:
+            pass
+        return out
+
+    def _self_study_importance(self, node_id: str, sets: dict, bias: str = "BIAS_NEUTRAL") -> float:
+        """Scalar importance for self-study target selection.
+
+        Floors (multiplicative, ordered by intent):
+          goal / schema-closure   ×12
+          narrative-linked        ×8
+          user-linked / taught    ×6
+          working-memory slot     ×5
+          focus neighborhood      ×4
+          current focus id        ×2.5
+          activation (or explore invert) + epsilon
+          long-term curiosity, sticky residual, guided neigh
+
+        Distant pure-dictionary leaves with no tie to the floors stay near
+        the epsilon floor so they remain reachable but rarely win.
+        """
+        graph = self.archivist.graph
+        nd = graph.nodes.get(node_id, {}) or {}
+        act = float(nd.get("activation", 0.0) or 0.0)
+        if bias == "BIAS_EXPLORE":
+            cap = float(getattr(self.archivist, "ACTIVATION_CAP", 5.0) or 5.0)
+            w = (cap - act) + 0.1
+        else:
+            w = act + 0.1
+
+        if node_id in sets.get("goal", ()):
+            w *= 12.0
+        if node_id in sets.get("narrative", ()):
+            w *= 8.0
+        if node_id in sets.get("user", ()):
+            w *= 6.0
+        elif nd.get("source") == "user" or nd.get("user_linked") or nd.get("pedagogical"):
+            w *= 6.0
+        if node_id in sets.get("wm", ()):
+            w *= 5.0
+        if node_id in sets.get("focus_local", ()):
+            w *= 4.0
+        if sets.get("focus_id") and node_id == sets["focus_id"]:
+            w *= 2.5
+
+        # Pure dictionary leaf with no importance floor: soft demotion
+        src = nd.get("source", "")
+        if src == "dictionary" and node_id not in sets.get("goal", ()) \
+                and node_id not in sets.get("narrative", ()) \
+                and node_id not in sets.get("user", ()) \
+                and node_id not in sets.get("wm", ()) \
+                and node_id not in sets.get("focus_local", ()):
+            w *= 0.35
+
         try:
             if hasattr(self, "long_term_interest"):
-                weights = [
-                    w * self.long_term_interest.curiosity_multiplier(n)
-                    for n, w in zip(pool, weights)
-                ]
+                w *= float(self.long_term_interest.curiosity_multiplier(node_id) or 1.0)
         except Exception:
             pass
-        # §13.y: sticky focus / residual neighbourhood bias
-        weights = [w * self.focus.self_study_weight(n) for n, w in zip(pool, weights)]
         try:
-            guided = self.focus.neighbourhood_boost_ids(self.archivist.graph)
-            if guided:
-                weights = [w * 3.5 if n in guided else w for n, w in zip(pool, weights)]
+            w *= float(self.focus.self_study_weight(node_id) or 1.0)
         except Exception:
             pass
+        try:
+            guided = self.focus.neighbourhood_boost_ids(graph)
+            if guided and node_id in guided:
+                w *= 3.5
+        except Exception:
+            pass
+        return max(0.05, float(w))
+
+    def _weighted_choice_by_activation(self, pool: List[str], bias: str = "BIAS_NEUTRAL",
+                                        boost_set: Optional[set] = None) -> Optional[str]:
+        """Importance-weighted self-study target choice.
+
+        P1 scoring: user-linked + goal + narrative floor ≫ distant WordNet.
+        Activation / explore invert remains the base signal; importance
+        floors are multiplicative so a cold but goal-linked node still
+        outranks a hot unrelated dictionary leaf.
+        """
+        if not pool:
+            return None
+        sets = self._self_study_importance_sets()
+        if boost_set:
+            # fold legacy boost_set into WM-like preference
+            sets["wm"] = set(sets.get("wm") or ()) | set(boost_set)
+        weights = [self._self_study_importance(n, sets, bias=bias) for n in pool]
         return random.choices(pool, weights=weights, k=1)[0]
 
     # ------------------------------------------------------------------
