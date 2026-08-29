@@ -3710,45 +3710,106 @@ class Prometheus:
 
 
     def node_neighborhood(self, node_id: str, max_each: int = 20) -> dict:
-        """Parents/children for search expand — list only, not full graph render.
+        """Parents/children/parts for search expand — list only, not full graph render.
 
-        Taxonomy convention:
-          is-a:      child → parent
-          composed-of: schema → member
+        Taxonomy convention (must stay consistent with edge_types + archivist.link):
+          is-a:        child → parent          (hyponym → hypernym)
+          part-of:     part  → whole
+          composed-of: whole → part
+
+        Body / felt / narr are anatomy/identity infrastructure:
+          they may only appear under part-of / composed-of / associated-with,
+          never under is-a.
         """
         graph = self.archivist.graph
+        empty = {
+            "id": node_id,
+            "parents": [],
+            "children": [],
+            "part_of": [],
+            "has_parts": [],
+            "member_of_schemas": [],
+            "schema_members": [],
+            "related": [],
+            "parent_count": 0,
+            "child_count": 0,
+            "related_count": 0,
+        }
         if not node_id or node_id not in graph:
-            return {
-                "id": node_id, "parents": [], "children": [], "related": [],
-                "member_of_schemas": [], "schema_members": [],
-            }
-        parents, children, related = [], [], []
+            return empty
+
+        try:
+            from .edge_types import (
+                is_body_channel_node,
+                is_felt_place_node,
+                is_narrative_graph_node,
+                is_somatic_infrastructure,
+            )
+        except Exception:
+            is_body_channel_node = lambda n: str(n).startswith("body:")
+            is_felt_place_node = lambda n: str(n).startswith(("felt:", "basin_"))
+            is_narrative_graph_node = lambda n: str(n).startswith("narr:")
+            is_somatic_infrastructure = lambda n: (
+                is_body_channel_node(n)
+                or is_felt_place_node(n)
+                or is_narrative_graph_node(n)
+            )
+
+        parents, children = [], []
+        part_of, has_parts = [], []
         member_of_schemas, schema_members = [], []
+        related = []
+
+        def _row(nid, rel):
+            return {
+                "id": str(nid),
+                "relation": rel,
+                "name": (graph.nodes.get(nid) or {}).get("name"),
+            }
+
+        # Out-edges: this → other
         for _, v, data in list(graph.out_edges(node_id, data=True)):
-            rel = data.get("relation_type") or "associated-with"
-            row = {"id": str(v), "relation": rel, "name": graph.nodes[v].get("name")}
-            if rel in ("is-a", "part-of"):
-                parents.append(row)  # this → parent
+            rel = (data or {}).get("relation_type") or "associated-with"
+            row = _row(v, rel)
+            if rel == "is-a":
+                if not is_somatic_infrastructure(node_id) and not is_somatic_infrastructure(v):
+                    parents.append(row)
+                else:
+                    related.append(row)
+            elif rel == "part-of":
+                part_of.append(row)
             elif rel == "composed-of":
-                schema_members.append(row)  # this schema → member
+                has_parts.append(row)
+                schema_members.append(row)
             else:
                 related.append(row)
+
+        # In-edges: other → this
         for u, _, data in list(graph.in_edges(node_id, data=True)):
-            rel = data.get("relation_type") or "associated-with"
-            row = {"id": str(u), "relation": rel, "name": graph.nodes[u].get("name")}
-            if rel in ("is-a", "part-of"):
-                children.append(row)  # child → this
+            rel = (data or {}).get("relation_type") or "associated-with"
+            row = _row(u, rel)
+            if rel == "is-a":
+                if not is_somatic_infrastructure(node_id) and not is_somatic_infrastructure(u):
+                    children.append(row)
+                else:
+                    related.append(row)
+            elif rel == "part-of":
+                has_parts.append(row)
             elif rel == "composed-of":
-                member_of_schemas.append(row)  # schema claims this
+                member_of_schemas.append(row)
+                part_of.append(row)
             else:
                 related.append(row)
+
         return {
             "id": node_id,
             "parents": parents[:max_each],
             "children": children[:max_each],
-            "related": related[:max_each],
+            "part_of": part_of[:max_each],
+            "has_parts": has_parts[:max_each],
             "member_of_schemas": member_of_schemas[:max_each],
             "schema_members": schema_members[:max_each],
+            "related": related[:max_each],
             "parent_count": len(parents),
             "child_count": len(children),
             "related_count": len(related),
