@@ -882,12 +882,15 @@ class NarrativeModule:
         residual_top: Optional[List[str]] = None,
         event: Optional[str] = None,
         event_detail: str = "",
+        hub_line: Optional[str] = None,
     ) -> Optional[str]:
-        """Append one SoC beat. Optional event= interrupts (goal open/sat/fail)."""
+        """Append one SoC beat. Optional event= interrupts (goal open/sat/fail).
+        hub_line: at most one SELF-hub-derived clause (Identity & Hygiene)."""
         wm_slots = list(wm_slots or [])
         goal_targets = list(goal_targets or [])
         residual_top = list(residual_top or [])
         label = self._stream_label
+        self._pending_hub_line = (hub_line or "").strip() or None
 
         # --- Interrupt beats (goals, etc.) ---
         if event:
@@ -953,6 +956,12 @@ class NarrativeModule:
                 f"The body reads as {climate}",
             ]
             clauses.append(climate_lines[rot % 3])
+
+        # At most one SELF-hub line (Identity & Hygiene)
+        hub = getattr(self, "_pending_hub_line", None)
+        if hub:
+            clauses.append(hub)
+            self._pending_hub_line = None
 
         # Attention / operator flavour (bias/state stand in for last op)
         if focus:

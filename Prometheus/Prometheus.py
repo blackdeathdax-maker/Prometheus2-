@@ -974,6 +974,18 @@ class Prometheus:
                 out.setdefault("felt_places", []).append(v)
             elif rel in (EDGE_ASSOCIATED_WITH, "associated-with") and g.nodes.get(v, {}).get("is_schema"):
                 out["agency"].append(v)
+            elif g.nodes.get(v, {}).get("is_process_tag"):
+                out.setdefault("process_tags", []).append({
+                    "node": v,
+                    "relation": rel,
+                    "op": g.nodes.get(v, {}).get("process_op"),
+                })
+        # Active thread snapshot (identity surface)
+        try:
+            if getattr(self, "active_thread", None) is not None:
+                out["active_thread"] = self.active_thread.report()
+        except Exception:
+            pass
         return out
 
 
@@ -1323,6 +1335,7 @@ class Prometheus:
                     )
             except Exception:
                 pass
+            hub_line = self._hub_stream_line()
             self.self_narrative.record_stream_beat(
                 pulse=self.pulse_count,
                 focus_id=fid,
@@ -1330,6 +1343,7 @@ class Prometheus:
                 basin_key=str(self.synthesizer.get_current_basin_key() or ""),
                 wm_slots=wm_slots,
                 goal_targets=goals,
+                hub_line=hub_line,
                 bias=str(getattr(self.executive, "current_bias", "") or ""),
                 state=str(self.state or ""),
                 residual_top=residual_top,
@@ -3595,6 +3609,11 @@ class Prometheus:
                 )
         except Exception as e:
             logger.debug("active_thread update failed: %s", e)
+        # Process attributes on SELF (rate-limited streaks)
+        try:
+            self._maybe_attach_process_tag(str(dec.operator or ""))
+        except Exception as e:
+            logger.debug("process tag failed: %s", e)
         detail = ""
         op = dec.operator
 
@@ -4031,6 +4050,113 @@ class Prometheus:
             return self.active_thread.report()
         return {}
 
+    def get_module_health_report(self) -> dict:
+        """Which optional modules imported cleanly (Identity & Hygiene)."""
+        names = (
+            "modulators", "felt_anchors", "schema_felt", "executive",
+            "stimulus", "goals", "operators", "active_thread", "self_narrative",
+            "somatic_topo", "long_term_interest",
+        )
+        out = {}
+        for n in names:
+            out[n] = getattr(self, n, None) is not None
+        return out
+
+    def get_consolidation_report(self) -> dict:
+        return dict(getattr(self, "_last_consolidation_report", {}) or {})
+
+    def run_soak_checks(self) -> dict:
+        try:
+            from .soak_checks import run_soak_checks
+            return run_soak_checks(self)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def _hub_stream_line(self) -> Optional[str]:
+        """At most one template clause from SELF hub (body / goal / process)."""
+        try:
+            thr = self.active_thread.thread if getattr(self, "active_thread", None) else None
+            if thr and thr.goal_ids:
+                g0 = thr.goal_ids[0]
+                return f"what matters stays with {g0}"
+            tag = getattr(self, "_last_process_tag", None)
+            if tag:
+                nice = str(tag).replace("process_", "").replace("_", " ")
+                return f"I notice I {nice}"
+            # Elevated body channel if present on report
+            rep = self.get_identity_hub_report()
+            body = rep.get("body") or []
+            best = None
+            best_v = 0.0
+            for b in body:
+                v = float(b.get("value") or 0)
+                if v > best_v:
+                    best_v = v
+                    best = b.get("node")
+            if best and best_v >= 0.65:
+                return f"the body leans high on {best}"
+        except Exception:
+            pass
+        return None
+
+    def _maybe_attach_process_tag(self, operator: str) -> None:
+        """Rate-limited SELF —associated-with→ process tags after streaks."""
+        from .archivist import SELF_NODE
+        op = (operator or "").upper()
+        if op not in ("HOLD", "EXPAND", "SETTLE", "RELEASE"):
+            return
+        ring = []
+        try:
+            ring = list(getattr(self.operators, "_op_ring", []) or [])[-12:]
+        except Exception:
+            return
+        if not ring:
+            return
+        streak = 0
+        for o in reversed(ring):
+            if str(o).upper() == op:
+                streak += 1
+            else:
+                break
+        need = {"HOLD": 5, "EXPAND": 2, "SETTLE": 2, "RELEASE": 2}.get(op, 99)
+        if streak < need:
+            return
+        # Rate limit: one tag per op family per 40 pulses
+        last = getattr(self, "_last_process_tag_pulse", {}) or {}
+        if self.pulse_count - int(last.get(op, -999)) < 40:
+            return
+        tag_id = {
+            "HOLD": "process_held_focus",
+            "EXPAND": "process_explored",
+            "SETTLE": "process_settled",
+            "RELEASE": "process_released",
+        }.get(op)
+        if not tag_id:
+            return
+        g = self.archivist.graph
+        if tag_id not in g:
+            g.add_node(
+                tag_id,
+                source="system",
+                is_process_tag=True,
+                process_op=op,
+                growable=False,
+                activation=0.3,
+            )
+        else:
+            g.nodes[tag_id]["is_process_tag"] = True
+            g.nodes[tag_id]["process_op"] = op
+        try:
+            self.archivist.link(
+                SELF_NODE, tag_id, "associated-with",
+                source="system", placement="explicit",
+            )
+        except Exception:
+            pass
+        last[op] = self.pulse_count
+        self._last_process_tag_pulse = last
+        self._last_process_tag = tag_id
+
     def get_others_report(self) -> dict:
 
         if hasattr(self, "others"):
@@ -4321,6 +4447,33 @@ class Prometheus:
         # individually (see the "No self.save() here" comments in
         # archivist.py, reflector.py, and hormonal.py's step()). This is
         # the one clock persistence is gated to.
+        # Consolidation quality signal (Identity & Hygiene)
+        try:
+            from .edge_types import is_body_channel_node
+            illegal_isa = 0
+            for u, v, ed in self.archivist.graph.edges(data=True):
+                if (ed or {}).get("relation_type") == "is-a":
+                    if is_body_channel_node(u) or is_body_channel_node(v):
+                        illegal_isa += 1
+            if illegal_isa > 0 and hasattr(self.archivist, "repair_identity_edges"):
+                self.archivist.repair_identity_edges()
+            narr_n = sum(1 for n in self.archivist.graph.nodes if str(n).startswith("narr:"))
+            named_ep = sum(
+                1 for n, d in self.archivist.graph.nodes(data=True)
+                if d.get("node_type") in ("epistemic_schema", "schema") and d.get("named")
+            )
+            self._last_consolidation_report = {
+                "pulse": self.pulse_count,
+                "illegal_body_is_a": illegal_isa,
+                "narrative_nodes": narr_n,
+                "named_epistemic": named_ep,
+                "new_epistemic": len(new_epistemic_schemas or []),
+                "repaired_body_isa": illegal_isa > 0,
+            }
+            print(f"Consolidation quality: {self._last_consolidation_report}")
+        except Exception as e:
+            logger.debug("consolidation quality failed: %s", e)
+
         # Full checkpoint — only intentional reset should wipe the mind
         self.save_full_checkpoint()
 
