@@ -334,7 +334,10 @@ class ReflectorModule:
     # ------------------------------------------------------------------
     @staticmethod
     def _is_lemma_like(label: str) -> bool:
-        """True for short concept-like labels; false for sentences/glosses."""
+        """True for short concept-like labels; false for sentences/glosses.
+
+        Body / felt / narr / SELF are anatomy/identity, never human schema titles.
+        """
         if not label or label in (SELF_NODE,):
             return False
         s = str(label).strip()
@@ -348,8 +351,21 @@ class ReflectorModule:
                             "we ", "you ", "this ", "that ", "there ", "because ",
                             "when ", "what ", "how ", "why ")):
             return False
-        if s.startswith("epistemic_") or s.startswith("schema_") or s.startswith("felt_"):
+        if s.startswith(("epistemic_", "schema_", "felt_", "body:", "narr:", "basin_")):
             return False
+        # Bare body-channel names (heart_rate, energy, …) are not knowledge lemmas
+        try:
+            from .edge_types import BODY_CHANNELS, is_body_channel_node, is_forbidden_epistemic_parent
+            if is_body_channel_node(s) or is_forbidden_epistemic_parent(s):
+                return False
+            if low in BODY_CHANNELS or low.replace(" ", "_") in BODY_CHANNELS:
+                return False
+        except Exception:
+            if low in (
+                "heart_rate", "breath", "muscle_tension", "sweat_skin",
+                "gut", "energy", "warmth",
+            ):
+                return False
         # WordNet gloss fingerprints — never human schema titles
         gloss_markers = (
             "consisting of", "characterized by", "used to", "a person who",
@@ -436,8 +452,23 @@ class ReflectorModule:
         return len(contexts)
 
     def _name_candidate(self, members: List[str]) -> Optional[str]:
-        """Best lemma-like member to use as human name, or None."""
-        freq = Counter(m for m in members if self._is_lemma_like(m))
+        """Best lemma-like member to use as human name, or None.
+
+        Never name after body / felt / narr / SELF (anatomy & identity).
+        """
+        try:
+            from .edge_types import is_eligible_epistemic_member, is_forbidden_epistemic_parent
+        except Exception:
+            is_eligible_epistemic_member = lambda n: True
+            is_forbidden_epistemic_parent = lambda n: False
+
+        eligible = [
+            m for m in members
+            if self._is_lemma_like(m)
+            and is_eligible_epistemic_member(m)
+            and not is_forbidden_epistemic_parent(m)
+        ]
+        freq = Counter(eligible)
         if not freq:
             return None
         ranked = sorted(freq.items(), key=lambda t: (-t[1], len(str(t[0]))))
@@ -741,21 +772,39 @@ class ReflectorModule:
 
 
     def scrub_invalid_schema_names(self) -> int:
-        """Un-name epistemic schemas whose title fails lemma-like checks.
+        """Un-name epistemic schemas whose title fails lemma-like checks
+        or is anatomy/identity (body channel, felt, narr, SELF).
         Gloss stays in definition if missing."""
         graph = self.archivist.graph
         scrubbed = 0
+        try:
+            from .edge_types import is_body_channel_node, is_forbidden_epistemic_parent
+        except Exception:
+            is_body_channel_node = lambda n: str(n).startswith("body:")
+            is_forbidden_epistemic_parent = lambda n: str(n).startswith(
+                ("body:", "felt:", "narr:", "basin_")
+            )
         for node, data in list(graph.nodes(data=True)):
             if data.get("node_type") != NODE_EPISTEMIC_SCHEMA:
                 continue
             if not data.get("named"):
                 continue
             name = data.get("name")
-            if name and self._is_lemma_like(str(name)):
+            if not name:
+                data["named"] = False
+                scrubbed += 1
+                continue
+            name_s = str(name)
+            illegal_name = (
+                not self._is_lemma_like(name_s)
+                or is_body_channel_node(name_s)
+                or is_forbidden_epistemic_parent(name_s)
+            )
+            if not illegal_name:
                 continue
             # Demote to unnamed; preserve text as definition
-            if name and not data.get("definition"):
-                data["definition"] = name
+            if not data.get("definition"):
+                data["definition"] = name_s
             data["name"] = None
             data["named"] = False
             scrubbed += 1
