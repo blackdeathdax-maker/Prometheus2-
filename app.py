@@ -231,6 +231,7 @@ if st.session_state.prom is not None:
                                 f"children {nb.get('child_count', 0)} · "
                                 f"related {nb.get('related_count', 0)} (showing up to 15 each)"
                             )
+                            # True taxonomic is-a only
                             if nb.get("parents"):
                                 st.markdown("**Parents (this is-a …)**")
                                 for row in nb["parents"]:
@@ -239,6 +240,17 @@ if st.session_state.prom is not None:
                             if nb.get("children"):
                                 st.markdown("**Children (… is-a this)**")
                                 for row in nb["children"]:
+                                    nm = row.get("name") or row["id"]
+                                    st.write(f"- `{row['id']}` ({nm}) · {row.get('relation')}")
+                            # Membership / anatomy — never labeled is-a
+                            if nb.get("part_of"):
+                                st.markdown("**Part of (part-of / composed-of whole)**")
+                                for row in nb["part_of"]:
+                                    nm = row.get("name") or row["id"]
+                                    st.write(f"- `{row['id']}` ({nm}) · {row.get('relation')}")
+                            if nb.get("has_parts"):
+                                st.markdown("**Has parts (composed-of / reverse part-of)**")
+                                for row in nb["has_parts"]:
                                     nm = row.get("name") or row["id"]
                                     st.write(f"- `{row['id']}` ({nm}) · {row.get('relation')}")
                             if nb.get("member_of_schemas"):
@@ -256,7 +268,12 @@ if st.session_state.prom is not None:
                                 for row in nb["related"]:
                                     nm = row.get("name") or row["id"]
                                     st.write(f"- `{row['id']}` ({nm}) · {row.get('relation')}")
-                            if not (nb.get("parents") or nb.get("children") or nb.get("related")):
+                            if not any([
+                                nb.get("parents"), nb.get("children"),
+                                nb.get("part_of"), nb.get("has_parts"),
+                                nb.get("member_of_schemas"), nb.get("schema_members"),
+                                nb.get("related"),
+                            ]):
                                 st.caption("No edges yet.")
                 if st.session_state.get("graph_pin_id"):
                     st.info(f"Pinned for attention: `{st.session_state['graph_pin_id']}`")
@@ -500,10 +517,37 @@ if st.session_state.prom is not None:
                         "clustering is correctly skipped as redundant)."
                     )
 
+            st.subheader("Active Thread")
+            st.caption(
+                "Short-horizon now: focus, goals, derived intent, body prediction error. "
+                "In-memory only (persistence later with live head)."
+            )
+            try:
+                atr = prom.get_active_thread_report() if hasattr(prom, "get_active_thread_report") else {}
+            except Exception as e:
+                atr = {"error": str(e)}
+            if atr and not atr.get("error"):
+                ac1, ac2, ac3 = st.columns(3)
+                with ac1:
+                    st.metric("Intent", atr.get("intent") or "—")
+                with ac2:
+                    st.metric("|body_error|", atr.get("max_abs_body_error") or 0)
+                with ac3:
+                    st.metric("Age (pulses)", atr.get("age") or 0)
+                st.caption(
+                    f"focus=`{atr.get('focus_id')}` · goals={atr.get('goal_ids')} · "
+                    f"barren={atr.get('barren_focus')} · {atr.get('note')}"
+                )
+                if atr.get("last_ops"):
+                    st.caption("last ops: " + " → ".join(str(x) for x in atr.get("last_ops")[-8:]))
+            else:
+                st.caption("Active Thread not available on this build.")
+
             st.subheader("Goals / Commitments")
             st.caption(
                 "Explicit commitments opened by focus dwell. Schema goals track "
-                "member/nested growth; node goals track residual cool-down."
+                "member/nested growth; node goals track residual cool-down. "
+                "REGULATE + high body_error soft-delays satisfy."
             )
             try:
                 gr = prom.get_goals_report() if hasattr(prom, "get_goals_report") else {"active": [], "recent_history": []}
