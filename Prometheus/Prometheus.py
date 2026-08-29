@@ -2583,14 +2583,26 @@ class Prometheus:
         if sets.get("focus_id") and node_id == sets["focus_id"]:
             w *= 2.5
 
-        # Pure dictionary leaf with no importance floor: soft demotion
+        # Pure dictionary leaf with no importance floor: soft demotion;
+        # hard-skip weight in Childhood (pedagogy must not roam WordNet).
         src = nd.get("source", "")
-        if src == "dictionary" and node_id not in sets.get("goal", ()) \
-                and node_id not in sets.get("narrative", ()) \
-                and node_id not in sets.get("user", ()) \
-                and node_id not in sets.get("wm", ()) \
-                and node_id not in sets.get("focus_local", ()):
-            w *= 0.35
+        pure_dict = (
+            src == "dictionary"
+            and node_id not in sets.get("goal", ())
+            and node_id not in sets.get("narrative", ())
+            and node_id not in sets.get("user", ())
+            and node_id not in sets.get("wm", ())
+            and node_id not in sets.get("focus_local", ())
+        )
+        if pure_dict:
+            try:
+                epoch = str(getattr(self.bio.epoch, "value", "") or "")
+            except Exception:
+                epoch = ""
+            if epoch == "Childhood":
+                w *= 0.02  # hard skip in practice
+            else:
+                w *= 0.35
 
         try:
             if hasattr(self, "long_term_interest"):

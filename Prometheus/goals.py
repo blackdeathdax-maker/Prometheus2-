@@ -101,6 +101,27 @@ class GoalModule:
         self._on_event = None  # optional callable(event, target, detail, pulse)
         self.load()
 
+    @staticmethod
+    def _looks_like_sentence(label: str) -> bool:
+        """True for full-sentence / gloss focus — not a commitment target."""
+        if not label:
+            return True
+        s = str(label).strip()
+        if s.startswith(("epistemic_", "narr:", "body:", "felt:", "schema_")):
+            return False  # structural ids OK
+        words = s.replace("_", " ").split()
+        if len(words) >= 6:
+            return True
+        if len(s) > 48:
+            return True
+        low = s.casefold()
+        if any(low.startswith(p) for p in (
+            "when i ", "i feel ", "i want ", "tell me ", "fear is ",
+            "it was ", "there is ", "because ",
+        )):
+            return True
+        return False
+
     def _gid(self, target_id: str) -> str:
         # Collapse lemma / epistemic twin into one commitment key
         t = str(target_id or "")
@@ -255,6 +276,9 @@ class GoalModule:
         if self._dwell[focus_id] < self.COMMIT_AFTER_PULSES:
             return
         if focus_id in (None, "SELF", "OTHER"):
+            return
+        # Never open commitment on sentence-like focus (narrative quality)
+        if self._looks_like_sentence(focus_id):
             return
 
         gid = self._gid(focus_id)

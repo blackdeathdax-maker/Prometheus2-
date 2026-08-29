@@ -76,13 +76,15 @@ class ActiveThreadModule:
         goals = list(goal_ids or [])
 
         if focus_id or goals:
-            if t.focus_id != focus_id and focus_id:
-                if t.opened_pulse == 0 or t.focus_id is None:
-                    t.opened_pulse = pulse
+            # Reset age clock on real focus change (soak fix)
+            if focus_id and focus_id != t.focus_id:
+                t.opened_pulse = pulse
                 t.age = 0
+            elif t.opened_pulse == 0:
+                t.opened_pulse = pulse
             t.focus_id = focus_id
             t.goal_ids = goals
-            t.age = (pulse - t.opened_pulse) if t.opened_pulse else 0
+            t.age = max(0, pulse - int(t.opened_pulse or pulse))
             self._idle_pulses = 0
         else:
             self._idle_pulses += 1

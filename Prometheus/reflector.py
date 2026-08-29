@@ -42,7 +42,7 @@ AFFINITY_THRESHOLD = 2.5          # min weighted score to keep a pair in cluster
 AFFINITY_SHARED_PARENT = 1.5      # bonus if nodes share an is-a parent
 AFFINITY_DIRECT_IS_A = 2.0        # one is-a the other
 AFFINITY_PART_OF = 1.2
-AFFINITY_ASSOCIATED = 0.25        # bare co-occurrence placement — weak
+AFFINITY_ASSOCIATED = 0.45        # residual associated-with as schema fuel (High Continuity)
 AFFINITY_CAUSAL = 0.4             # thematic, not kind
 AFFINITY_SOCIAL = 0.15
 AFFINITY_COACT_SCALE = 0.35       # per stabilized co-activation count unit
@@ -134,6 +134,8 @@ class ReflectorModule:
         # numerically tuned" placeholder as everywhere else (§10).
         self.SCHEMA_STABILIZATION_THRESHOLD = SCHEMA_STABILIZATION_THRESHOLD
         self.EPISTEMIC_MIN_CLUSTER_SIZE = EPISTEMIC_MIN_CLUSTER_SIZE
+        # Soft ceiling for meta-schema stacking (Life>plant>tree>… later).
+        self.MAX_ABSTRACTION_LEVEL = 3
         self.EPISTEMIC_NAME_MIN_COVERAGE = EPISTEMIC_NAME_MIN_COVERAGE
         self.EPISTEMIC_MIN_COHERENCE = EPISTEMIC_MIN_COHERENCE
         self.EPISTEMIC_MIN_LEMMA_RATIO = EPISTEMIC_MIN_LEMMA_RATIO
@@ -1664,8 +1666,10 @@ class ReflectorModule:
         if not levels:
             return []
         new_level = max(levels) + 1
-        # Cap stacking depth to avoid runaway towers in early runs
-        if new_level > 4:
+        # Soft ceiling (tunable). Default 3 for stability; raise toward
+        # Life>plant>tree>oak>red-oak depth when hierarchy is solid.
+        max_abs = int(getattr(self, "MAX_ABSTRACTION_LEVEL", 3) or 3)
+        if new_level > max_abs:
             return []
 
         if dominant_parent:

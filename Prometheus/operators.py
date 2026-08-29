@@ -579,6 +579,20 @@ class OperatorModule:
                 scores["EXPAND"] = max(scores["EXPAND"], 3.0)
             scores["HOLD"] *= 0.9
 
+        # Anti-HOLD-lock: after 6 HOLDs with LEARN/EXPLORE, allow one EXPAND
+        if (
+            hold_streak >= 6
+            and intent in ("LEARN", "EXPLORE")
+            and lookup_budget_ok
+            and not barren_focus
+            and not force_return
+            and intent != "HOLD"
+        ):
+            force_expand = True
+            force_hold = False
+            scores["EXPAND"] = max(scores["EXPAND"], 3.8)
+            scores["HOLD"] *= 0.55
+
         # Hard forces
         if force_return:
             scores["RETURN"] = max(scores["RETURN"], 5.0)
