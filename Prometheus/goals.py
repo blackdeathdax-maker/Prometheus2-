@@ -88,6 +88,10 @@ class GoalModule:
     RESIDUAL_BOOST = 1.8
     CLOSURE_BOOST_SCALE = 0.55
     HISTORY_CAP = 40
+    # Cognitive Continuity: REGULATE + high body_error soft-delays satisfy
+    BODY_ERROR_DELAY_THRESHOLD = 0.18
+    REGULATE_DELAY_PULSES = 20          # extra dwell required while regulating
+    REGULATE_TIMEOUT_PULSES = 120       # never stick forever
 
     def __init__(self):
         self.active: Dict[str, Commitment] = {}
@@ -338,8 +342,12 @@ class GoalModule:
         stagnation: bool = False,
         force_switch: bool = False,
         graph=None,
+        thread_intent: str = "",
+        max_body_error: float = 0.0,
     ) -> Dict:
         satisfied = failed = 0
+        intent = (thread_intent or "").upper()
+        body_err = float(max_body_error or 0.0)
         for gid, g in list(self.active.items()):
             g.last_pulse = pulse
             on_focus = focus_id == g.target_id
@@ -423,6 +431,18 @@ class GoalModule:
                 can_close = grew if g.is_schema_goal else (cooled or grew)
                 if g.is_schema_goal and cooled and not grew:
                     can_close = False  # stay open until real members
+                # Cognitive Continuity: REGULATE + high body_error → soft delay
+                # (timeout so goals cannot stick forever)
+                age = max(0, pulse - int(g.created_pulse or pulse))
+                if (
+                    can_close
+                    and intent == "REGULATE"
+                    and body_err >= self.BODY_ERROR_DELAY_THRESHOLD
+                    and age < self.REGULATE_TIMEOUT_PULSES
+                ):
+                    # Require extra dwell while regulating under body error
+                    if g.dwell_pulses < self.SATISFY_MIN_DWELL + self.REGULATE_DELAY_PULSES:
+                        can_close = False
                 if can_close:
                     reason = []
                     if cooled and not g.is_schema_goal:
@@ -436,6 +456,8 @@ class GoalModule:
                                 g.growth_events,
                             )
                         )
+                    if intent == "REGULATE" and body_err >= self.BODY_ERROR_DELAY_THRESHOLD:
+                        reason.append("regulate_timeout_or_cooled")
                     self._close(
                         g, status="satisfied", pulse=pulse,
                         reason="+".join(reason) or "satisfied",

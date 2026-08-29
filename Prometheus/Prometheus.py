@@ -34,6 +34,10 @@ try:
     from .operators import OperatorModule
 except ImportError:
     OperatorModule = None
+try:
+    from .active_thread import ActiveThreadModule
+except ImportError:
+    ActiveThreadModule = None
 
 
 
@@ -240,6 +244,7 @@ class Prometheus:
         self.others = OthersRegistry(self.archivist) if OthersRegistry is not None else None
         self.goals = GoalModule() if GoalModule is not None else None
         self.operators = OperatorModule() if OperatorModule is not None else None
+        self.active_thread = ActiveThreadModule() if ActiveThreadModule is not None else None
 
         # --- Learning policy (phase / inhibition / valence / lookup budgets) ---
         self.DICT_LOOKUPS_PER_PULSE = 6
@@ -1213,6 +1218,10 @@ class Prometheus:
                 fid = self.focus.focus_id
                 self.goals.observe_focus(fid, self.pulse_count, graph=self.archivist.graph)
                 fs = self.last_focus_summary or {}
+                # Thread intent / body_error may lag one pulse (operators run later);
+                # still pass best-known values for REGULATE soft-delay.
+                _thr = getattr(self, "active_thread", None)
+                _tr = _thr.thread if _thr is not None else None
                 summary = self.goals.tick(
                     pulse=self.pulse_count,
                     focus_id=fid,
@@ -1220,6 +1229,8 @@ class Prometheus:
                     stagnation=bool(fs.get("stagnation_escape")),
                     force_switch=bool(fs.get("force_switch") or fs.get("hard_age_escape")),
                     graph=self.archivist.graph,
+                    thread_intent=getattr(_tr, "intent", "") if _tr else "",
+                    max_body_error=float(getattr(_tr, "max_abs_body_error", 0) or 0) if _tr else 0.0,
                 )
                 # Inject commitment residual into focus store (target + schema closure)
                 graph = self.archivist.graph
@@ -3503,6 +3514,31 @@ class Prometheus:
             body_for_pred = dict(self.bio.get_raw_variables() or {})
         except Exception:
             body_for_pred = {}
+        barren_focus = False
+        try:
+            if fid and fid in getattr(self, "_barren_self_study_targets", set()):
+                barren_focus = True
+            # Escape: WM / goal / pin override barren
+            if barren_focus:
+                if fid in wm_slots or fid in goals:
+                    barren_focus = False
+                pin = None
+                try:
+                    pin = getattr(self.focus, "focus_id", None)
+                except Exception:
+                    pass
+                # user-linked nodes may retry
+                nd = graph.nodes.get(fid, {}) or {}
+                if nd.get("source") == "user" or nd.get("user_linked") or nd.get("pedagogical"):
+                    barren_focus = False
+        except Exception:
+            barren_focus = False
+        thread_intent = ""
+        try:
+            if getattr(self, "active_thread", None) is not None:
+                thread_intent = str(self.active_thread.thread.intent or "")
+        except Exception:
+            pass
         dec = self.operators.choose(
             graph=graph,
             focus_id=fid,
@@ -3516,7 +3552,37 @@ class Prometheus:
             parent_open=parent_open,
             goal_strength=goal_strength,
             body=body_for_pred,
+            thread_intent=thread_intent,
+            barren_focus=barren_focus,
         )
+        # Refresh Active Thread from this decision's prediction
+        try:
+            if getattr(self, "active_thread", None) is not None:
+                pred = getattr(dec, "predict", None)
+                body_err = {}
+                body_exp = {}
+                if pred is not None:
+                    body_exp = dict(getattr(pred, "expected_body", None) or {})
+                    obs = dict(getattr(pred, "observed_body", None) or {})
+                    # signed error per channel when both present
+                    for ch, exp_v in body_exp.items():
+                        if ch in obs:
+                            body_err[ch] = float(obs[ch]) - float(exp_v)
+                    if not body_err and getattr(pred, "signed_body_error", None) is not None:
+                        body_err["_mean"] = float(pred.signed_body_error)
+                self.active_thread.update(
+                    pulse=self.pulse_count,
+                    focus_id=fid,
+                    goal_ids=goals,
+                    body_expect=body_exp,
+                    body_error=body_err,
+                    last_op=str(dec.operator or ""),
+                    barren_focus=barren_focus,
+                    bias=bias,
+                    lookup_budget_ok=lookup_ok,
+                )
+        except Exception as e:
+            logger.debug("active_thread update failed: %s", e)
         detail = ""
         op = dec.operator
 
@@ -3946,6 +4012,11 @@ class Prometheus:
     def get_goals_report(self) -> dict:
         if getattr(self, "goals", None) is not None:
             return self.goals.report()
+        return {}
+
+    def get_active_thread_report(self) -> dict:
+        if getattr(self, "active_thread", None) is not None:
+            return self.active_thread.report()
         return {}
 
     def get_others_report(self) -> dict:

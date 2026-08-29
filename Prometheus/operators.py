@@ -421,6 +421,8 @@ class OperatorModule:
         parent_open: bool = False,
         goal_strength: float = 1.0,
         body: Optional[Dict[str, float]] = None,
+        thread_intent: str = "",
+        barren_focus: bool = False,
     ) -> OperatorDecision:
         pred = self.predict(
             graph, focus_id, goal_targets, wm_slots, residual_top, body=body
@@ -532,7 +534,7 @@ class OperatorModule:
         if fatigue > 0.55:
             scores["SETTLE"] = max(scores["SETTLE"], 1.0)
 
-        # ---- Interoceptive regulation bias (new) ----
+        # ---- Interoceptive regulation bias ----
         # High body error on regulation-relevant channels → prefer SETTLE / RELEASE
         if pred.body_error > 0.18 and not pred.body_match:
             reg_elevated = False
@@ -548,11 +550,40 @@ class OperatorModule:
                 scores["HOLD"] *= 0.75
                 scores["EXPAND"] *= 0.6
 
+        # ---- Active Thread intent + barren focus (Cognitive Continuity) ----
+        intent = (thread_intent or "").upper()
+        if barren_focus or intent == "HOLD":
+            # Stop barren EXPAND streaks; HOLD or RETURN only
+            force_hold = True
+            force_expand = False
+            scores["EXPAND"] *= 0.08
+            scores["HOLD"] = max(scores["HOLD"], 4.2)
+            if intent == "HOLD":
+                note_barren = "thread_hold"
+            else:
+                note_barren = "barren_focus"
+        else:
+            note_barren = ""
+        if intent == "REGULATE":
+            scores["SETTLE"] = max(scores["SETTLE"], 3.0)
+            scores["RELEASE"] = max(scores["RELEASE"], 2.2)
+            scores["EXPAND"] *= 0.25
+            scores["HOLD"] *= 0.85
+            force_expand = False
+        elif intent == "LEARN":
+            if lookup_budget_ok and not barren_focus:
+                scores["EXPAND"] = max(scores["EXPAND"], 2.6)
+            scores["HOLD"] = max(scores["HOLD"], 1.5)
+        elif intent == "EXPLORE":
+            if lookup_budget_ok and not barren_focus:
+                scores["EXPAND"] = max(scores["EXPAND"], 3.0)
+            scores["HOLD"] *= 0.9
+
         # Hard forces
         if force_return:
             scores["RETURN"] = max(scores["RETURN"], 5.0)
             scores["EXPAND"] *= 0.2
-        if force_expand and not force_return:
+        if force_expand and not force_return and not barren_focus:
             scores["EXPAND"] = max(scores["EXPAND"], 4.0)
             scores["HOLD"] *= 0.5
         if force_hold and not force_return and not force_expand:
@@ -573,6 +604,10 @@ class OperatorModule:
             note_parts.append("force_expand")
         if force_hold:
             note_parts.append("force_hold")
+        if note_barren:
+            note_parts.append(note_barren)
+        if intent:
+            note_parts.append(f"intent={intent}")
 
         dec = OperatorDecision(
             operator=op,
