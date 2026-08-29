@@ -517,6 +517,36 @@ if st.session_state.prom is not None:
                         "clustering is correctly skipped as redundant)."
                     )
 
+            st.subheader("Identity / SELF")
+            st.caption("Body parts, felt, narrative parts, process tags — unified hub surface.")
+            try:
+                idr = prom.get_identity_hub_report() if hasattr(prom, "get_identity_hub_report") else {}
+            except Exception as e:
+                idr = {"error": str(e)}
+            if idr and not idr.get("error"):
+                felt = idr.get("felt") or {}
+                st.caption(
+                    f"felt={felt.get('label') or '—'} · "
+                    f"A={felt.get('arousal')} V={felt.get('valence')} D={felt.get('dominance')}"
+                )
+                body = idr.get("body") or []
+                if body:
+                    st.write("**Body**")
+                    for b in body[:8]:
+                        st.write(f"- `{b.get('node')}` val={b.get('value')} · {b.get('relation')}")
+                narr = idr.get("narrative_parts") or []
+                if narr:
+                    st.write("**Narrative parts**")
+                    for n in narr[:6]:
+                        st.write(f"- `{n.get('node')}` w={n.get('weight')}")
+                tags = idr.get("process_tags") or []
+                if tags:
+                    st.write("**Process**")
+                    for t in tags[:6]:
+                        st.write(f"- `{t.get('node')}` ({t.get('op')})")
+            else:
+                st.caption("Identity hub report unavailable.")
+
             st.subheader("Active Thread")
             st.caption(
                 "Short-horizon now: focus, goals, derived intent, body prediction error. "
@@ -576,6 +606,28 @@ if st.session_state.prom is not None:
                             f"- `{h.get('target_id')}` → **{h.get('status')}** "
                             f"({h.get('reason')}) @ pulse {h.get('pulse')}"
                         )
+
+            with st.expander("Soak checks / consolidation quality"):
+                if st.button("Run soak checks", key="soak_btn"):
+                    try:
+                        sc = prom.run_soak_checks() if hasattr(prom, "run_soak_checks") else {}
+                        st.json(sc)
+                    except Exception as e:
+                        st.error(str(e))
+                try:
+                    cr = prom.get_consolidation_report() if hasattr(prom, "get_consolidation_report") else {}
+                    if cr:
+                        st.caption("Last consolidation")
+                        st.json(cr)
+                except Exception:
+                    pass
+                try:
+                    mh = prom.get_module_health_report() if hasattr(prom, "get_module_health_report") else {}
+                    if mh:
+                        missing = [k for k, v in mh.items() if not v]
+                        st.caption("Modules OK" if not missing else f"Missing: {missing}")
+                except Exception:
+                    pass
 
             st.subheader("Directed Working Memory (§14, new)")
             st.caption(
