@@ -38,7 +38,10 @@ try:
     from .active_thread import ActiveThreadModule
 except ImportError:
     ActiveThreadModule = None
-
+try:
+    from .allostasis import AllostasisModule
+except ImportError:
+    AllostasisModule = None
 
 
 logger = logging.getLogger(__name__)
@@ -245,6 +248,7 @@ class Prometheus:
         self.goals = GoalModule() if GoalModule is not None else None
         self.operators = OperatorModule() if OperatorModule is not None else None
         self.active_thread = ActiveThreadModule() if ActiveThreadModule is not None else None
+        self.allostasis = AllostasisModule() if AllostasisModule is not None else None
 
         # --- Learning policy (phase / inhibition / valence / lookup budgets) ---
         self.DICT_LOOKUPS_PER_PULSE = 6
@@ -1136,6 +1140,67 @@ class Prometheus:
             self.synthesizer.get_current_basin_key(),
             raw_body=body,
         )
+        # Allostasis & Affect: adaptive set-points + pain/pleasure caps
+        try:
+            if getattr(self, "allostasis", None) is not None:
+                _intent = ""
+                _goals_on = False
+                try:
+                    if self.active_thread is not None:
+                        _intent = str(self.active_thread.thread.intent or "")
+                        _goals_on = bool(self.active_thread.thread.goal_ids)
+                except Exception:
+                    pass
+                if not _goals_on and getattr(self, "goals", None) is not None:
+                    try:
+                        _goals_on = bool(self.goals.active_target_ids())
+                    except Exception:
+                        pass
+                ep = ""
+                try:
+                    ep = str(self.bio.epoch.value)
+                except Exception:
+                    pass
+                fat = float(getattr(self, "fatigue", 0) or 0)
+                self.allostasis.compute_setpoints(
+                    intent=_intent, has_goals=_goals_on, epoch=ep, fatigue=fat,
+                )
+                _bmax = 0.0
+                try:
+                    if self.active_thread is not None:
+                        _bmax = float(self.active_thread.thread.max_abs_body_error or 0)
+                except Exception:
+                    pass
+                _conflict = 0.0
+                try:
+                    if hasattr(self.synthesizer, "get_conflict_score"):
+                        _conflict = float(self.synthesizer.get_conflict_score() or 0)
+                except Exception:
+                    pass
+                _barren = False
+                try:
+                    fid0 = getattr(self.focus, "focus_id", None)
+                    if fid0 and fid0 in getattr(self, "_barren_self_study_targets", set()):
+                        _barren = True
+                except Exception:
+                    pass
+                _last_op = ""
+                try:
+                    dec0 = getattr(self.operators, "last_decision", None)
+                    if dec0 is not None:
+                        _last_op = str(getattr(dec0, "operator", "") or "")
+                except Exception:
+                    pass
+                self.allostasis.update_affect(
+                    body,
+                    body_error_max=_bmax,
+                    barren_focus=_barren,
+                    conflict=_conflict,
+                    last_op=_last_op,
+                )
+                self._last_body_surface = dict(body)
+        except Exception as e:
+            logger.debug("allostasis update failed: %s", e)
         # Pre-linguistic self-awareness: SELF is always bound to how the
         # body feels right now (infants have this without words).
         try:
@@ -1270,6 +1335,30 @@ class Prometheus:
                         pass
                 if summary.get("satisfied_this_tick") or summary.get("failed_this_tick"):
                     print(f"Goals: {summary}")
+                # Allostatic safety: extreme pain can release weakest off-focus goal
+                try:
+                    if getattr(self, "allostasis", None) is not None and self.goals is not None:
+                        nesc = self.goals.allostatic_escape_close(
+                            self.pulse_count,
+                            pain=float(self.allostasis.state.pain or 0),
+                        )
+                        if nesc:
+                            print(f"Goals: allostatic_escape closed {nesc}")
+                except Exception:
+                    pass
+                # Pleasure pulse on growth satisfaction
+                try:
+                    if (
+                        getattr(self, "allostasis", None) is not None
+                        and summary.get("satisfied_this_tick")
+                    ):
+                        self.allostasis.update_affect(
+                            getattr(self, "_last_body_surface", {}) or {"pain": self.allostasis.state.pain, "pleasure": self.allostasis.state.pleasure},
+                            goal_growth=True,
+                            last_op="",
+                        )
+                except Exception:
+                    pass
                 # Narrative beats for newly closed goals
                 try:
                     for h in (self.goals.history or [])[-3:]:
@@ -3565,6 +3654,18 @@ class Prometheus:
                 thread_intent = str(self.active_thread.thread.intent or "")
         except Exception:
             pass
+        _pain = 0.0
+        _pleasure = 0.0
+        _escape = ""
+        try:
+            if getattr(self, "allostasis", None) is not None:
+                _pain = float(self.allostasis.state.pain or 0)
+                _pleasure = float(self.allostasis.state.pleasure or 0)
+                _escape = str(self.allostasis.state.last_escape or "")
+                body_for_pred["pain"] = _pain
+                body_for_pred["pleasure"] = _pleasure
+        except Exception:
+            pass
         dec = self.operators.choose(
             graph=graph,
             focus_id=fid,
@@ -3580,6 +3681,9 @@ class Prometheus:
             body=body_for_pred,
             thread_intent=thread_intent,
             barren_focus=barren_focus,
+            pain=_pain,
+            pleasure=_pleasure,
+            allostatic_escape=_escape,
         )
         # Refresh Active Thread from this decision's prediction
         try:
@@ -3596,6 +3700,13 @@ class Prometheus:
                             body_err[ch] = float(obs[ch]) - float(exp_v)
                     if not body_err and getattr(pred, "signed_body_error", None) is not None:
                         body_err["_mean"] = float(pred.signed_body_error)
+                if getattr(self, "allostasis", None) is not None:
+                    body_exp = dict(body_exp)
+                    body_exp["_pain_level"] = float(self.allostasis.state.pain or 0)
+                    # Merge allostatic channel errors when present
+                    for ch, ev in (self.allostasis.state.error or {}).items():
+                        if ch not in body_err:
+                            body_err[ch] = float(ev)
                 self.active_thread.update(
                     pulse=self.pulse_count,
                     focus_id=fid,
@@ -4048,6 +4159,11 @@ class Prometheus:
     def get_active_thread_report(self) -> dict:
         if getattr(self, "active_thread", None) is not None:
             return self.active_thread.report()
+        return {}
+
+    def get_allostasis_report(self) -> dict:
+        if getattr(self, "allostasis", None) is not None:
+            return self.allostasis.report()
         return {}
 
     def get_module_health_report(self) -> dict:

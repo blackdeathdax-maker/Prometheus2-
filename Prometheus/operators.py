@@ -31,10 +31,14 @@ BODY_CHANNELS = (
     "gut",
     "energy",
     "warmth",
+    "pain",
+    "pleasure",
 )
 
 # Channels whose elevation is especially relevant for regulation policies
-REGULATION_CHANNELS = frozenset({"muscle_tension", "sweat_skin", "gut", "heart_rate"})
+REGULATION_CHANNELS = frozenset({
+    "muscle_tension", "sweat_skin", "gut", "heart_rate", "pain",
+})
 
 
 @dataclass
@@ -423,6 +427,9 @@ class OperatorModule:
         body: Optional[Dict[str, float]] = None,
         thread_intent: str = "",
         barren_focus: bool = False,
+        pain: float = 0.0,
+        pleasure: float = 0.0,
+        allostatic_escape: str = "",
     ) -> OperatorDecision:
         pred = self.predict(
             graph, focus_id, goal_targets, wm_slots, residual_top, body=body
@@ -592,6 +599,30 @@ class OperatorModule:
             force_hold = False
             scores["EXPAND"] = max(scores["EXPAND"], 3.8)
             scores["HOLD"] *= 0.55
+
+        # Allostasis & Affect — pain/pleasure policy (mild; caps elsewhere)
+        pn = float(pain or 0.0)
+        pl = float(pleasure or 0.0)
+        if pn >= 0.55:
+            scores["SETTLE"] = max(scores["SETTLE"], 3.2)
+            scores["RELEASE"] = max(scores["RELEASE"], 2.4)
+            scores["EXPAND"] *= 0.35
+            force_expand = False
+        if pl >= 0.55 and not barren_focus and lookup_budget_ok:
+            # Mild EXPAND bias only (pleasure addiction guard)
+            scores["EXPAND"] = max(scores["EXPAND"], 2.4)
+            scores["HOLD"] = max(scores["HOLD"], 1.2)
+        if allostatic_escape == "op_diversity":
+            # Break pure SETTLE lock under pain
+            scores["HOLD"] = max(scores["HOLD"], 3.5)
+            scores["RETURN"] = max(scores["RETURN"], 2.0)
+            scores["SETTLE"] *= 0.4
+            force_hold = True
+            force_expand = False
+        if allostatic_escape == "time_clamp":
+            scores["SETTLE"] = max(scores["SETTLE"], 3.5)
+            scores["RELEASE"] = max(scores["RELEASE"], 3.0)
+            scores["EXPAND"] *= 0.2
 
         # Hard forces
         if force_return:

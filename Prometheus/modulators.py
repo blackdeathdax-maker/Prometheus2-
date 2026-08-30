@@ -180,6 +180,8 @@ class FastModulators:
             "gut": 0.48 * a - 0.18 * t + 0.12 * s + 0.30 * c,
             "energy": 0.40 * s + 0.30 * e - 0.18 * a - 0.12 * c,
             "warmth": 0.38 * t + 0.24 * e - 0.18 * a - 0.12 * c,
+            "pain": 0.55 * a + 0.35 * c - 0.25 * t + 0.15 * s,
+            "pleasure": 0.40 * e + 0.30 * t + 0.20 * s - 0.25 * a - 0.20 * c,
         }
         # center around 0 and cap magnitude
         out = {}

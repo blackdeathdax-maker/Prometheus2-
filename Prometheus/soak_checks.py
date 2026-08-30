@@ -69,4 +69,17 @@ def run_soak_checks(prom) -> Dict[str, Any]:
     has_id = hasattr(prom, "get_identity_hub_report")
     add("identity_hub_api", has_id, "")
 
+    # Allostasis affect channels present + not stuck at ceiling
+    try:
+        if hasattr(prom, "get_allostasis_report"):
+            ar = prom.get_allostasis_report() or {}
+            p = float(ar.get("pain") or 0)
+            pl = float(ar.get("pleasure") or 0)
+            add("affect_in_range", 0.0 <= p <= 1.0 and 0.0 <= pl <= 1.0, f"pain={p} pleasure={pl}")
+            add("pain_not_stuck_ceiling", p < 0.99, f"pain={p}")
+        else:
+            add("allostasis_api", False, "missing")
+    except Exception as e:
+        add("allostasis_api", False, str(e))
+
     return out

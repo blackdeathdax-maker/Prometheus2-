@@ -522,6 +522,20 @@ class GoalModule:
             "targets": [g.target_id for g in self.active.values()],
         }
 
+    def allostatic_escape_close(self, pulse: int, pain: float = 0.0) -> int:
+        """Close weakest off-focus goal under extreme sustained pain (safety)."""
+        if pain < 0.90 or not self.active:
+            return 0
+        candidates = [
+            g for g in self.active.values()
+            if int(getattr(g, "off_focus_pulses", 0) or 0) >= 8
+        ]
+        if not candidates:
+            return 0
+        weakest = min(candidates, key=lambda c: c.strength)
+        self._close(weakest, status="failed", pulse=pulse, reason="allostatic_escape")
+        return 1
+
     def _close(self, g: Commitment, status: str, pulse: int, reason: str) -> None:
         g.status = status
         if status == "satisfied":

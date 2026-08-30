@@ -117,16 +117,20 @@ class ActiveThreadModule:
         bias: str = "",
         lookup_budget_ok: bool = True,
     ) -> str:
-        # 1) Body regulation dominates when error is high on regulation channels
+        # 1) Body regulation / allostatic pain dominates
         reg_err = 0.0
         for ch, err in (t.body_error or {}).items():
-            if ch in REGULATION_CHANNELS:
+            if ch in REGULATION_CHANNELS or ch in ("pain",):
                 reg_err = max(reg_err, abs(float(err)))
         if reg_err >= self.BODY_ERROR_REGULATE:
             t.note = "body_error_regulate"
             return "REGULATE"
         if t.max_abs_body_error >= self.BODY_ERROR_REGULATE:
             t.note = "body_error_global"
+            return "REGULATE"
+        pain_lvl = float((t.body_expect or {}).get("_pain_level", 0) or 0)
+        if pain_lvl >= 0.55:
+            t.note = "pain_regulate"
             return "REGULATE"
 
         # 2) Barren focus → HOLD (don't EXPAND again)

@@ -154,7 +154,7 @@ class BioSystem:
 
         Channels (0..1-ish):
           heart_rate, breath, muscle_tension, sweat_skin, gut,
-          energy, warmth
+          energy, warmth, pain, pleasure
         """
         h = self._hormones
         adr = h["adrenaline"]
@@ -180,6 +180,10 @@ class BioSystem:
         energy = clamp(0.30 * thy + 0.25 * dop + 0.20 * ser + 0.15 * adr + 0.10 * est)
         warmth = clamp(0.45 * oxy + 0.25 * ser + 0.15 * dop + 0.15 * (1.0 - cor))
 
+        # Affect surface (climate only; allostasis module overlays policy)
+        pain = clamp(0.45 * cor + 0.25 * adr + 0.15 * (1.0 - ser) + 0.15 * (1.0 - oxy))
+        pleasure = clamp(0.40 * dop + 0.30 * ser + 0.20 * oxy + 0.10 * (1.0 - cor))
+
         body = {
             "heart_rate": heart_rate,
             "breath": breath,
@@ -188,11 +192,15 @@ class BioSystem:
             "gut": gut,
             "energy": energy,
             "warmth": warmth,
+            "pain": pain,
+            "pleasure": pleasure,
         }
         if fast_body_delta:
             for k, dv in fast_body_delta.items():
                 if k in body:
                     body[k] = clamp(body[k] + float(dv))
+                elif k in ("pain", "pleasure"):
+                    body[k] = clamp(float(body.get(k, 0.2)) + float(dv))
         body["respiration_rate"] = body["breath"]
         return body
 

@@ -296,6 +296,9 @@ BODY_CHANNELS = (
     "gut",
     "energy",
     "warmth",
+    # Allostasis & Affect — cost/reward surface (not emotion taxonomy)
+    "pain",
+    "pleasure",
 )
 
 # Canonical node ids in the graph (prefix keeps them out of lemma space)
