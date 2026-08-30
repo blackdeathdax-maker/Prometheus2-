@@ -573,6 +573,30 @@ if st.session_state.prom is not None:
             else:
                 st.caption("Active Thread not available on this build.")
 
+            st.subheader("Allostasis / Affect")
+            st.caption(
+                "Adaptive set-points + pain/pleasure surface (caps & escapes). "
+                "Not emotion taxonomy — body channels only."
+            )
+            try:
+                alr = prom.get_allostasis_report() if hasattr(prom, "get_allostasis_report") else {}
+            except Exception as e:
+                alr = {"error": str(e)}
+            if alr and not alr.get("error"):
+                a1, a2, a3 = st.columns(3)
+                with a1:
+                    st.metric("Pain", alr.get("pain") or 0)
+                with a2:
+                    st.metric("Pleasure", alr.get("pleasure") or 0)
+                with a3:
+                    st.metric("Escape", alr.get("last_escape") or "—")
+                st.caption(
+                    f"note={alr.get('note')} · drivers={alr.get('setpoint_drivers')} · "
+                    f"pain_streak={alr.get('high_pain_streak')}"
+                )
+            else:
+                st.caption("Allostasis not available on this build.")
+
             st.subheader("Goals / Commitments")
             st.caption(
                 "Explicit commitments opened by focus dwell. Schema goals track "
