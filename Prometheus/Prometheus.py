@@ -1875,6 +1875,78 @@ class Prometheus:
                 self._stamp_basin_tag(n)
 
 
+    # Dict hygiene under emotion / affective focus (not an emotion ontology)
+    DICT_NOISE_LEAVES = frozenset({
+        "akvavit", "aquavit", "arrack", "arak", "bitters", "absinthe",
+        "brandy", "whiskey", "whisky", "vodka", "gin", "rum", "tequila",
+        "liqueur", "schnapps", "ouzo", "sambuca", "vermouth", "cognac",
+        "bourbon", "scotch", "moonshine", "hooch", "grog", "mead",
+        "cordial", "aperitif", "digestif", "kirsch", "slivovitz",
+    })
+    AFFECT_LEMMA_HINTS = frozenset({
+        "emotion", "feeling", "mood", "affect", "joy", "fear", "anger",
+        "sadness", "disgust", "surprise", "anxiety", "calm", "pride",
+        "shame", "guilt", "love", "hate", "hope", "dread", "elation",
+        "grief", "rage", "terror", "delight", "sorrow", "pleasure", "pain",
+    })
+
+    def _focus_is_affective(self, target: str = None) -> bool:
+        """True when self-study is under emotion/taught affect neighborhood."""
+        try:
+            g = self.archivist.graph
+            ids = set()
+            fid = getattr(self.focus, "focus_id", None)
+            if fid:
+                ids.add(str(fid))
+            if target:
+                ids.add(str(target))
+            try:
+                ids |= set(self.focus_neighborhood_ids(cap=24) or [])
+            except Exception:
+                pass
+            for nid in list(ids)[:40]:
+                low = str(nid).lower().replace("epistemic_of_", "").replace("_", " ")
+                if any(h in low for h in self.AFFECT_LEMMA_HINTS):
+                    return True
+                nd = g.nodes.get(nid, {}) or {}
+                name = str(nd.get("name") or "").lower()
+                if any(h in name for h in self.AFFECT_LEMMA_HINTS):
+                    return True
+                # is-a emotion / member of emotion schema
+                if nid in g:
+                    for _u, v, ed in g.out_edges(nid, data=True):
+                        if (ed or {}).get("relation_type") == "is-a":
+                            vl = str(v).lower()
+                            if "emotion" in vl or "feeling" in vl or "mood" in vl:
+                                return True
+                    for u, _v, ed in g.in_edges(nid, data=True):
+                        if (ed or {}).get("relation_type") in ("composed-of", "member-of"):
+                            ul = str(u).lower()
+                            if "emotion" in ul or "epistemic_of_emotion" in ul:
+                                return True
+        except Exception:
+            pass
+        return False
+
+    def _is_noise_dict_leaf(self, term: str, affective: bool = False) -> bool:
+        """Skip liquor / multi-word gloss leaves that pollute emotion soaks."""
+        if not term or not isinstance(term, str):
+            return True
+        t = term.strip()
+        low = t.lower()
+        if low in self.DICT_NOISE_LEAVES:
+            return True
+        # multi-word dictionary glosses (not short lemmas)
+        words = [w for w in low.replace("-", " ").split() if w]
+        if len(words) > 2 or len(t) > 36:
+            return True
+        if affective and low in self.DICT_NOISE_LEAVES:
+            return True
+        # "spirits" liquor sense often expands to drink names
+        if affective and low.endswith(" spirits"):
+            return True
+        return False
+
     def _ordered_self_study_expansions(self, target: str):
         """Phase-ordered expansion for a target (esp. WM/user nodes):
 
@@ -1885,11 +1957,15 @@ class Prometheus:
 
         Skips terms already linked under the target so we advance phases
         instead of re-placing the same leaves forever.
+        Under affective focus: tighter synonym cap + noise filter.
         """
         graph = self.archivist.graph
         phase = int(self._self_study_phase.get(target, 0))
         plan = []
         seen = set()
+        affective = self._focus_is_affective(target)
+        syn_cap = 1 if affective else 3
+        hypo_cap = 4 if affective else 12
 
         # Already children of target (any categorical edge)
         already = set()
@@ -1915,7 +1991,7 @@ class Prometheus:
 
         def syns(label):
             try:
-                return list(self.sensory.lookup_synonyms(label) or [])[:3]
+                return list(self.sensory.lookup_synonyms(label) or [])[:syn_cap]
             except Exception:
                 return []
 
@@ -1927,13 +2003,24 @@ class Prometheus:
                 if len(w) >= 3 and w not in stop:
                     labels.append(w)
 
+        def _ok(term):
+            if not term or term == target or term in already or term in seen:
+                return False
+            if self._is_noise_dict_leaf(term, affective=affective):
+                return False
+            return True
+
         # --- phase 0: hyponyms ---
         if phase <= 0:
             for lab in labels:
                 for h in hypos(lab):
-                    if h and h != target and h not in already and h not in seen:
+                    if _ok(h):
                         seen.add(h)
                         plan.append(("hyponym", h))
+                        if len(plan) >= hypo_cap:
+                            break
+                if len(plan) >= hypo_cap:
+                    break
             if plan:
                 return plan
             # exhausted hyponyms → advance
@@ -1944,7 +2031,7 @@ class Prometheus:
         if phase == 1:
             for lab in labels:
                 h = hyper(lab)
-                if h and h != target and h not in already and h not in seen:
+                if _ok(h):
                     seen.add(h)
                     plan.append(("hypernym", h))
             if plan:
@@ -1956,7 +2043,7 @@ class Prometheus:
         if phase == 2:
             for lab in labels:
                 for s in syns(lab):
-                    if s and s != target and s not in already and s not in seen:
+                    if _ok(s):
                         seen.add(s)
                         plan.append(("synonym", s))
             if plan:
@@ -2388,8 +2475,12 @@ class Prometheus:
         basin_key = self.synthesizer.get_current_basin_key()
         felt_state = self.synthesizer.get_current_felt_state()
         placed_children = []
-        # Prefer hyponyms first (kind structure), then hypernyms, max 3
-        for kind, child in (expansion_plan or [("+", c) for c in expansions])[:3]:
+        # Prefer hyponyms first (kind structure), then hypernyms.
+        # Affective focus: at most 1 new dict leaf per tick (hygiene).
+        place_cap = 1 if self._focus_is_affective(target) else 3
+        for kind, child in (expansion_plan or [("+", c) for c in expansions])[:place_cap]:
+            if self._is_noise_dict_leaf(str(child), affective=self._focus_is_affective(target)):
+                continue
             definition = self.sensory.lookup_definition(child) or ""
             result = self.association.place_node(
                 child, definition=definition, source="dictionary",
@@ -2805,6 +2896,8 @@ class Prometheus:
 
         # Pure dictionary leaf with no importance floor: soft demotion;
         # hard-skip weight in Childhood (pedagogy must not roam WordNet).
+        # Under affective focus, demote pure dict even harder so emotion
+        # soaks deepen user/schema structure instead of liquor synonyms.
         src = nd.get("source", "")
         pure_dict = (
             src == "dictionary"
@@ -2823,6 +2916,16 @@ class Prometheus:
                 w *= 0.02  # hard skip in practice
             else:
                 w *= 0.35
+            try:
+                if self._focus_is_affective(node_id):
+                    w *= 0.15
+            except Exception:
+                pass
+            try:
+                if self._is_noise_dict_leaf(str(node_id), affective=True):
+                    w *= 0.05
+            except Exception:
+                pass
 
         try:
             if hasattr(self, "long_term_interest"):
