@@ -358,25 +358,54 @@ def is_forbidden_epistemic_parent(node_id: str) -> bool:
     if not node_id:
         return True
     n = str(node_id)
-    low = n.lower()
-    if n in ("SELF", "OTHER") or low in ("self", "other"):
+    low = n.lower().replace(":", "_")
+    raw = n.lower()
+    if n in ("SELF", "OTHER") or raw in ("self", "other"):
         return True
     if is_somatic_infrastructure(n):
         return True
     if n.startswith(("body:", "felt:", "basin_", "narr:")):
         return True
-    # Already-formed illegal epistemic shells
-    if low.startswith("epistemic_of_self") or low.startswith("epistemic_of_other"):
+    # Already-formed illegal epistemic shells (id or display)
+    if raw.startswith("epistemic_of_self") or raw.startswith("epistemic_of_other"):
+        return True
+    if raw.startswith("epistemic_of_body") or raw.startswith("epistemic_of_felt"):
+        return True
+    if raw.startswith("epistemic_of_basin") or raw.startswith("epistemic_of_narr"):
         return True
     if low.startswith("epistemic_of_body") or low.startswith("epistemic_of_felt"):
         return True
     if low.startswith("epistemic_of_basin") or low.startswith("epistemic_of_narr"):
         return True
-    # slug forms: epistemic_of_heart_rate, epistemic_of_0_5_0_4_0_7, etc.
+    # slug forms: epistemic_of_heart_rate, epistemic_of_body_heart_rate
     for ch in BODY_CHANNELS:
-        if low == f"epistemic_of_{ch}" or low.startswith(f"epistemic_of_{ch}"):
+        ch_l = ch.lower()
+        if low == f"epistemic_of_{ch_l}" or low.startswith(f"epistemic_of_{ch_l}"):
+            return True
+        if low == f"epistemic_of_body_{ch_l}" or low.startswith(f"epistemic_of_body_{ch_l}"):
+            return True
+    # numeric PAD shells: epistemic_of_0.20_0.40_0.80 or epistemic_of_0_20_0_40_0_80
+    if raw.startswith("epistemic_of_"):
+        tail = raw[len("epistemic_of_"):]
+        # felt-like coordinates dominate the id
+        if tail.replace(".", "").replace("_", "").isdigit() and tail.count("_") >= 2:
+            return True
+        if "felt" in tail and any(c.isdigit() for c in tail):
             return True
     return False
+
+
+def is_illegal_epistemic_shell(node_id: str) -> bool:
+    """True if this node id is an epistemic_* shell that must be deleted."""
+    if not node_id:
+        return False
+    n = str(node_id)
+    low = n.lower()
+    if not (low.startswith("epistemic_") or low.startswith("epistemic_of_")):
+        return False
+    return is_forbidden_epistemic_parent(n) or is_forbidden_epistemic_parent(
+        n[len("epistemic_of_"):] if low.startswith("epistemic_of_") else n
+    )
 
 
 def is_eligible_epistemic_member(node_id: str) -> bool:

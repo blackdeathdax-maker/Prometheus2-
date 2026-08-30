@@ -1208,8 +1208,13 @@ class Prometheus:
         except Exception as e:
             logger.warning("_sync_self_felt failed: %s", e)
         try:
-            if hasattr(self.archivist, "repair_identity_edges") and self.pulse_count % 25 == 1:
+            if hasattr(self.archivist, "repair_identity_edges") and self.pulse_count % 10 == 1:
                 self.archivist.repair_identity_edges()
+            if hasattr(self, "reflector") and self.pulse_count % 10 == 1:
+                try:
+                    self.reflector.scrub_invalid_schema_names()
+                except Exception:
+                    pass
         except Exception as e:
             logger.warning("repair_identity_edges: %s", e)
         intensity = self.synthesizer.get_current_intensity()
@@ -3501,13 +3506,21 @@ class Prometheus:
                     promoted += 1
                 except Exception:
                     pass
-            # Ensure epistemic_of_{hub} composes children
+            # Ensure epistemic_of_{hub} composes children (never body/felt hubs)
+            try:
+                from .edge_types import is_forbidden_epistemic_parent as _forbid_ep
+            except Exception:
+                def _forbid_ep(h):
+                    return str(h).startswith(("body:", "felt:", "basin_", "narr:", "epistemic_of_body", "epistemic_of_felt"))
+            if _forbid_ep(hub):
+                continue
             kind_id = f"epistemic_of_{hub}" if hub in graph else None
-            # also try lowercase hub name
             for kid in (f"epistemic_of_{hub}", f"epistemic_of_{str(hub).casefold()}"):
                 if kid in graph:
                     kind_id = kid
                     break
+            if kind_id and _forbid_ep(kind_id):
+                kind_id = None
             if kind_id and kind_id in graph:
                 for child in nbrs:
                     if child not in graph:
@@ -4202,6 +4215,24 @@ class Prometheus:
             else:
                 if _keep_related(row, data):
                     related.append(row)
+
+        # Dedupe related by id (bidirectional edges otherwise list twice)
+        seen_rel = {}
+        for r in related:
+            rid = r.get("id")
+            if rid not in seen_rel:
+                seen_rel[rid] = r
+            else:
+                # keep higher weight if present
+                prev = seen_rel[rid]
+                pw = prev.get("weight")
+                nw = r.get("weight")
+                try:
+                    if nw is not None and (pw is None or float(nw) > float(pw)):
+                        seen_rel[rid] = r
+                except (TypeError, ValueError):
+                    pass
+        related = list(seen_rel.values())
 
         # Prefer stronger co-occurrence when weights present
         def _rel_key(r):

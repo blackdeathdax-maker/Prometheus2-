@@ -585,8 +585,10 @@ class ReflectorModule:
             parent, cnt = max(parent_counts.items(), key=lambda kv: kv[1])
             if cnt < max(2, len(members) // 2):
                 continue
-            kind_id = f"epistemic_of_{parent}"
             if not self._epistemic_parent_allowed(parent):
+                continue
+            kind_id = f"epistemic_of_{_slug_id_fragment(parent)}"
+            if not self._epistemic_parent_allowed(kind_id):
                 continue
             if kind_id not in graph:
                 graph.add_node(
@@ -774,20 +776,47 @@ class ReflectorModule:
 
 
     def scrub_invalid_schema_names(self) -> int:
-        """Un-name epistemic schemas whose title fails lemma-like checks
-        or is anatomy/identity (body channel, felt, narr, SELF).
-        Gloss stays in definition if missing."""
+        """Remove illegal body/felt/SELF epistemic shells; un-name other
+        non-lemma titles. Anatomy must never stay as epistemic_of_* hubs."""
         graph = self.archivist.graph
         scrubbed = 0
         try:
-            from .edge_types import is_body_channel_node, is_forbidden_epistemic_parent
+            from .edge_types import (
+                is_body_channel_node,
+                is_forbidden_epistemic_parent,
+                is_illegal_epistemic_shell,
+            )
         except Exception:
             is_body_channel_node = lambda n: str(n).startswith("body:")
             is_forbidden_epistemic_parent = lambda n: str(n).startswith(
                 ("body:", "felt:", "narr:", "basin_")
             )
+            is_illegal_epistemic_shell = lambda n: str(n).lower().startswith(
+                ("epistemic_of_body", "epistemic_of_felt", "epistemic_of_self", "epistemic_of_basin")
+            )
         for node, data in list(graph.nodes(data=True)):
-            if data.get("node_type") != NODE_EPISTEMIC_SCHEMA:
+            nt = data.get("node_type")
+            is_schema = nt == NODE_EPISTEMIC_SCHEMA or data.get("is_schema")
+            # Hard delete illegal anatomy/identity shells
+            if is_illegal_epistemic_shell(node) or (
+                is_schema and is_forbidden_epistemic_parent(node)
+            ):
+                try:
+                    graph.remove_node(node)
+                    scrubbed += 1
+                except Exception:
+                    pass
+                continue
+            if nt != NODE_EPISTEMIC_SCHEMA:
+                continue
+            # Dominant parent is body/felt → delete shell
+            dom = data.get("dominant_parent") or data.get("name")
+            if dom and is_forbidden_epistemic_parent(str(dom)):
+                try:
+                    graph.remove_node(node)
+                    scrubbed += 1
+                except Exception:
+                    pass
                 continue
             if not data.get("named"):
                 continue
@@ -804,7 +833,7 @@ class ReflectorModule:
             )
             if not illegal_name:
                 continue
-            # Demote to unnamed; preserve text as definition
+            # Non-anatomy bad names: demote; anatomy already deleted above
             if not data.get("definition"):
                 data["definition"] = name_s
             data["name"] = None

@@ -123,6 +123,21 @@ def run_soak_checks(prom) -> Dict[str, Any]:
     except Exception as e:
         add("body_felt_cooccur", False, str(e))
 
+    # No epistemic_of_body / epistemic_of_felt shells
+    try:
+        illegal_shells = []
+        for n in g.nodes:
+            low = str(n).lower()
+            if low.startswith(("epistemic_of_body", "epistemic_of_felt", "epistemic_of_basin", "epistemic_of_self")):
+                illegal_shells.append(str(n))
+            elif low.startswith("epistemic_of_"):
+                tail = low[len("epistemic_of_"):]
+                if tail.replace(".", "").replace("_", "").isdigit() and tail.count("_") >= 2:
+                    illegal_shells.append(str(n))
+        add("no_illegal_epistemic_shells", len(illegal_shells) == 0, f"count={len(illegal_shells)} sample={illegal_shells[:5]}")
+    except Exception as e:
+        add("no_illegal_epistemic_shells", False, str(e))
+
     # Allostasis affect channels present + not stuck at ceiling
     try:
         if hasattr(prom, "get_allostasis_report"):

@@ -262,21 +262,28 @@ class ArchivistModule:
             return s == SELF_NODE or s.upper() == "SELF" or s.lower().startswith("epistemic_of_self")
 
         # 1) Drop illegal epistemic shell nodes entirely
+        try:
+            from .edge_types import is_illegal_epistemic_shell
+        except Exception:
+            is_illegal_epistemic_shell = lambda n: str(n).lower().startswith(
+                ("epistemic_of_body", "epistemic_of_felt", "epistemic_of_self", "epistemic_of_basin", "epistemic_of_narr")
+            )
         for node in list(g.nodes()):
             low = str(node).lower()
-            if (
-                is_forbidden_epistemic_parent(node)
-                and (low.startswith("epistemic_") or g.nodes.get(node, {}).get("node_type") in (
-                    "epistemic_schema", "schema"
-                ))
-            ):
-                # only remove if it is the shell itself, not a legitimate knowledge lemma
-                if low.startswith("epistemic_"):
-                    try:
-                        g.remove_node(node)
-                        removed_nodes += 1
-                    except Exception:
-                        pass
+            nd = g.nodes.get(node, {}) or {}
+            dom = nd.get("dominant_parent") or nd.get("name")
+            kill = is_illegal_epistemic_shell(node)
+            if not kill and low.startswith("epistemic_"):
+                if is_forbidden_epistemic_parent(node):
+                    kill = True
+                elif dom and is_forbidden_epistemic_parent(str(dom)):
+                    kill = True
+            if kill:
+                try:
+                    g.remove_node(node)
+                    removed_nodes += 1
+                except Exception:
+                    pass
 
         # 2) Strip illegal edges
         to_remove = []
