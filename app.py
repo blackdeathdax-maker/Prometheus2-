@@ -597,6 +597,46 @@ if st.session_state.prom is not None:
             else:
                 st.caption("Allostasis not available on this build.")
 
+            st.subheader("World stub / Act outcomes")
+            st.caption(
+                "Package A: tiny internal world slots + operator→body/world deltas. "
+                "Thin C: outcome confidence (rises when effect matches plan)."
+            )
+            try:
+                wr = prom.get_world_report() if hasattr(prom, "get_world_report") else {}
+            except Exception as e:
+                wr = {"error": str(e)}
+            try:
+                ar = prom.get_act_report() if hasattr(prom, "get_act_report") else {}
+            except Exception as e:
+                ar = {"error": str(e)}
+            if wr and not wr.get("error") and wr.get("slots"):
+                slots = wr.get("slots") or {}
+                w1, w2, w3 = st.columns(3)
+                with w1:
+                    st.metric("object_near", round(float(slots.get("object_near") or 0), 3))
+                with w2:
+                    st.metric("obstacle", round(float(slots.get("obstacle") or 0), 3))
+                with w3:
+                    st.metric("goal_cue", round(float(slots.get("goal_cue") or 0), 3))
+                st.caption(
+                    f"last_op={wr.get('last_op') or ar.get('last_op')} · "
+                    f"world_deltas={wr.get('last_deltas') or ar.get('world_deltas')}"
+                )
+            else:
+                st.caption("World stub not available on this build (deploy world_stub.py).")
+            if ar and not ar.get("error"):
+                st.caption(
+                    f"act last_op=`{ar.get('last_op')}` · "
+                    f"body_deltas={ar.get('body_deltas')} · "
+                    f"pending={ar.get('pending_body')}"
+                )
+                conf = ar.get("confidence_top") or []
+                if conf:
+                    st.write("**Outcome confidence (top)**")
+                    for c in conf[:8]:
+                        st.write(f"- `{c.get('key')}` → {c.get('confidence')}")
+
             st.subheader("Goals / Commitments")
             st.caption(
                 "Explicit commitments opened by focus dwell. Schema goals track "
