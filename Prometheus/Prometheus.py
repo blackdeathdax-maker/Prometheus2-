@@ -249,6 +249,18 @@ class Prometheus:
         self.operators = OperatorModule() if OperatorModule is not None else None
         self.active_thread = ActiveThreadModule() if ActiveThreadModule is not None else None
         self.allostasis = AllostasisModule() if AllostasisModule is not None else None
+        # Package A: tiny world stub for action→consequence
+        try:
+            from .world_stub import WorldStub
+            self.world_stub = WorldStub()
+        except Exception:
+            try:
+                from world_stub import WorldStub
+                self.world_stub = WorldStub()
+            except Exception:
+                self.world_stub = None
+        self._pre_act_body_snap: dict = {}
+        self._pre_act_world_snap: dict = {}
 
         # --- Learning policy (phase / inhibition / valence / lookup budgets) ---
         self.DICT_LOOKUPS_PER_PULSE = 6
@@ -990,6 +1002,24 @@ class Prometheus:
                 out["active_thread"] = self.active_thread.report()
         except Exception:
             pass
+        # Package A: world stub + act outcomes
+        try:
+            if getattr(self, "world_stub", None) is not None:
+                out["world"] = self.world_stub.report()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "operators", None) is not None:
+                rep = self.operators.report()
+                out["act"] = {
+                    "last_op": rep.get("last_act_op") or rep.get("last_operator"),
+                    "body_deltas": rep.get("last_act_body_deltas"),
+                    "world_deltas": rep.get("last_act_world_deltas"),
+                    "pending_body": rep.get("pending_body_delta"),
+                    "confidence_top": rep.get("outcome_confidence_top"),
+                }
+        except Exception:
+            pass
         return out
 
 
@@ -1123,8 +1153,42 @@ class Prometheus:
         else:
             fast_delta = None
 
+        # Package A: merge pending operator→body outcomes from prior pulse
+        try:
+            if self.operators is not None:
+                act_delta = self.operators.consume_pending_body_delta()
+                if act_delta:
+                    if fast_delta is None:
+                        fast_delta = {}
+                    for ch, dv in act_delta.items():
+                        fast_delta[ch] = float(fast_delta.get(ch, 0.0)) + float(dv)
+        except Exception as e:
+            logger.debug("consume act body delta: %s", e)
+
         # Body surface = medium/slow hormones + fast gusts (still no chemical names)
         body = self.bio.get_raw_variables(fast_body_delta=fast_delta)
+
+        # Thin C: update outcome confidence from last act (before vs after sense)
+        try:
+            if self.operators is not None and self.operators._last_act_op:
+                op0 = self.operators._last_act_op
+                pred_b = dict(self.operators._last_act_body_deltas or {})
+                before_b = dict(self._pre_act_body_snap or {})
+                if pred_b and before_b:
+                    self.operators.update_outcome_confidence(
+                        op0, pred_b, before_b, body, prefix="",
+                    )
+                pred_w = dict(self.operators._last_act_world_deltas or {})
+                before_w = dict(self._pre_act_world_snap or {})
+                after_w = {}
+                if getattr(self, "world_stub", None) is not None:
+                    after_w = self.world_stub.observe()
+                if pred_w and before_w:
+                    self.operators.update_outcome_confidence(
+                        op0, pred_w, before_w, after_w, prefix="world:",
+                    )
+        except Exception as e:
+            logger.debug("outcome confidence update: %s", e)
 
         # synthesizer must run first, before anything that conditions a
         # decision on its output (regulation trigger, executive bias).
@@ -3913,6 +3977,40 @@ class Prometheus:
             pleasure=_pleasure,
             allostatic_escape=_escape,
         )
+        # Package A: apply act → body (queued) + world stub (immediate)
+        try:
+            op_name = str(dec.operator or "HOLD")
+            # snapshot for next-pulse confidence
+            self._pre_act_body_snap = dict(body_for_pred or {})
+            if getattr(self, "world_stub", None) is not None:
+                self._pre_act_world_snap = self.world_stub.observe()
+            # body effect lands next sense
+            body_d = self.operators.queue_body_delta(op_name)
+            # world effect now
+            world_d = {}
+            if getattr(self, "world_stub", None) is not None:
+                before_w = dict(self._pre_act_world_snap)
+                self.world_stub.apply_operator(op_name, pulse=self.pulse_count)
+                after_w = self.world_stub.observe()
+                world_d = {
+                    k: float(after_w.get(k, 0)) - float(before_w.get(k, 0))
+                    for k in after_w
+                    if abs(float(after_w.get(k, 0)) - float(before_w.get(k, 0))) > 1e-9
+                }
+                self.operators._last_act_world_deltas = world_d
+            # sync body_value on graph for elevated channels (visibility)
+            try:
+                from .edge_types import body_channel_node_id
+                g = self.archivist.graph
+                for ch, dv in (body_d or {}).items():
+                    nid = body_channel_node_id(ch)
+                    if nid in g:
+                        cur = float(g.nodes[nid].get("body_value") or 0.5)
+                        g.nodes[nid]["body_value"] = max(0.0, min(1.0, cur + float(dv)))
+            except Exception:
+                pass
+        except Exception as e:
+            logger.debug("act apply failed: %s", e)
         # Refresh Active Thread from this decision's prediction
         try:
             if getattr(self, "active_thread", None) is not None:
@@ -4440,12 +4538,31 @@ class Prometheus:
             return self.allostasis.report()
         return {}
 
+    def get_world_report(self) -> dict:
+        """Package A world stub slots + last act deltas."""
+        if getattr(self, "world_stub", None) is not None:
+            return self.world_stub.report()
+        return {}
+
+    def get_act_report(self) -> dict:
+        """Package A+thin C: last act body/world deltas + confidence top."""
+        if getattr(self, "operators", None) is None:
+            return {}
+        rep = self.operators.report()
+        return {
+            "last_op": rep.get("last_act_op") or rep.get("last_operator"),
+            "body_deltas": rep.get("last_act_body_deltas") or {},
+            "world_deltas": rep.get("last_act_world_deltas") or {},
+            "pending_body": rep.get("pending_body_delta") or {},
+            "confidence_top": rep.get("outcome_confidence_top") or [],
+        }
+
     def get_module_health_report(self) -> dict:
         """Which optional modules imported cleanly (Identity & Hygiene)."""
         names = (
             "modulators", "felt_anchors", "schema_felt", "executive",
             "stimulus", "goals", "operators", "active_thread", "self_narrative",
-            "somatic_topo", "long_term_interest",
+            "somatic_topo", "long_term_interest", "world_stub", "allostasis",
         )
         out = {}
         for n in names:

@@ -40,6 +40,36 @@ REGULATION_CHANNELS = frozenset({
     "muscle_tension", "sweat_skin", "gut", "heart_rate", "pain",
 })
 
+# Package A: operator → small body deltas (applied next pulse via pending delta)
+# Values are soft nudges; hormonal/allostatic caps still apply.
+OP_BODY_DELTAS: Dict[str, Dict[str, float]] = {
+    "SETTLE": {
+        "heart_rate": -0.04, "muscle_tension": -0.05, "pain": -0.02,
+        "breath": 0.02, "sweat_skin": -0.03,
+    },
+    "RELEASE": {
+        "muscle_tension": -0.06, "sweat_skin": -0.04, "breath": 0.03,
+        "heart_rate": -0.02,
+    },
+    "EXPAND": {
+        "energy": 0.05, "heart_rate": 0.03, "warmth": 0.02,
+        "muscle_tension": 0.01,
+    },
+    "HOLD": {
+        "muscle_tension": 0.02,  # mild freeze
+    },
+    "RETURN": {
+        "energy": 0.02, "heart_rate": -0.01, "muscle_tension": -0.02,
+    },
+}
+
+ACT_CONF_START = 0.30
+ACT_CONF_MIN = 0.15
+ACT_CONF_MAX = 0.95
+ACT_CONF_UP = 0.06
+ACT_CONF_DOWN = 0.08
+ACT_MAX_BODY_DELTA = 0.08
+
 
 @dataclass
 class PredictResult:
@@ -93,6 +123,97 @@ class OperatorModule:
         self._body_hist: deque = deque(maxlen=self.HISTORY_LEN)
         # Per-channel exponential smoother of recent deltas (operator-agnostic baseline)
         self._delta_ema: Dict[str, float] = {ch: 0.0 for ch in BODY_CHANNELS}
+
+        # Package A + thin C: pending body delta + outcome confidence
+        self.pending_body_delta: Dict[str, float] = {}
+        # key: "OP:channel" or "OP:world:slot" → confidence
+        self.outcome_confidence: Dict[str, float] = {}
+        self._pre_act_body: Dict[str, float] = {}
+        self._pre_act_world: Dict[str, float] = {}
+        self._last_act_op: str = ""
+        self._last_act_body_deltas: Dict[str, float] = {}
+        self._last_act_world_deltas: Dict[str, float] = {}
+
+    def planned_body_delta(self, op: str, scale: float = 1.0) -> Dict[str, float]:
+        """Signed body nudges for this operator (clamped)."""
+        op_u = (op or "HOLD").upper()
+        raw = dict(OP_BODY_DELTAS.get(op_u, {}))
+        out: Dict[str, float] = {}
+        for ch, dv in raw.items():
+            d = max(-ACT_MAX_BODY_DELTA, min(ACT_MAX_BODY_DELTA, float(dv) * float(scale)))
+            if abs(d) > 1e-6:
+                out[ch] = d
+        return out
+
+    def queue_body_delta(self, op: str, scale: float = 1.0) -> Dict[str, float]:
+        """Queue operator body effect for next pulse sense."""
+        d = self.planned_body_delta(op, scale=scale)
+        # merge into pending (sum, then clamp per channel later)
+        for ch, dv in d.items():
+            self.pending_body_delta[ch] = float(self.pending_body_delta.get(ch, 0.0)) + dv
+        self._last_act_op = (op or "HOLD").upper()
+        self._last_act_body_deltas = dict(d)
+        return d
+
+    def consume_pending_body_delta(self) -> Dict[str, float]:
+        """Take and clear pending body deltas (call once per pulse at sense)."""
+        out = dict(self.pending_body_delta)
+        self.pending_body_delta = {}
+        return out
+
+    def conf_key(self, op: str, target: str) -> str:
+        return f"{(op or 'HOLD').upper()}:{target}"
+
+    def get_confidence(self, op: str, target: str) -> float:
+        return float(self.outcome_confidence.get(self.conf_key(op, target), ACT_CONF_START))
+
+    def update_outcome_confidence(
+        self,
+        op: str,
+        predicted_deltas: Dict[str, float],
+        observed_before: Dict[str, float],
+        observed_after: Dict[str, float],
+        prefix: str = "",
+    ) -> None:
+        """Thin C: raise confidence when observed change agrees with planned sign."""
+        op_u = (op or "HOLD").upper()
+        for ch, pred_d in (predicted_deltas or {}).items():
+            if abs(float(pred_d)) < 1e-6:
+                continue
+            before = float((observed_before or {}).get(ch, 0.0))
+            after = float((observed_after or {}).get(ch, before))
+            actual = after - before
+            key = self.conf_key(op_u, f"{prefix}{ch}" if prefix else ch)
+            conf = float(self.outcome_confidence.get(key, ACT_CONF_START))
+            # agreement: same sign and non-trivial move
+            if pred_d * actual > 0 and abs(actual) >= 0.005:
+                conf = min(ACT_CONF_MAX, conf + ACT_CONF_UP)
+            elif pred_d * actual < 0 and abs(actual) >= 0.005:
+                conf = max(ACT_CONF_MIN, conf - ACT_CONF_DOWN)
+            else:
+                conf = max(ACT_CONF_MIN, conf - ACT_CONF_DOWN * 0.35)
+            self.outcome_confidence[key] = conf
+
+    def confidence_bias_scores(self, body: Optional[Dict[str, float]] = None) -> Dict[str, float]:
+        """Soft score additives from learned outcome confidence (thin C)."""
+        body = body or {}
+        bias = {op: 0.0 for op in OPS}
+        tension = float(body.get("muscle_tension", 0.4) or 0.4)
+        pain = float(body.get("pain", 0.1) or 0.1)
+        energy = float(body.get("energy", 0.5) or 0.5)
+        # If SETTLE has high conf on lowering tension and tension high → boost SETTLE
+        if tension > 0.55:
+            c = self.get_confidence("SETTLE", "muscle_tension")
+            bias["SETTLE"] += 0.8 * (c - 0.3)
+            c2 = self.get_confidence("RELEASE", "muscle_tension")
+            bias["RELEASE"] += 0.6 * (c2 - 0.3)
+        if pain > 0.5:
+            c = self.get_confidence("SETTLE", "pain")
+            bias["SETTLE"] += 0.7 * (c - 0.3)
+        if energy < 0.35:
+            c = self.get_confidence("EXPAND", "energy")
+            bias["EXPAND"] += 0.6 * (c - 0.3)
+        return bias
 
     # ------------------------------------------------------------------
     def family_ids(self, graph, root_id: str, max_n: int = 80) -> Set[str]:
@@ -437,6 +558,12 @@ class OperatorModule:
         self.last_predict = pred
 
         scores = {op: 0.0 for op in OPS}
+        # Thin C: soft bias from outcome confidence
+        try:
+            for op_k, add in self.confidence_bias_scores(body).items():
+                scores[op_k] = scores.get(op_k, 0.0) + float(add)
+        except Exception:
+            pass
         ring = list(self._op_ring[-16:])
         if not ring:
             ring = [e.get("operator") for e in self.episodes[-16:] if e.get("operator")]
@@ -698,6 +825,9 @@ class OperatorModule:
             self.episodes = self.episodes[-self.EPISODE_CAP :]
 
     def report(self) -> dict:
+        top_conf = sorted(
+            self.outcome_confidence.items(), key=lambda kv: -kv[1]
+        )[:12]
         return {
             "last_operator": (self.last_decision.operator if self.last_decision else None),
             "last_predict": (
@@ -720,4 +850,11 @@ class OperatorModule:
             "op_ring": list(self._op_ring[-12:]),
             "body_hist_len": len(self._body_hist),
             "delta_ema": {k: round(v, 4) for k, v in self._delta_ema.items()},
+            "pending_body_delta": dict(self.pending_body_delta),
+            "last_act_op": self._last_act_op,
+            "last_act_body_deltas": dict(self._last_act_body_deltas),
+            "last_act_world_deltas": dict(self._last_act_world_deltas),
+            "outcome_confidence_top": [
+                {"key": k, "confidence": round(v, 3)} for k, v in top_conf
+            ],
         }

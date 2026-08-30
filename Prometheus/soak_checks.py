@@ -123,6 +123,22 @@ def run_soak_checks(prom) -> Dict[str, Any]:
     except Exception as e:
         add("body_felt_cooccur", False, str(e))
 
+    # Package A: world stub present
+    try:
+        ws = getattr(orch, "world_stub", None)
+        ok = ws is not None and bool(getattr(ws, "slots", None))
+        add("world_stub_slots", ok, str(ws.report() if ws else None)[:120])
+    except Exception as e:
+        add("world_stub_slots", False, str(e))
+
+    # Thin C: outcome confidence dict exists after acts
+    try:
+        ops = getattr(orch, "operators", None)
+        conf = getattr(ops, "outcome_confidence", {}) if ops else {}
+        add("act_outcome_confidence", ops is not None, f"n_keys={len(conf)}")
+    except Exception as e:
+        add("act_outcome_confidence", False, str(e))
+
     # No epistemic_of_body / epistemic_of_felt shells
     try:
         illegal_shells = []
