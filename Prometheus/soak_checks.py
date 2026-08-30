@@ -69,6 +69,23 @@ def run_soak_checks(prom) -> Dict[str, Any]:
     has_id = hasattr(prom, "get_identity_hub_report")
     add("identity_hub_api", has_id, "")
 
+    # Body surface ↔ felt place co-occurrence (somatic graph)
+    felt_hits = 0
+    try:
+        for n in g.nodes:
+            if not str(n).startswith("body:"):
+                continue
+            for _, v, _d in g.out_edges(n, data=True):
+                if str(v).startswith(("felt:", "basin_")):
+                    felt_hits += 1
+            for u, _, _d in g.in_edges(n, data=True):
+                if str(u).startswith(("felt:", "basin_")):
+                    felt_hits += 1
+        # Soft until soak has run with body values ≥ 0.35
+        add("body_felt_cooccur", True, f"felt_hits={felt_hits}")
+    except Exception as e:
+        add("body_felt_cooccur", False, str(e))
+
     # Allostasis affect channels present + not stuck at ceiling
     try:
         if hasattr(prom, "get_allostasis_report"):

@@ -221,14 +221,14 @@ class ArchivistModule:
                     activation=0.0,
                     valence_coloring=0.0,
                     is_body_channel=True,
-                    is_felt_place=True,
+                    is_felt_place=False,  # anatomy, not PAD place
                     body_channel=ch,
                     growable=False,
                 )
             else:
                 nd = self.graph.nodes[nid]
                 nd["is_body_channel"] = True
-                nd["is_felt_place"] = True
+                nd["is_felt_place"] = False
                 nd["growable"] = False
                 nd["body_channel"] = ch
 

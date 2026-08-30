@@ -2137,6 +2137,36 @@ class Prometheus:
                 if val >= 0.62 or val <= 0.28:
                     salient.append((ch, nid, val))
 
+                # Body surface ↔ current felt place (somatic graph)
+                # associated-with only — never is-a; co-occurrence of surface + PAD place
+                try:
+                    if basin_id and basin_id in g and val >= 0.35:
+                        self.archivist.link(
+                            nid, basin_id, EDGE_ASSOCIATED_WITH,
+                            source="somatic", placement="body_felt_cooccur",
+                            felt_state=stamp,
+                        )
+                        self.archivist.link(
+                            basin_id, nid, EDGE_ASSOCIATED_WITH,
+                            source="somatic", placement="body_felt_cooccur",
+                            felt_state=stamp,
+                        )
+                        ed = g.get_edge_data(nid, basin_id) or {}
+                        for _k, attr in ed.items():
+                            if isinstance(attr, dict) and attr.get("relation_type") == EDGE_ASSOCIATED_WITH:
+                                attr["dwell"] = float(attr.get("dwell") or 0.0) + 1.0
+                                attr["last_value"] = val
+                                break
+                        if val >= 0.55:
+                            try:
+                                self.archivist.bump_activation(nid)
+                                self.archivist.bump_activation(basin_id)
+                                self.archivist.record_co_activation([nid, basin_id, SELF_NODE])
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
             # Link salient channels as PARTS of active epistemic schemas
             # anger --composed-of--> body:heart_rate  (part, not child)
             active_schemas = []
