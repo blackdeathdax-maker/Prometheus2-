@@ -1961,6 +1961,109 @@ class Prometheus:
         return plan
 
 
+    # --- body ↔ felt co-occurrence weights (option A) ---
+    BODY_FELT_GATE = 0.35       # channel must be up to credit this pulse
+    BODY_FELT_INC = 0.08        # increment while co-active
+    BODY_FELT_DECAY = 0.995     # per-pulse multiply on all body_felt edges
+    BODY_FELT_CAP = 1.0
+    BODY_FELT_SHOW = 0.12       # below this = residual, not peer
+    BODY_FELT_DROP = 0.02       # remove edge under this after decay
+
+    def _update_body_felt_weights(self, g, basin_id: str = "", stamp=None):
+        """Decay all body↔felt co-occur weights; reinforce current basin.
+
+        Edges use associated-with + placement=body_felt_cooccur + float weight.
+        Only the *current* basin is incremented this pulse (temporal locality).
+        """
+        from .edge_types import (
+            EDGE_ASSOCIATED_WITH,
+            BODY_CHANNELS,
+            body_channel_node_id,
+            is_body_channel_node,
+        )
+        from .archivist import SELF_NODE
+
+        # 1) Decay every body↔felt associated-with edge (new + legacy binary)
+        to_drop = []
+        try:
+            for u, v, k, attr in list(g.edges(keys=True, data=True)):
+                if not isinstance(attr, dict):
+                    continue
+                if attr.get("relation_type") != EDGE_ASSOCIATED_WITH:
+                    continue
+                u_b = str(u).startswith("body:")
+                v_b = str(v).startswith("body:")
+                u_f = str(u).startswith(("felt:", "basin_"))
+                v_f = str(v).startswith(("felt:", "basin_"))
+                is_bf = (u_b and v_f) or (u_f and v_b)
+                if not is_bf and attr.get("placement") != "body_felt_cooccur":
+                    continue
+                if not is_bf:
+                    continue
+                # Migrate legacy edges onto the weighted placement
+                if attr.get("placement") in (None, "", "self_felt"):
+                    attr["placement"] = "body_felt_cooccur"
+                w = float(attr.get("weight") if attr.get("weight") is not None else 0.5)
+                w = max(0.0, w * self.BODY_FELT_DECAY)
+                attr["weight"] = w
+                if w < self.BODY_FELT_DROP:
+                    to_drop.append((u, v, k))
+            for u, v, k in to_drop:
+                try:
+                    g.remove_edge(u, v, key=k)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning("body↔felt decay failed: %s", e)
+
+        if not basin_id or basin_id not in g:
+            return
+
+        # 2) Increment body channels that are currently elevated toward this basin
+        for ch in BODY_CHANNELS:
+            nid = body_channel_node_id(ch)
+            if nid not in g:
+                continue
+            try:
+                val = float(g.nodes[nid].get("body_value") or 0.0)
+            except (TypeError, ValueError):
+                val = 0.0
+            if val < self.BODY_FELT_GATE:
+                continue
+            # Ensure bidirectional edges exist, then bump weight
+            for a, b in ((nid, basin_id), (basin_id, nid)):
+                try:
+                    self.archivist.link(
+                        a, b, EDGE_ASSOCIATED_WITH,
+                        source="somatic", placement="body_felt_cooccur",
+                        felt_state=stamp,
+                    )
+                except Exception:
+                    pass
+                ed = g.get_edge_data(a, b) or {}
+                for _k, attr in ed.items():
+                    if not isinstance(attr, dict):
+                        continue
+                    if attr.get("relation_type") != EDGE_ASSOCIATED_WITH:
+                        continue
+                    # Prefer placement match; fall back to any associated-with
+                    if attr.get("placement") and attr.get("placement") != "body_felt_cooccur":
+                        continue
+                    attr["placement"] = "body_felt_cooccur"
+                    prev = float(attr.get("weight") if attr.get("weight") is not None else 0.0)
+                    attr["weight"] = min(self.BODY_FELT_CAP, prev + self.BODY_FELT_INC)
+                    attr["dwell"] = float(attr.get("dwell") or 0.0) + 1.0
+                    attr["last_value"] = val
+                    attr["source"] = attr.get("source") or "somatic"
+                    break
+            if val >= 0.55:
+                try:
+                    self.archivist.bump_activation(nid)
+                    self.archivist.bump_activation(basin_id)
+                    self.archivist.record_co_activation([nid, basin_id, SELF_NODE])
+                except Exception:
+                    pass
+
     def _sync_self_felt(self):
         """Bind SELF to the current somatic felt place every pulse.
 
@@ -2137,35 +2240,14 @@ class Prometheus:
                 if val >= 0.62 or val <= 0.28:
                     salient.append((ch, nid, val))
 
-                # Body surface ↔ current felt place (somatic graph)
-                # associated-with only — never is-a; co-occurrence of surface + PAD place
-                try:
-                    if basin_id and basin_id in g and val >= 0.35:
-                        self.archivist.link(
-                            nid, basin_id, EDGE_ASSOCIATED_WITH,
-                            source="somatic", placement="body_felt_cooccur",
-                            felt_state=stamp,
-                        )
-                        self.archivist.link(
-                            basin_id, nid, EDGE_ASSOCIATED_WITH,
-                            source="somatic", placement="body_felt_cooccur",
-                            felt_state=stamp,
-                        )
-                        ed = g.get_edge_data(nid, basin_id) or {}
-                        for _k, attr in ed.items():
-                            if isinstance(attr, dict) and attr.get("relation_type") == EDGE_ASSOCIATED_WITH:
-                                attr["dwell"] = float(attr.get("dwell") or 0.0) + 1.0
-                                attr["last_value"] = val
-                                break
-                        if val >= 0.55:
-                            try:
-                                self.archivist.bump_activation(nid)
-                                self.archivist.bump_activation(basin_id)
-                                self.archivist.record_co_activation([nid, basin_id, SELF_NODE])
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
+            # --- Weighted body ↔ felt co-occurrence (option A) ---
+            # Binary links made a static hairball. Weight + temporal locality
+            # + soft decay so unused body↔basin edges fade and differential
+            # soaks can separate signatures. Uses body_value already written above.
+            try:
+                self._update_body_felt_weights(g, basin_id=basin_id, stamp=stamp)
+            except Exception as e:
+                logger.warning("body↔felt weight update failed: %s", e)
 
             # Link salient channels as PARTS of active epistemic schemas
             # anger --composed-of--> body:heart_rate  (part, not child)
@@ -4058,22 +4140,41 @@ class Prometheus:
         part_of, has_parts = [], []
         member_of_schemas, schema_members = [], []
         related = []
+        show_floor = float(getattr(self, "BODY_FELT_SHOW", 0.12) or 0.12)
 
-        def _row(nid, rel):
+        def _row(nid, rel, data=None):
+            data = data or {}
+            w = data.get("weight")
+            try:
+                w = float(w) if w is not None else None
+            except (TypeError, ValueError):
+                w = None
             return {
                 "id": str(nid),
                 "relation": rel,
                 "name": (graph.nodes.get(nid) or {}).get("name"),
+                "weight": w,
+                "dwell": data.get("dwell"),
+                "placement": data.get("placement"),
             }
+
+        def _keep_related(row, data):
+            """Drop residual body↔felt edges below show floor so UI isn't egalitarian."""
+            if (data or {}).get("placement") != "body_felt_cooccur":
+                return True
+            w = row.get("weight")
+            if w is None:
+                return True
+            return float(w) >= show_floor
 
         # Out-edges: this → other
         for _, v, data in list(graph.out_edges(node_id, data=True)):
             rel = (data or {}).get("relation_type") or "associated-with"
-            row = _row(v, rel)
+            row = _row(v, rel, data)
             if rel == "is-a":
                 if not is_somatic_infrastructure(node_id) and not is_somatic_infrastructure(v):
                     parents.append(row)
-                else:
+                elif _keep_related(row, data):
                     related.append(row)
             elif rel == "part-of":
                 part_of.append(row)
@@ -4081,16 +4182,17 @@ class Prometheus:
                 has_parts.append(row)
                 schema_members.append(row)
             else:
-                related.append(row)
+                if _keep_related(row, data):
+                    related.append(row)
 
         # In-edges: other → this
         for u, _, data in list(graph.in_edges(node_id, data=True)):
             rel = (data or {}).get("relation_type") or "associated-with"
-            row = _row(u, rel)
+            row = _row(u, rel, data)
             if rel == "is-a":
                 if not is_somatic_infrastructure(node_id) and not is_somatic_infrastructure(u):
                     children.append(row)
-                else:
+                elif _keep_related(row, data):
                     related.append(row)
             elif rel == "part-of":
                 has_parts.append(row)
@@ -4098,7 +4200,15 @@ class Prometheus:
                 member_of_schemas.append(row)
                 part_of.append(row)
             else:
-                related.append(row)
+                if _keep_related(row, data):
+                    related.append(row)
+
+        # Prefer stronger co-occurrence when weights present
+        def _rel_key(r):
+            w = r.get("weight")
+            return -(float(w) if w is not None else 0.0)
+
+        related.sort(key=_rel_key)
 
         return {
             "id": node_id,

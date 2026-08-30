@@ -69,20 +69,57 @@ def run_soak_checks(prom) -> Dict[str, Any]:
     has_id = hasattr(prom, "get_identity_hub_report")
     add("identity_hub_api", has_id, "")
 
-    # Body surface ↔ felt place co-occurrence (somatic graph)
+    # Body surface ↔ felt place co-occurrence (weighted)
     felt_hits = 0
+    weighted = 0
+    weights: List[float] = []
+    flat_ones = 0
     try:
-        for n in g.nodes:
-            if not str(n).startswith("body:"):
+        show_floor = float(getattr(prom, "BODY_FELT_SHOW", 0.12) or 0.12)
+        for u, v, ed in g.edges(data=True):
+            ed = ed or {}
+            placement = ed.get("placement")
+            u_b = str(u).startswith("body:")
+            v_b = str(v).startswith("body:")
+            u_f = str(u).startswith(("felt:", "basin_"))
+            v_f = str(v).startswith(("felt:", "basin_"))
+            is_bf = (u_b and v_f) or (u_f and v_b)
+            if placement == "body_felt_cooccur":
+                if not is_bf:
+                    continue
+            elif not is_bf:
                 continue
-            for _, v, _d in g.out_edges(n, data=True):
-                if str(v).startswith(("felt:", "basin_")):
-                    felt_hits += 1
-            for u, _, _d in g.in_edges(n, data=True):
-                if str(u).startswith(("felt:", "basin_")):
-                    felt_hits += 1
-        # Soft until soak has run with body values ≥ 0.35
-        add("body_felt_cooccur", True, f"felt_hits={felt_hits}")
+            # count body↔felt associated edges (new weighted + legacy)
+            if ed.get("relation_type") not in (None, "associated-with", "associated_with"):
+                if placement != "body_felt_cooccur":
+                    continue
+            felt_hits += 1
+            w = ed.get("weight")
+            if w is not None:
+                try:
+                    wf = float(w)
+                    weights.append(wf)
+                    weighted += 1
+                    if wf >= 0.99:
+                        flat_ones += 1
+                except (TypeError, ValueError):
+                    pass
+        detail = f"felt_hits={felt_hits} weighted={weighted}"
+        if weights:
+            mn = min(weights)
+            mx = max(weights)
+            avg = sum(weights) / len(weights)
+            above = sum(1 for w in weights if w >= show_floor)
+            detail += (
+                f" min={mn:.3f} max={mx:.3f} avg={avg:.3f} "
+                f"above_show={above} flat1={flat_ones}"
+            )
+        stuck = weighted >= 8 and flat_ones == weighted
+        add("body_felt_cooccur", not stuck, detail)
+        if stuck:
+            add("body_felt_weights_varied", False, "all body↔felt weights ≈ 1.0 (static)")
+        elif weights:
+            add("body_felt_weights_varied", True, detail)
     except Exception as e:
         add("body_felt_cooccur", False, str(e))
 
@@ -92,7 +129,11 @@ def run_soak_checks(prom) -> Dict[str, Any]:
             ar = prom.get_allostasis_report() or {}
             p = float(ar.get("pain") or 0)
             pl = float(ar.get("pleasure") or 0)
-            add("affect_in_range", 0.0 <= p <= 1.0 and 0.0 <= pl <= 1.0, f"pain={p} pleasure={pl}")
+            add(
+                "affect_in_range",
+                0.0 <= p <= 1.0 and 0.0 <= pl <= 1.0,
+                f"pain={p} pleasure={pl}",
+            )
             add("pain_not_stuck_ceiling", p < 0.99, f"pain={p}")
         else:
             add("allostasis_api", False, "missing")
