@@ -261,6 +261,16 @@ class Prometheus:
                 self.world_stub = None
         self._pre_act_body_snap: dict = {}
         self._pre_act_world_snap: dict = {}
+        # Package D: compositional plans over causal traces
+        try:
+            from .plan import PlanModule
+            self.planner = PlanModule()
+        except Exception:
+            try:
+                from plan import PlanModule
+                self.planner = PlanModule()
+            except Exception:
+                self.planner = None
 
         # --- Learning policy (phase / inhibition / valence / lookup budgets) ---
         self.DICT_LOOKUPS_PER_PULSE = 6
@@ -1404,6 +1414,29 @@ class Prometheus:
                         pass
                 if summary.get("satisfied_this_tick") or summary.get("failed_this_tick"):
                     print(f"Goals: {summary}")
+                # Package D: rebuild plan from causal traces for primary goal
+                try:
+                    if getattr(self, "planner", None) is not None:
+                        gids = list(self.goals.active_target_ids() or [])
+                        def _closure(gid):
+                            try:
+                                return self.goals.schema_closure_ids(graph, gid)
+                            except Exception:
+                                return set()
+                        plan = self.planner.tick(
+                            pulse=self.pulse_count,
+                            graph=graph,
+                            goal_ids=gids,
+                            schema_closure_fn=_closure,
+                        )
+                        means = self.planner.next_means_id()
+                        if means:
+                            try:
+                                self.focus.boost_residual(means, amount=0.55)
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.debug("planner tick: %s", e)
                 # Allostatic safety: extreme pain can release weakest off-focus goal
                 try:
                     if getattr(self, "allostasis", None) is not None and self.goals is not None:
@@ -2115,6 +2148,127 @@ class Prometheus:
             self._self_study_phase[target] = 3
 
         return plan
+
+
+    # --- Package B: causal co-occurrence from focus + act outcomes ---
+    CAUSAL_DELTA_MIN = 0.02          # min |delta| to mint/reinforce a cause edge
+    CAUSAL_WEIGHT_INC = 0.08
+    CAUSAL_WEIGHT_CAP = 1.0
+    CAUSAL_CONF_START = 0.30
+
+    def _ensure_world_slot_node(self, slot: str) -> str:
+        """Ensure world:<slot> exists as non-taxonomic infrastructure."""
+        nid = f"world:{slot}"
+        g = self.archivist.graph
+        if nid not in g:
+            g.add_node(
+                nid,
+                node_type="world_slot",
+                is_world_slot=True,
+                growable=False,
+                source="world_stub",
+                activation=0.0,
+                body_value=None,
+                world_value=float((self.world_stub.slots if self.world_stub else {}).get(slot, 0.0)),
+            )
+        elif self.world_stub is not None:
+            g.nodes[nid]["world_value"] = float(self.world_stub.slots.get(slot, 0.0))
+            g.nodes[nid]["is_world_slot"] = True
+            g.nodes[nid]["growable"] = False
+        return nid
+
+    def _record_causal_cooccurrence(
+        self,
+        focus_id: Optional[str],
+        op_name: str,
+        body_deltas: dict,
+        world_deltas: dict,
+    ) -> int:
+        """Mint/reinforce causes/enables/prevents from focus when act moves targets.
+
+        Co-occurrence rule (user default for B):
+          focus active + operator applied + |delta| >= CAUSAL_DELTA_MIN
+          → focus --causes--> body:channel   (body change)
+          → focus --enables--> world:slot    (positive world change)
+          → focus --prevents--> world:slot   (negative world change on obstacle-like)
+
+        Never uses is-a on body/world. Weight + confidence on edge for thin C continuity.
+        """
+        if not focus_id or focus_id not in self.archivist.graph:
+            return 0
+        try:
+            from .edge_types import (
+                EDGE_CAUSES, EDGE_ENABLES, EDGE_PREVENTS,
+                body_channel_node_id, is_body_channel_node, is_felt_place_node,
+                is_forbidden_epistemic_parent,
+            )
+        except Exception:
+            return 0
+
+        # Focus must be a knowledge lemma (not body/felt/SELF/schema shell)
+        fl = str(focus_id)
+        if fl in ("SELF", "OTHER") or fl.startswith(("body:", "felt:", "basin_", "narr:", "world:", "epistemic_")):
+            return 0
+        nd = self.archivist.graph.nodes.get(focus_id, {}) or {}
+        if nd.get("is_schema") or nd.get("node_type") in ("schema", "epistemic_schema"):
+            return 0
+
+        made = 0
+        conf = self.CAUSAL_CONF_START
+        if self.operators is not None:
+            # use mean confidence of this op's body outcomes if any
+            try:
+                confs = [
+                    self.operators.get_confidence(op_name, ch)
+                    for ch in (body_deltas or {})
+                ]
+                if confs:
+                    conf = sum(confs) / len(confs)
+            except Exception:
+                pass
+
+        # Body consequences: focus causes body:channel
+        for ch, dv in (body_deltas or {}).items():
+            if abs(float(dv)) < self.CAUSAL_DELTA_MIN:
+                continue
+            bnode = body_channel_node_id(ch)
+            if bnode not in self.archivist.graph:
+                continue
+            w_inc = min(self.CAUSAL_WEIGHT_CAP, self.CAUSAL_WEIGHT_INC * (abs(float(dv)) / 0.05))
+            try:
+                self.archivist.link(
+                    focus_id, bnode, EDGE_CAUSES,
+                    source="causal_cooccur", placement="act_cooccur",
+                    weight=w_inc, confidence=conf,
+                )
+                made += 1
+            except Exception:
+                pass
+
+        # World consequences
+        for slot, dv in (world_deltas or {}).items():
+            if abs(float(dv)) < self.CAUSAL_DELTA_MIN:
+                continue
+            wnode = self._ensure_world_slot_node(slot)
+            rel = EDGE_ENABLES if float(dv) > 0 else EDGE_PREVENTS
+            # obstacle decrease is more "prevents obstacle" / enables progress
+            if slot == "obstacle" and float(dv) < 0:
+                rel = EDGE_PREVENTS
+            elif float(dv) > 0:
+                rel = EDGE_ENABLES
+            else:
+                rel = EDGE_CAUSES
+            w_inc = min(self.CAUSAL_WEIGHT_CAP, self.CAUSAL_WEIGHT_INC * (abs(float(dv)) / 0.05))
+            try:
+                self.archivist.link(
+                    focus_id, wnode, rel,
+                    source="causal_cooccur", placement="act_cooccur",
+                    weight=w_inc, confidence=conf,
+                )
+                made += 1
+            except Exception:
+                pass
+        return made
 
 
     # --- body ↔ felt co-occurrence weights (option A) ---
@@ -3958,6 +4112,12 @@ class Prometheus:
                 body_for_pred["pleasure"] = _pleasure
         except Exception:
             pass
+        _plan_op = ""
+        try:
+            if getattr(self, "planner", None) is not None:
+                _plan_op = str(self.planner.suggested_operator() or "")
+        except Exception:
+            _plan_op = ""
         dec = self.operators.choose(
             graph=graph,
             focus_id=fid,
@@ -3976,6 +4136,7 @@ class Prometheus:
             pain=_pain,
             pleasure=_pleasure,
             allostatic_escape=_escape,
+            plan_suggested_op=_plan_op,
         )
         # Package A: apply act → body (queued) + world stub (immediate)
         try:
@@ -4009,6 +4170,16 @@ class Prometheus:
                         g.nodes[nid]["body_value"] = max(0.0, min(1.0, cur + float(dv)))
             except Exception:
                 pass
+            # Package B: causal co-occurrence (focus + act → changed targets)
+            try:
+                self._record_causal_cooccurrence(
+                    focus_id=fid,
+                    op_name=op_name,
+                    body_deltas=body_d or {},
+                    world_deltas=world_d or {},
+                )
+            except Exception as e:
+                logger.debug("causal cooccur: %s", e)
         except Exception as e:
             logger.debug("act apply failed: %s", e)
         # Refresh Active Thread from this decision's prediction
@@ -4556,6 +4727,12 @@ class Prometheus:
             "pending_body": rep.get("pending_body_delta") or {},
             "confidence_top": rep.get("outcome_confidence_top") or [],
         }
+
+    def get_plan_report(self) -> dict:
+        """Package D: compositional plan over causal traces."""
+        if getattr(self, "planner", None) is not None:
+            return self.planner.report()
+        return {"active": False}
 
     def get_module_health_report(self) -> dict:
         """Which optional modules imported cleanly (Identity & Hygiene)."""

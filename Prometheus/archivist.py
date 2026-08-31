@@ -445,7 +445,8 @@ class ArchivistModule:
         # the end via prometheus.py's _run_consolidation().
 
     def link(self, node_a: str, node_b: str, relation_type: str, source: str = "user",
-              placement: str = "explicit", felt_state: Optional[str] = None):
+              placement: str = "explicit", felt_state: Optional[str] = None,
+              weight: Optional[float] = None, confidence: Optional[float] = None):
         """
         General typed-edge creator used by association.py's hierarchy
         placement (§2.3). `placement` records whether this edge came from
@@ -455,22 +456,10 @@ class ArchivistModule:
 
         `felt_state` (new, this revision): the felt state active at the
         moment of creation, stamped directly onto the edge as
-        `felt_state_at_creation` when supplied. Fixes a real bug found in
-        reflector.py's schema detection: felt state was previously always
-        reconstructed after the fact via chronos._felt_state_near()'s
-        nearest-preceding-timestamp lookup, but since prometheus.py's
-        pulse() always calls _ingest() (which creates relational edges)
-        before that same tick's chronos.record_pulse(), an edge's own
-        timestamp is always earlier than its own tick's chronos entry --
-        the lookup could only ever find the *previous* tick's felt state,
-        or nothing at all on the very first pulse ever / right after a
-        felt-state transition, silently and permanently dropping a
-        relational edge from schema candidacy even though a real, named
-        felt state was active when it was created. Stamping ground truth
-        directly at creation is far more reliable than reconstructing it
-        approximately afterward. Optional and backward-compatible: edges
-        created without this (including everything in an existing saved
-        graph) fall back to the old timestamp-based reconstruction.
+        `felt_state_at_creation` when supplied.
+
+        Optional `weight` / `confidence` for causal co-occurrence edges
+        (Package B): on re-link, reinforce weight/confidence instead of no-op.
         """
         for n in (node_a, node_b):
             if n not in self.graph:
@@ -534,6 +523,7 @@ class ArchivistModule:
                     return
         # Idempotent: MultiDiGraph otherwise stacks duplicate same-type edges
         # every pulse (WM is-a scaffolding / re-link), which draws "flower" graphs.
+        # Causal co-occurrence: reinforce weight/confidence instead of no-op.
         if self.graph.has_edge(node_a, node_b):
             try:
                 for _k, attr in (self.graph.get_edge_data(node_a, node_b) or {}).items():
@@ -541,13 +531,31 @@ class ArchivistModule:
                         self.graph.nodes[node_a]["last_reinforced"] = datetime.now()
                         if node_b in self.graph.nodes:
                             self.graph.nodes[node_b]["last_reinforced"] = datetime.now()
-                        return  # already linked this way
+                        if weight is not None:
+                            prev = float(attr.get("weight") or 0.0)
+                            attr["weight"] = min(1.0, prev + float(weight))
+                        if confidence is not None:
+                            prev_c = float(attr.get("confidence") or 0.3)
+                            attr["confidence"] = min(1.0, max(prev_c, float(confidence)))
+                        if placement:
+                            attr["placement"] = placement
+                        return
             except Exception:
                 pass
         edge_kwargs = dict(relation_type=relation_type, source=source,
                             placement=placement, created_at=datetime.now().isoformat())
         if felt_state is not None:
             edge_kwargs["felt_state_at_creation"] = felt_state
+        if weight is not None:
+            edge_kwargs["weight"] = float(weight)
+        if confidence is not None:
+            edge_kwargs["confidence"] = float(confidence)
+        try:
+            from .edge_types import get_family, FAMILY_OF
+            if relation_type in FAMILY_OF:
+                edge_kwargs["family"] = get_family(relation_type)
+        except Exception:
+            pass
         self.graph.add_edge(node_a, node_b, **edge_kwargs)
         self.graph.nodes[node_a]["last_reinforced"] = datetime.now()
         # No self.save() here (§4C) -- see store()'s comment. link() is
