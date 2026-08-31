@@ -637,6 +637,30 @@ if st.session_state.prom is not None:
                     for c in conf[:8]:
                         st.write(f"- `{c.get('key')}` → {c.get('confidence')}")
 
+            st.subheader("Plan (compositional)")
+            st.caption(
+                "Package D: short means-end chain from causes/enables/prevents. "
+                "Empty until causal traces exist (Package B)."
+            )
+            try:
+                pr = prom.get_plan_report() if hasattr(prom, "get_plan_report") else {}
+            except Exception as e:
+                pr = {"error": str(e)}
+            if pr and pr.get("active"):
+                st.caption(
+                    f"goal=`{pr.get('goal_id')}` · next=`{pr.get('next_means_id')}` · "
+                    f"op={pr.get('suggested_op')} · {pr.get('note')}"
+                )
+                for i, s in enumerate(pr.get("steps") or []):
+                    mark = "→" if i == pr.get("next_index") else "·"
+                    st.write(
+                        f"{mark} `{s.get('means_id')}` -{s.get('relation')}→ "
+                        f"`{s.get('target_id')}` [{s.get('suggested_op')}] "
+                        f"w={s.get('weight')} c={s.get('confidence')}"
+                    )
+            else:
+                st.caption((pr or {}).get("note") or "No active plan (need goal + causal edges).")
+
             st.subheader("Goals / Commitments")
             st.caption(
                 "Explicit commitments opened by focus dwell. Schema goals track "
