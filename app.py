@@ -648,8 +648,8 @@ if st.session_state.prom is not None:
 
             st.subheader("Plan (compositional)")
             st.caption(
-                "Package D: short means-end chain from causes/enables/prevents. "
-                "Empty until causal traces exist (Package B)."
+                "Package D: means from high-confidence / scored causes only. "
+                "Legacy low-conf edges ignored."
             )
             try:
                 pr = prom.get_plan_report() if hasattr(prom, "get_plan_report") else {}
@@ -668,7 +668,28 @@ if st.session_state.prom is not None:
                         f"w={s.get('weight')} c={s.get('confidence')}"
                     )
             else:
-                st.caption((pr or {}).get("note") or "No active plan (need goal + causal edges).")
+                st.caption((pr or {}).get("note") or "No active plan (need goal + high-conf causes).")
+
+            st.subheader("Schema expectations")
+            st.caption("Map retrieve: members + high-conf causes under focus kind.")
+            try:
+                se = prom.get_schema_expectations() if hasattr(prom, "get_schema_expectations") else {}
+            except Exception as e:
+                se = {"error": str(e)}
+            if se and not se.get("error"):
+                st.caption(
+                    f"root=`{se.get('root')}` · anchor=`{se.get('anchor')}` · {se.get('note')}"
+                )
+                for m in (se.get("members") or [])[:6]:
+                    st.write(f"· member `{m.get('id')}` ({m.get('rel')})")
+                for c in (se.get("causes") or [])[:6]:
+                    tag = "scored" if c.get("scored") else "conf"
+                    st.write(
+                        f"· {c.get('rel')} `{c.get('id')}` "
+                        f"c={c.get('confidence')} L={c.get('link_L')} [{tag}]"
+                    )
+            else:
+                st.caption("No expectations for current focus.")
 
             st.subheader("Goals / Commitments")
             st.caption(
