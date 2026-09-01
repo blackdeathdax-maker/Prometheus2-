@@ -1197,6 +1197,34 @@ class Prometheus:
                     self.operators.update_outcome_confidence(
                         op0, pred_w, before_w, after_w, prefix="world:",
                     )
+                # Evidence spine: credit L from scored body improvement
+                try:
+                    from .evidence import score_body_improvement
+                    pain_b = float(before_b.get("pain", 0) or 0)
+                    pain_a = float(body.get("pain", 0) or 0)
+                    if getattr(self, "allostasis", None) is not None:
+                        pain_a = float(self.allostasis.state.pain or pain_a)
+                    improved, mag = score_body_improvement(
+                        before_b, body,
+                        pain_before=pain_b, pain_after=pain_a,
+                    )
+                    ctx = ""
+                    try:
+                        ctx = str(getattr(self.focus, "focus_id", "") or "")
+                        if ctx.startswith(("body:", "felt:", "epistemic_", "narr:", "world:")):
+                            # resolve lemma if possible
+                            if hasattr(self, "_resolve_causal_anchor"):
+                                ctx = self._resolve_causal_anchor(ctx) or ""
+                    except Exception:
+                        ctx = ""
+                    self.operators.credit_evidence(
+                        op0, improved, context=str(ctx or ""), magnitude=mag,
+                    )
+                    self._last_evidence_credit = {
+                        "op": op0, "improved": improved, "mag": mag, "ctx": ctx,
+                    }
+                except Exception as e:
+                    logger.debug("evidence credit: %s", e)
         except Exception as e:
             logger.debug("outcome confidence update: %s", e)
 

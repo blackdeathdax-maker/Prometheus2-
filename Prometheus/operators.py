@@ -115,6 +115,18 @@ class OperatorModule:
     def __init__(self):
         self.episodes: List[dict] = []
         self.last_decision: Optional[OperatorDecision] = None
+        # Evidence spine: log-odds L separate from bias B
+        try:
+            from .evidence import EvidenceModule
+            self.evidence = EvidenceModule()
+        except Exception:
+            try:
+                from evidence import EvidenceModule
+                self.evidence = EvidenceModule()
+            except Exception:
+                self.evidence = None
+        self._last_L_scores: Dict[str, float] = {}
+        self._last_evidence_led: bool = False
         self.last_predict: Optional[PredictResult] = None
         self._op_ring: List[str] = []
 
@@ -559,6 +571,24 @@ class OperatorModule:
         self.last_predict = pred
 
         scores = {op: 0.0 for op in OPS}
+        # --- L: learned log-odds (data) ---
+        L_scores = {op: 0.0 for op in OPS}
+        ctx = str(focus_id or "")
+        # Prefer lemma-like context only
+        if ctx.startswith(("body:", "felt:", "epistemic_", "narr:", "world:")):
+            ctx = ""
+        try:
+            if self.evidence is not None:
+                self.evidence.decay()
+                L_scores = self.evidence.L_scores(context=ctx)
+                for op_k, Lv in L_scores.items():
+                    # scale L (~[-4,4]) into score space
+                    scores[op_k] = scores.get(op_k, 0.0) + float(Lv) * 0.85
+        except Exception:
+            L_scores = {op: 0.0 for op in OPS}
+        self._last_L_scores = dict(L_scores)
+
+        # --- B: admitted bias (not knowledge) ---
         # Thin C: soft bias from outcome confidence
         try:
             for op_k, add in self.confidence_bias_scores(body).items():
@@ -768,10 +798,18 @@ class OperatorModule:
             scores["HOLD"] = max(scores["HOLD"], 4.0)
             scores["EXPAND"] *= 0.15
 
-        # Pick
+        # Pick (serial commitment)
         op = max(scores, key=lambda k: scores[k])
         if scores[op] <= 0:
             op = "HOLD"
+
+        evidence_led = False
+        try:
+            if self.evidence is not None:
+                evidence_led = self.evidence.evidence_led(op, context=ctx)
+        except Exception:
+            evidence_led = False
+        self._last_evidence_led = bool(evidence_led)
 
         note_parts = [pred.reason]
         if pred.body_reason:
@@ -786,6 +824,16 @@ class OperatorModule:
             note_parts.append(note_barren)
         if intent:
             note_parts.append(f"intent={intent}")
+        # Diagnostics: L vs decision
+        try:
+            Lv = float(L_scores.get(op, 0.0))
+            note_parts.append(f"L_{op}={Lv:.2f}")
+            if evidence_led:
+                note_parts.append("evidence_led")
+            else:
+                note_parts.append("bias_or_weak_L")
+        except Exception:
+            pass
 
         dec = OperatorDecision(
             operator=op,
@@ -830,6 +878,23 @@ class OperatorModule:
         if len(self.episodes) > self.EPISODE_CAP:
             self.episodes = self.episodes[-self.EPISODE_CAP :]
 
+    def credit_evidence(
+        self,
+        chosen: str,
+        improved: Optional[bool],
+        context: str = "",
+        magnitude: float = 1.0,
+    ) -> None:
+        """Write-back: update log-odds from scored outcome."""
+        if self.evidence is None:
+            return
+        try:
+            self.evidence.update(
+                chosen, improved, context=context, magnitude=magnitude
+            )
+        except Exception:
+            pass
+
     def report(self) -> dict:
         top_conf = sorted(
             self.outcome_confidence.items(), key=lambda kv: -kv[1]
@@ -860,6 +925,11 @@ class OperatorModule:
             "last_act_op": self._last_act_op,
             "last_act_body_deltas": dict(self._last_act_body_deltas),
             "last_act_world_deltas": dict(self._last_act_world_deltas),
+            "L_scores": dict(getattr(self, "_last_L_scores", {}) or {}),
+            "evidence_led": bool(getattr(self, "_last_evidence_led", False)),
+            "evidence": (
+                self.evidence.report() if getattr(self, "evidence", None) is not None else {}
+            ),
             "outcome_confidence_top": [
                 {"key": k, "confidence": round(v, 3)} for k, v in top_conf
             ],
