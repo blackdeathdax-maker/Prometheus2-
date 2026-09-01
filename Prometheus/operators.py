@@ -551,6 +551,7 @@ class OperatorModule:
         pain: float = 0.0,
         pleasure: float = 0.0,
         allostatic_escape: str = "",
+        plan_suggested_op: str = "",
     ) -> OperatorDecision:
         pred = self.predict(
             graph, focus_id, goal_targets, wm_slots, residual_top, body=body
@@ -564,6 +565,11 @@ class OperatorModule:
                 scores[op_k] = scores.get(op_k, 0.0) + float(add)
         except Exception:
             pass
+        # Package D: soft bias toward plan's suggested operator
+        if plan_suggested_op:
+            ps = str(plan_suggested_op).upper()
+            if ps in scores:
+                scores[ps] += 1.25
         ring = list(self._op_ring[-16:])
         if not ring:
             ring = [e.get("operator") for e in self.episodes[-16:] if e.get("operator")]
