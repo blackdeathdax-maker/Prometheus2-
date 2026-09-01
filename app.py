@@ -636,6 +636,15 @@ if st.session_state.prom is not None:
                     st.write("**Outcome confidence (top)**")
                     for c in conf[:8]:
                         st.write(f"- `{c.get('key')}` → {c.get('confidence')}")
+                causal = ar.get("causal") or {}
+                if causal:
+                    st.caption(
+                        f"causal B: focus=`{causal.get('focus_id')}` → "
+                        f"anchor=`{causal.get('anchor')}` · made={causal.get('made')} · "
+                        f"{causal.get('note')}"
+                    )
+                    for t in (causal.get("targets") or [])[:6]:
+                        st.write(f"- {t.get('rel')} → `{t.get('to')}` (Δ={t.get('dv')})")
 
             st.subheader("Plan (compositional)")
             st.caption(
