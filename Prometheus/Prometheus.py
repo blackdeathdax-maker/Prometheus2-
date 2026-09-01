@@ -1223,6 +1223,38 @@ class Prometheus:
                     self._last_evidence_credit = {
                         "op": op0, "improved": improved, "mag": mag, "ctx": ctx,
                     }
+                    # Package B: commit causal edges only on scored improvement
+                    try:
+                        pending = getattr(self, "_pending_causal", None) or {}
+                        if pending and improved is True:
+                            # Keep only channels that moved toward comfort setpoints
+                            body_d = dict(pending.get("body_deltas") or {})
+                            before_b2 = dict(before_b or {})
+                            filtered = {}
+                            comfort_low = ("pain", "muscle_tension", "sweat_skin", "gut")
+                            comfort_high = ("energy", "pleasure", "warmth")
+                            for ch, dv in body_d.items():
+                                dv = float(dv)
+                                if ch in comfort_low and dv < -0.005:
+                                    filtered[ch] = dv  # lowered bad channel
+                                elif ch in comfort_high and dv > 0.005:
+                                    filtered[ch] = dv  # raised good channel
+                                elif ch == "breath" and abs(dv) >= 0.01:
+                                    filtered[ch] = dv
+                                elif ch == "heart_rate" and dv < -0.005:
+                                    filtered[ch] = dv  # calm
+                            self._record_causal_cooccurrence(
+                                focus_id=pending.get("focus_id"),
+                                op_name=str(pending.get("op_name") or op0),
+                                body_deltas=filtered,
+                                world_deltas=dict(pending.get("world_deltas") or {}),
+                            )
+                        elif pending and improved is False:
+                            # Miss: do not mint; clear
+                            pass
+                        self._pending_causal = None
+                    except Exception as e:
+                        logger.debug("causal commit: %s", e)
                 except Exception as e:
                     logger.debug("evidence credit: %s", e)
         except Exception as e:
@@ -2339,12 +2371,15 @@ class Prometheus:
                 except Exception:
                     continue
             w_inc = min(self.CAUSAL_WEIGHT_CAP, self.CAUSAL_WEIGHT_INC * (abs(float(dv)) / 0.05))
+            # Scored-improvement path: higher confidence + link_L bump
+            conf_use = max(float(conf), 0.45)
             try:
                 self.archivist.link(
                     anchor, bnode, EDGE_CAUSES,
                     source="causal_cooccur", placement="act_cooccur",
-                    weight=w_inc, confidence=conf,
+                    weight=w_inc, confidence=conf_use,
                 )
+                self._stamp_causal_edge(anchor, bnode, EDGE_CAUSES, hit=True)
                 made += 1
                 self._last_causal_report["targets"].append(
                     {"rel": EDGE_CAUSES, "to": bnode, "dv": float(dv)}
@@ -2364,12 +2399,14 @@ class Prometheus:
             else:
                 rel = EDGE_CAUSES
             w_inc = min(self.CAUSAL_WEIGHT_CAP, self.CAUSAL_WEIGHT_INC * (abs(float(dv)) / 0.05))
+            conf_use = max(float(conf), 0.45)
             try:
                 self.archivist.link(
                     anchor, wnode, rel,
                     source="causal_cooccur", placement="act_cooccur",
-                    weight=w_inc, confidence=conf,
+                    weight=w_inc, confidence=conf_use,
                 )
+                self._stamp_causal_edge(anchor, wnode, rel, hit=True)
                 made += 1
                 self._last_causal_report["targets"].append(
                     {"rel": rel, "to": wnode, "dv": float(dv)}
@@ -2379,6 +2416,103 @@ class Prometheus:
         self._last_causal_report["made"] = made
         self._last_causal_report["note"] = "ok" if made else "no_significant_delta"
         return made
+
+    def _stamp_causal_edge(self, src: str, dst: str, rel: str, hit: bool = True) -> None:
+        """Link-level evidence: scored_improve flag + link_L log-odds bump."""
+        g = self.archivist.graph
+        try:
+            for _k, attr in (g.get_edge_data(src, dst) or {}).items():
+                if not isinstance(attr, dict):
+                    continue
+                if attr.get("relation_type") != rel:
+                    continue
+                attr["scored_improve"] = bool(hit)
+                attr["evidence_credit"] = True
+                prev = float(attr.get("link_L") or 0.0)
+                attr["link_L"] = max(-3.0, min(3.0, prev + (0.25 if hit else -0.25)))
+                c = float(attr.get("confidence") or 0.3)
+                attr["confidence"] = max(0.15, min(0.95, c + (0.05 if hit else -0.06)))
+                break
+        except Exception:
+            pass
+
+    def get_schema_expectations(self, root_id: Optional[str] = None) -> dict:
+        """Map-conditioned expectations from schema members + high-conf causes.
+
+        Parallel retrieve: what the active kind leads us to expect next.
+        """
+        g = self.archivist.graph
+        fid = root_id or (self.focus.focus_id if self.focus else None)
+        if not fid or fid not in g:
+            return {"root": fid, "members": [], "causes": [], "note": "no_root"}
+        # Prefer schema shell if focus is lemma with epistemic parent
+        root = fid
+        nd = g.nodes.get(fid, {}) or {}
+        if nd.get("node_type") not in ("schema", "epistemic_schema") and not nd.get("is_schema"):
+            # try epistemic_of_<name>
+            for cand in (f"epistemic_of_{fid}", f"epistemic_of_{str(fid).capitalize()}"):
+                if cand in g:
+                    root = cand
+                    break
+        members = []
+        causes = []
+        anchor = fid
+        try:
+            if hasattr(self, "_resolve_causal_anchor"):
+                anchor = self._resolve_causal_anchor(fid) or fid
+        except Exception:
+            anchor = fid
+        try:
+            for _, v, data in g.out_edges(root, data=True):
+                rel = (data or {}).get("relation_type") or ""
+                if rel in ("composed-of", "part-of"):
+                    members.append({
+                        "id": v,
+                        "rel": rel,
+                        "weight": (data or {}).get("weight"),
+                    })
+                if rel in ("causes", "enables", "prevents"):
+                    c = float((data or {}).get("confidence") or 0)
+                    if c >= 0.4 or (data or {}).get("scored_improve"):
+                        causes.append({
+                            "id": v,
+                            "rel": rel,
+                            "confidence": c,
+                            "weight": (data or {}).get("weight"),
+                            "link_L": (data or {}).get("link_L"),
+                            "scored": bool((data or {}).get("scored_improve")),
+                        })
+            if anchor and anchor in g and anchor != root:
+                for _, v, data in g.out_edges(anchor, data=True):
+                    rel = (data or {}).get("relation_type") or ""
+                    if rel in ("causes", "enables", "prevents"):
+                        c = float((data or {}).get("confidence") or 0)
+                        if c >= 0.4 or (data or {}).get("scored_improve"):
+                            causes.append({
+                                "id": v,
+                                "rel": rel,
+                                "confidence": c,
+                                "weight": (data or {}).get("weight"),
+                                "link_L": (data or {}).get("link_L"),
+                                "scored": bool((data or {}).get("scored_improve")),
+                                "from": anchor,
+                            })
+        except Exception:
+            pass
+        seen = set()
+        uniq = []
+        for row in causes:
+            if row["id"] in seen:
+                continue
+            seen.add(row["id"])
+            uniq.append(row)
+        return {
+            "root": root,
+            "anchor": anchor,
+            "members": members[:12],
+            "causes": uniq[:12],
+            "note": f"members={len(members)} causes={len(uniq)}",
+        }
 
 
     # --- body ↔ felt co-occurrence weights (option A) ---
@@ -4280,16 +4414,17 @@ class Prometheus:
                         g.nodes[nid]["body_value"] = max(0.0, min(1.0, cur + float(dv)))
             except Exception:
                 pass
-            # Package B: causal co-occurrence (focus + act → changed targets)
+            # Package B: queue candidates; commit next pulse only if score improved
             try:
-                self._record_causal_cooccurrence(
-                    focus_id=fid,
-                    op_name=op_name,
-                    body_deltas=body_d or {},
-                    world_deltas=world_d or {},
-                )
+                self._pending_causal = {
+                    "focus_id": fid,
+                    "op_name": op_name,
+                    "body_deltas": dict(body_d or {}),
+                    "world_deltas": dict(world_d or {}),
+                    "pulse": int(getattr(self, "pulse_count", 0) or 0),
+                }
             except Exception as e:
-                logger.debug("causal cooccur: %s", e)
+                logger.debug("causal queue: %s", e)
         except Exception as e:
             logger.debug("act apply failed: %s", e)
         # Refresh Active Thread from this decision's prediction

@@ -73,8 +73,9 @@ class PlanModule:
     """Build and advance short means-end plans for active goals."""
 
     MAX_STEPS = 4
-    MIN_EDGE_WEIGHT = 0.08
-    MIN_CONFIDENCE = 0.25
+    MIN_EDGE_WEIGHT = 0.12
+    MIN_CONFIDENCE = 0.40       # only high-confidence causes feed plans
+    REQUIRE_SCORED = True       # prefer edges stamped from improved outcomes
     ADVANCE_WEIGHT = 0.35       # edge weight high enough to treat step as used
 
     def __init__(self):
@@ -148,22 +149,41 @@ class PlanModule:
             self.last_plan = plan
             return plan
 
-        # Rank edges by weight * confidence
+        # Rank edges by weight * confidence; prefer scored-improvement stamps
         ranked = []
         for src, rel, dst, data in edges:
             w = float(data.get("weight") or 0.0)
             c = float(data.get("confidence") or 0.3)
+            scored = bool(data.get("scored_improve") or data.get("evidence_credit"))
+            if c < self.MIN_CONFIDENCE and not scored:
+                continue
             if w < self.MIN_EDGE_WEIGHT and c < self.MIN_CONFIDENCE:
                 continue
-            # Prefer edges that point at body/world (actionable consequences)
-            # or from means lemma toward goal
+            if self.REQUIRE_SCORED and not scored and c < 0.55:
+                # Legacy unscoring edges need higher confidence to enter plans
+                continue
             score = w * (0.5 + c)
+            if scored:
+                score *= 1.5
             if str(dst).startswith(("body:", "world:")):
                 score *= 1.4
             if src == goal_id or dst == goal_id:
                 score *= 1.2
+            # link-level L if present
+            try:
+                score += 0.3 * float(data.get("link_L") or 0.0)
+            except Exception:
+                pass
             ranked.append((score, src, rel, dst, data))
         ranked.sort(key=lambda t: -t[0])
+        if not ranked:
+            plan = Plan(
+                goal_id=goal_id, steps=[], pulse_built=pulse,
+                note="no_high_conf_causal",
+            )
+            self.plans[goal_id] = plan
+            self.last_plan = plan
+            return plan
 
         steps: List[PlanStep] = []
         seen_means = set()
