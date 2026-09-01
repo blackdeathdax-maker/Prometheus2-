@@ -2177,6 +2177,67 @@ class Prometheus:
             g.nodes[nid]["growable"] = False
         return nid
 
+    def _resolve_causal_anchor(self, focus_id: Optional[str]) -> Optional[str]:
+        """Map focus to a lemma suitable as causal edge source.
+
+        Package B must not attach causes to schemas / body / shells.
+        Prefer: plain lemma → dominant_parent / name of schema → epistemic tail.
+        """
+        if not focus_id:
+            return None
+        g = self.archivist.graph
+        fl = str(focus_id)
+
+        def _usable(nid: str) -> bool:
+            if not nid or nid not in g:
+                return False
+            low = str(nid)
+            if low in ("SELF", "OTHER"):
+                return False
+            if low.startswith(("body:", "felt:", "basin_", "narr:", "world:", "epistemic_")):
+                return False
+            # sentence-like pollution ("Joy causes body: warmth")
+            if " " in low or " causes " in low.casefold() or " enables " in low.casefold():
+                return False
+            nd = g.nodes.get(nid, {}) or {}
+            if nd.get("is_schema") or nd.get("node_type") in ("schema", "epistemic_schema"):
+                return False
+            return True
+
+        if _usable(fl):
+            return fl
+        # casefold match among non-schema lemmas
+        try:
+            want = fl.casefold()
+            for n in g.nodes:
+                if str(n).casefold() == want and _usable(str(n)):
+                    return str(n)
+        except Exception:
+            pass
+        nd = g.nodes.get(focus_id, {}) or {}
+        # epistemic_of_joy → joy
+        if fl.startswith("epistemic_of_"):
+            tail = fl[len("epistemic_of_"):]
+            if tail.startswith("body:") or tail.startswith("felt:"):
+                return None
+            for cand in (tail, tail.casefold(), tail.replace("_", " ")):
+                if _usable(cand):
+                    return cand
+                # create lemma if missing? no — only attach to existing knowledge
+                for n in g.nodes:
+                    if str(n).casefold() == str(cand).casefold() and _usable(str(n)):
+                        return str(n)
+        # schema with name / dominant_parent
+        for key in ("dominant_parent", "name", "lemma"):
+            cand = nd.get(key)
+            if cand and _usable(str(cand)):
+                return str(cand)
+            if cand:
+                for n in g.nodes:
+                    if str(n).casefold() == str(cand).casefold() and _usable(str(n)):
+                        return str(n)
+        return None
+
     def _record_causal_cooccurrence(
         self,
         focus_id: Optional[str],
@@ -2188,35 +2249,37 @@ class Prometheus:
 
         Co-occurrence rule (user default for B):
           focus active + operator applied + |delta| >= CAUSAL_DELTA_MIN
-          → focus --causes--> body:channel   (body change)
-          → focus --enables--> world:slot    (positive world change)
-          → focus --prevents--> world:slot   (negative world change on obstacle-like)
+          → anchor --causes--> body:channel
+          → anchor --enables--> world:slot    (positive)
+          → anchor --prevents--> world:slot   (obstacle down)
 
         Never uses is-a on body/world. Weight + confidence on edge for thin C continuity.
         """
-        if not focus_id or focus_id not in self.archivist.graph:
-            return 0
         try:
             from .edge_types import (
                 EDGE_CAUSES, EDGE_ENABLES, EDGE_PREVENTS,
-                body_channel_node_id, is_body_channel_node, is_felt_place_node,
-                is_forbidden_epistemic_parent,
+                body_channel_node_id,
             )
         except Exception:
             return 0
 
-        # Focus must be a knowledge lemma (not body/felt/SELF/schema shell)
-        fl = str(focus_id)
-        if fl in ("SELF", "OTHER") or fl.startswith(("body:", "felt:", "basin_", "narr:", "world:", "epistemic_")):
-            return 0
-        nd = self.archivist.graph.nodes.get(focus_id, {}) or {}
-        if nd.get("is_schema") or nd.get("node_type") in ("schema", "epistemic_schema"):
+        anchor = self._resolve_causal_anchor(focus_id)
+        self._last_causal_report = {
+            "focus_id": focus_id,
+            "anchor": anchor,
+            "op": op_name,
+            "body_deltas": dict(body_deltas or {}),
+            "world_deltas": dict(world_deltas or {}),
+            "made": 0,
+            "targets": [],
+        }
+        if not anchor:
+            self._last_causal_report["note"] = "no_lemma_anchor"
             return 0
 
         made = 0
         conf = self.CAUSAL_CONF_START
         if self.operators is not None:
-            # use mean confidence of this op's body outcomes if any
             try:
                 confs = [
                     self.operators.get_confidence(op_name, ch)
@@ -2227,21 +2290,37 @@ class Prometheus:
             except Exception:
                 pass
 
-        # Body consequences: focus causes body:channel
+        g = self.archivist.graph
+        # Body consequences: anchor causes body:channel
         for ch, dv in (body_deltas or {}).items():
             if abs(float(dv)) < self.CAUSAL_DELTA_MIN:
                 continue
             bnode = body_channel_node_id(ch)
-            if bnode not in self.archivist.graph:
-                continue
+            if bnode not in g:
+                # ensure anatomy node exists (still not is-a / not growable)
+                try:
+                    g.add_node(
+                        bnode,
+                        node_type="body_channel",
+                        is_body_channel=True,
+                        growable=False,
+                        source="body_surface",
+                        body_value=0.5,
+                        activation=0.0,
+                    )
+                except Exception:
+                    continue
             w_inc = min(self.CAUSAL_WEIGHT_CAP, self.CAUSAL_WEIGHT_INC * (abs(float(dv)) / 0.05))
             try:
                 self.archivist.link(
-                    focus_id, bnode, EDGE_CAUSES,
+                    anchor, bnode, EDGE_CAUSES,
                     source="causal_cooccur", placement="act_cooccur",
                     weight=w_inc, confidence=conf,
                 )
                 made += 1
+                self._last_causal_report["targets"].append(
+                    {"rel": EDGE_CAUSES, "to": bnode, "dv": float(dv)}
+                )
             except Exception:
                 pass
 
@@ -2250,8 +2329,6 @@ class Prometheus:
             if abs(float(dv)) < self.CAUSAL_DELTA_MIN:
                 continue
             wnode = self._ensure_world_slot_node(slot)
-            rel = EDGE_ENABLES if float(dv) > 0 else EDGE_PREVENTS
-            # obstacle decrease is more "prevents obstacle" / enables progress
             if slot == "obstacle" and float(dv) < 0:
                 rel = EDGE_PREVENTS
             elif float(dv) > 0:
@@ -2261,13 +2338,18 @@ class Prometheus:
             w_inc = min(self.CAUSAL_WEIGHT_CAP, self.CAUSAL_WEIGHT_INC * (abs(float(dv)) / 0.05))
             try:
                 self.archivist.link(
-                    focus_id, wnode, rel,
+                    anchor, wnode, rel,
                     source="causal_cooccur", placement="act_cooccur",
                     weight=w_inc, confidence=conf,
                 )
                 made += 1
+                self._last_causal_report["targets"].append(
+                    {"rel": rel, "to": wnode, "dv": float(dv)}
+                )
             except Exception:
                 pass
+        self._last_causal_report["made"] = made
+        self._last_causal_report["note"] = "ok" if made else "no_significant_delta"
         return made
 
 
@@ -4720,13 +4802,19 @@ class Prometheus:
         if getattr(self, "operators", None) is None:
             return {}
         rep = self.operators.report()
-        return {
+        out = {
             "last_op": rep.get("last_act_op") or rep.get("last_operator"),
             "body_deltas": rep.get("last_act_body_deltas") or {},
             "world_deltas": rep.get("last_act_world_deltas") or {},
             "pending_body": rep.get("pending_body_delta") or {},
             "confidence_top": rep.get("outcome_confidence_top") or [],
         }
+        # Package B last pulse diagnostic
+        try:
+            out["causal"] = dict(getattr(self, "_last_causal_report", {}) or {})
+        except Exception:
+            out["causal"] = {}
+        return out
 
     def get_plan_report(self) -> dict:
         """Package D: compositional plan over causal traces."""
