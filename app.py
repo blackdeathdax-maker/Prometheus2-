@@ -992,6 +992,13 @@ if st.session_state.prom is not None:
                     f"**{opr['last_operator']}** — {opr.get('last_note','')} "
                     f"(predict: {opr.get('last_predict',{})})"
                 )
+            # Evidence spine: L (log-odds) vs bias-led choice
+            ev = opr.get("evidence") or {}
+            Lsc = opr.get("L_scores") or (ev.get("L") if ev else {}) or {}
+            if Lsc:
+                led = "evidence_led" if opr.get("evidence_led") else "bias_or_weak_L"
+                st.caption(f"Evidence L (log-odds) · decision={led} · θ={ev.get('theta', 0.85)}")
+                st.write(" · ".join(f"{k}={v}" for k, v in Lsc.items()))
             eps = opr.get("episodes") or []
             if eps:
                 with st.expander(f"Recent episodes ({len(eps)})"):
