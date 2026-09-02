@@ -2,7 +2,7 @@ import os
 import random
 import logging
 from collections import deque
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from .hormonal import BioSystem, Epoch
 from .archivist import ArchivistModule, TIER_WORKING, TIER_TRUSTED, SELF_NODE, OTHER_NODE
@@ -2443,37 +2443,50 @@ class Prometheus:
             pass
 
     def _apply_schema_expectation_error(self) -> dict:
-        """If focus kind expects members/causes that are cold, raise residual + explore.
+        """Map predict→score→credit: expected members/causes vs warmth.
 
-        Write-back for map use: expectation miss → attention pressure, not new ontology.
+        - Hit/miss updates schema reliability (same teacher idea as op L)
+        - Cold expected nodes get residual boost
+        - Persistent misses soft-demote composed-of / weak causal membership
+        - High miss ratio → explore nudge
         """
         g = self.archivist.graph
         fid = self.focus.focus_id if self.focus else None
+        if not hasattr(self, "_schema_reliability"):
+            self._schema_reliability: Dict[str, float] = {}
+        if not hasattr(self, "_expect_miss_streak"):
+            self._expect_miss_streak: Dict[str, int] = {}
+
         report = {
             "focus": fid,
             "expected": 0,
             "hits": 0,
             "misses": [],
             "boosted": [],
+            "demoted": [],
             "explore_nudge": False,
+            "reliability": None,
         }
         if not fid or fid not in g:
             self._last_expectation_error = report
             return report
+
         exp = self.get_schema_expectations(fid)
+        root = str(exp.get("root") or fid)
         members = list(exp.get("members") or [])
         causes = list(exp.get("causes") or [])
-        # Candidates to expect "warm": member ids + non-body cause targets that are lemmas
+
         expected_ids = []
+        member_set = set()
         for m in members:
             mid = m.get("id")
             if mid and mid in g and not str(mid).startswith(("body:", "world:", "felt:")):
                 expected_ids.append(str(mid))
+                member_set.add(str(mid))
         for c in causes:
             cid = c.get("id")
             if not cid or cid not in g:
                 continue
-            # Body/world causes: "hit" if channel elevated or recently credited
             if str(cid).startswith("body:"):
                 try:
                     bv = float((g.nodes.get(cid) or {}).get("body_value") or 0.5)
@@ -2487,43 +2500,57 @@ class Prometheus:
             if str(cid).startswith(("world:", "felt:")):
                 continue
             expected_ids.append(str(cid))
-        # Dedupe
+
         seen = set()
         expected_ids = [x for x in expected_ids if not (x in seen or seen.add(x))]
-        report["expected"] = len(expected_ids) + len([m for m in report.get("misses", [])])
+        report["expected"] = len(expected_ids)
 
         act_threshold = 0.12
+        hit_n = int(report["hits"])
+        miss_n = 0
         for nid in expected_ids[:16]:
             try:
                 nd = g.nodes.get(nid) or {}
                 act = float(nd.get("activation") or 0.0)
-                res = 0.0
                 try:
                     res = float(self.focus.total_residual(nid) or 0.0)
                 except Exception:
                     res = float((self.focus.residuals or {}).get(nid, 0) or 0)
                 if act >= act_threshold or res >= 0.35:
-                    report["hits"] += 1
+                    hit_n += 1
+                    self._expect_miss_streak[nid] = 0
                 else:
+                    miss_n += 1
                     report["misses"].append(nid)
-                    # Write-back: warm the missing expected node
                     self.focus.boost_residual(nid, amount=0.22)
                     report["boosted"].append(nid)
+                    streak = int(self._expect_miss_streak.get(nid, 0) or 0) + 1
+                    self._expect_miss_streak[nid] = streak
+                    # Persistent miss (≥8 pulses cold while expected) → soft demote edge
+                    if streak >= 8 and streak % 4 == 0:
+                        dem = self._demote_expectation_edge(root, nid, is_member=(nid in member_set))
+                        if dem:
+                            report["demoted"].append(nid)
             except Exception:
                 pass
 
-        # Sustained miss ratio → mild explore pressure (Active Thread / bias hint)
-        n_miss = len(report["misses"])
-        n_exp = max(1, len(expected_ids) + n_miss)
-        miss_ratio = n_miss / float(max(1, len(expected_ids))) if expected_ids else 0.0
-        if expected_ids and miss_ratio >= 0.5 and n_miss >= 2:
+        report["hits"] = hit_n
+        total = max(1, hit_n + miss_n)
+        miss_ratio = miss_n / float(total) if (hit_n + miss_n) else 0.0
+
+        # Schema reliability in [0, 1] — slow EMA from hit rate
+        prev_r = float(self._schema_reliability.get(root, 0.5))
+        instant = hit_n / float(total)
+        new_r = 0.92 * prev_r + 0.08 * instant
+        self._schema_reliability[root] = max(0.05, min(0.95, new_r))
+        report["reliability"] = round(new_r, 3)
+
+        if expected_ids and miss_ratio >= 0.5 and miss_n >= 2:
             report["explore_nudge"] = True
-            # Prefer EXPAND path: boost residual on focus itself slightly
             try:
                 self.focus.boost_residual(fid, amount=0.12)
             except Exception:
                 pass
-            # Stash for operators / thread (read next cognition step)
             self._expectation_explore_nudge = True
         else:
             self._expectation_explore_nudge = False
@@ -2531,8 +2558,60 @@ class Prometheus:
         report["miss_ratio"] = round(miss_ratio, 3)
         report["misses"] = report["misses"][:12]
         report["boosted"] = report["boosted"][:12]
+        report["demoted"] = report["demoted"][:8]
+        report["root"] = root
         self._last_expectation_error = report
         return report
+
+    def _demote_expectation_edge(self, root: str, child: str, is_member: bool = True) -> bool:
+        """Soft-down composed-of (or weak causal) when expectation persistently fails."""
+        g = self.archivist.graph
+        if not root or not child or root not in g or child not in g:
+            return False
+        rels = ("composed-of", "part-of") if is_member else ("causes", "enables", "associated-with")
+        changed = False
+        try:
+            edges = g.get_edge_data(root, child) or {}
+            # MultiGraph: edges is dict of key -> attr
+            if edges and not any(isinstance(v, dict) and "relation_type" in v for v in edges.values()):
+                # simple edge dict
+                candidates = [edges] if isinstance(edges, dict) else []
+            else:
+                candidates = list(edges.values()) if isinstance(edges, dict) else []
+            for attr in candidates:
+                if not isinstance(attr, dict):
+                    continue
+                rel = attr.get("relation_type") or ""
+                if rel not in rels:
+                    continue
+                # Never demote user/teach strongly
+                src = str(attr.get("source") or "")
+                if src in ("user", "teach", "pedagogical") and float(attr.get("confidence") or 0.5) >= 0.55:
+                    continue
+                w = float(attr.get("weight") or 0.5)
+                c = float(attr.get("confidence") or 0.4)
+                attr["weight"] = max(0.05, w * 0.85)
+                attr["confidence"] = max(0.08, c * 0.88)
+                attr["expect_demoted"] = True
+                changed = True
+            # Also try reverse part-of
+            if is_member and not changed:
+                redges = g.get_edge_data(child, root) or {}
+                rvals = list(redges.values()) if isinstance(redges, dict) else []
+                for attr in rvals:
+                    if not isinstance(attr, dict):
+                        continue
+                    if (attr.get("relation_type") or "") != "part-of":
+                        continue
+                    w = float(attr.get("weight") or 0.5)
+                    c = float(attr.get("confidence") or 0.4)
+                    attr["weight"] = max(0.05, w * 0.85)
+                    attr["confidence"] = max(0.08, c * 0.88)
+                    attr["expect_demoted"] = True
+                    changed = True
+        except Exception:
+            return False
+        return changed
 
     def get_schema_expectations(self, root_id: Optional[str] = None) -> dict:
         """Map-conditioned expectations from schema members + high-conf causes.
