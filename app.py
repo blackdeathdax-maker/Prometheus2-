@@ -697,12 +697,18 @@ if st.session_state.prom is not None:
                 eer = {}
             if eer and eer.get("focus"):
                 st.caption(
-                    f"Expectation error: hits={eer.get('hits')} misses={len(eer.get('misses') or [])} "
-                    f"ratio={eer.get('miss_ratio')} explore={eer.get('explore_nudge')} "
-                    f"reliability={eer.get('reliability')}"
+                    f"Info credit: hits={eer.get('hits')} misses={len(eer.get('misses') or [])} "
+                    f"ratio={eer.get('miss_ratio')} info={eer.get('info_score')} "
+                    f"reliability={eer.get('reliability')} explore={eer.get('explore_nudge')}"
                 )
+                if eer.get("info_credit_op"):
+                    st.caption(
+                        f"info→L: op={eer.get('info_credit_op')} improved={eer.get('info_improved')}"
+                    )
                 if eer.get("boosted"):
                     st.write("boosted: " + ", ".join(f"`{x}`" for x in (eer.get("boosted") or [])[:8]))
+                if eer.get("promoted"):
+                    st.write("promoted: " + ", ".join(f"`{x}`" for x in (eer.get("promoted") or [])[:8]))
                 if eer.get("demoted"):
                     st.write("demoted: " + ", ".join(f"`{x}`" for x in (eer.get("demoted") or [])[:8]))
 
