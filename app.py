@@ -690,6 +690,18 @@ if st.session_state.prom is not None:
                     )
             else:
                 st.caption("No expectations for current focus.")
+            # Expectation error write-back
+            try:
+                eer = getattr(prom, "_last_expectation_error", None) or {}
+            except Exception:
+                eer = {}
+            if eer and eer.get("focus"):
+                st.caption(
+                    f"Expectation error: hits={eer.get('hits')} misses={len(eer.get('misses') or [])} "
+                    f"ratio={eer.get('miss_ratio')} explore={eer.get('explore_nudge')}"
+                )
+                if eer.get("boosted"):
+                    st.write("boosted: " + ", ".join(f"`{x}`" for x in (eer.get("boosted") or [])[:8]))
 
             st.subheader("Goals / Commitments")
             st.caption(
