@@ -712,6 +712,26 @@ if st.session_state.prom is not None:
                 if eer.get("demoted"):
                     st.write("demoted: " + ", ".join(f"`{x}`" for x in (eer.get("demoted") or [])[:8]))
 
+            st.subheader("Episodes (F)")
+            st.caption(
+                "Minimal act traces (lemma|op). Consolidation replays consistent successes → mild L re-credit."
+            )
+            try:
+                er = prom.get_episode_report() if hasattr(prom, "get_episode_report") else {}
+            except Exception as e:
+                er = {"error": str(e)}
+            if er and not er.get("error"):
+                st.caption(f"buffer={er.get('buffer', 0)}")
+                for p in (er.get("top_patterns") or [])[:6]:
+                    st.write(
+                        f"· `{p.get('key')}` ×{p.get('count')} net={p.get('net_improve')}"
+                    )
+                lr = er.get("last_replay") or {}
+                if lr.get("replayed"):
+                    st.caption(f"last replay: {lr.get('replayed')} patterns")
+            else:
+                st.caption("No episode log yet.")
+
             st.subheader("Goals / Commitments")
             st.caption(
                 "Explicit commitments opened by focus dwell. Schema goals track "
