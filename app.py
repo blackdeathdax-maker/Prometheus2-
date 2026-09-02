@@ -648,8 +648,8 @@ if st.session_state.prom is not None:
 
             st.subheader("Plan (compositional)")
             st.caption(
-                "Package D: means from high-confidence / scored causes only. "
-                "Legacy low-conf edges ignored."
+                "D+G: scored causal chains (depth≤3, forward+backward). "
+                "Low-conf / negative link_L edges ignored."
             )
             try:
                 pr = prom.get_plan_report() if hasattr(prom, "get_plan_report") else {}
