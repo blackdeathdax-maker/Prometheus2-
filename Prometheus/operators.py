@@ -735,11 +735,16 @@ class OperatorModule:
         else:
             note_barren = ""
         if intent == "REGULATE":
-            scores["SETTLE"] = max(scores["SETTLE"], 3.0)
-            scores["RELEASE"] = max(scores["RELEASE"], 2.2)
-            scores["EXPAND"] *= 0.25
-            scores["HOLD"] *= 0.85
+            scores["SETTLE"] = max(scores["SETTLE"], 3.6)
+            scores["RELEASE"] = max(scores["RELEASE"], 2.8)
+            scores["EXPAND"] *= 0.18
+            scores["HOLD"] *= 0.80
             force_expand = False
+            if float(pain or 0.0) >= 0.45 or (
+                body and float(body.get("muscle_tension", 0) or 0) >= 0.55
+            ):
+                scores["SETTLE"] = max(scores["SETTLE"], 4.2)
+                scores["RELEASE"] = max(scores["RELEASE"], 3.2)
         elif intent == "LEARN":
             if lookup_budget_ok and not barren_focus:
                 scores["EXPAND"] = max(scores["EXPAND"], 2.6)

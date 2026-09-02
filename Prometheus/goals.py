@@ -88,10 +88,11 @@ class GoalModule:
     RESIDUAL_BOOST = 1.8
     CLOSURE_BOOST_SCALE = 0.55
     HISTORY_CAP = 40
-    # Cognitive Continuity: REGULATE + high body_error soft-delays satisfy
+    # Cognitive Continuity: REGULATE + high body_error holds satisfy until cool or timeout
     BODY_ERROR_DELAY_THRESHOLD = 0.18
-    REGULATE_DELAY_PULSES = 20          # extra dwell required while regulating
-    REGULATE_TIMEOUT_PULSES = 120       # never stick forever
+    REGULATE_DELAY_PULSES = 36          # extra dwell floor while regulating
+    REGULATE_TIMEOUT_PULSES = 150       # never stick forever
+    REGULATE_COOL_THRESHOLD = 0.12      # body_err must fall below this to satisfy early
 
     def __init__(self):
         self.active: Dict[str, Commitment] = {}
@@ -455,18 +456,31 @@ class GoalModule:
                 can_close = grew if g.is_schema_goal else (cooled or grew)
                 if g.is_schema_goal and cooled and not grew:
                     can_close = False  # stay open until real members
-                # Cognitive Continuity: REGULATE + high body_error → soft delay
-                # (timeout so goals cannot stick forever)
+                # REGULATE path: hold satisfy while body error high (until cool or timeout)
                 age = max(0, pulse - int(g.created_pulse or pulse))
-                if (
-                    can_close
-                    and intent == "REGULATE"
-                    and body_err >= self.BODY_ERROR_DELAY_THRESHOLD
-                    and age < self.REGULATE_TIMEOUT_PULSES
-                ):
-                    # Require extra dwell while regulating under body error
-                    if g.dwell_pulses < self.SATISFY_MIN_DWELL + self.REGULATE_DELAY_PULSES:
+                regulating = (
+                    intent == "REGULATE"
+                    or body_err >= self.BODY_ERROR_DELAY_THRESHOLD
+                )
+                if can_close and regulating and age < self.REGULATE_TIMEOUT_PULSES:
+                    # Need body error cooled OR extra dwell floor under REGULATE
+                    cooled_body = body_err < self.REGULATE_COOL_THRESHOLD
+                    dwell_ok = g.dwell_pulses >= (
+                        self.SATISFY_MIN_DWELL + self.REGULATE_DELAY_PULSES
+                    )
+                    if not cooled_body:
+                        # Still in error: do not satisfy on residual/schema alone
                         can_close = False
+                        try:
+                            g.last_block_reason = "regulate_body_error"
+                        except Exception:
+                            pass
+                    elif not dwell_ok and intent == "REGULATE":
+                        can_close = False
+                        try:
+                            g.last_block_reason = "regulate_dwell"
+                        except Exception:
+                            pass
                 if can_close:
                     reason = []
                     if cooled and not g.is_schema_goal:
@@ -480,8 +494,11 @@ class GoalModule:
                                 g.growth_events,
                             )
                         )
-                    if intent == "REGULATE" and body_err >= self.BODY_ERROR_DELAY_THRESHOLD:
-                        reason.append("regulate_timeout_or_cooled")
+                    if regulating:
+                        if body_err < self.REGULATE_COOL_THRESHOLD:
+                            reason.append("regulate_body_cooled")
+                        elif age >= self.REGULATE_TIMEOUT_PULSES:
+                            reason.append("regulate_timeout")
                     self._close(
                         g, status="satisfied", pulse=pulse,
                         reason="+".join(reason) or "satisfied",

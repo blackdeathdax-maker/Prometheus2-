@@ -1428,6 +1428,12 @@ class Prometheus:
         except Exception as e:
             logger.debug("schema-guided focus warm failed: %s", e)
 
+        # Schema expectation error: expected members/causes not active under dwell
+        try:
+            self._apply_schema_expectation_error()
+        except Exception as e:
+            logger.debug("schema expectation error: %s", e)
+
         # Explicit commitments (contentful substrate)
         if getattr(self, "goals", None) is not None:
             try:
@@ -2435,6 +2441,98 @@ class Prometheus:
                 break
         except Exception:
             pass
+
+    def _apply_schema_expectation_error(self) -> dict:
+        """If focus kind expects members/causes that are cold, raise residual + explore.
+
+        Write-back for map use: expectation miss → attention pressure, not new ontology.
+        """
+        g = self.archivist.graph
+        fid = self.focus.focus_id if self.focus else None
+        report = {
+            "focus": fid,
+            "expected": 0,
+            "hits": 0,
+            "misses": [],
+            "boosted": [],
+            "explore_nudge": False,
+        }
+        if not fid or fid not in g:
+            self._last_expectation_error = report
+            return report
+        exp = self.get_schema_expectations(fid)
+        members = list(exp.get("members") or [])
+        causes = list(exp.get("causes") or [])
+        # Candidates to expect "warm": member ids + non-body cause targets that are lemmas
+        expected_ids = []
+        for m in members:
+            mid = m.get("id")
+            if mid and mid in g and not str(mid).startswith(("body:", "world:", "felt:")):
+                expected_ids.append(str(mid))
+        for c in causes:
+            cid = c.get("id")
+            if not cid or cid not in g:
+                continue
+            # Body/world causes: "hit" if channel elevated or recently credited
+            if str(cid).startswith("body:"):
+                try:
+                    bv = float((g.nodes.get(cid) or {}).get("body_value") or 0.5)
+                    if bv >= 0.55 or bv <= 0.35:
+                        report["hits"] += 1
+                    else:
+                        report["misses"].append(cid)
+                except Exception:
+                    pass
+                continue
+            if str(cid).startswith(("world:", "felt:")):
+                continue
+            expected_ids.append(str(cid))
+        # Dedupe
+        seen = set()
+        expected_ids = [x for x in expected_ids if not (x in seen or seen.add(x))]
+        report["expected"] = len(expected_ids) + len([m for m in report.get("misses", [])])
+
+        act_threshold = 0.12
+        for nid in expected_ids[:16]:
+            try:
+                nd = g.nodes.get(nid) or {}
+                act = float(nd.get("activation") or 0.0)
+                res = 0.0
+                try:
+                    res = float(self.focus.total_residual(nid) or 0.0)
+                except Exception:
+                    res = float((self.focus.residuals or {}).get(nid, 0) or 0)
+                if act >= act_threshold or res >= 0.35:
+                    report["hits"] += 1
+                else:
+                    report["misses"].append(nid)
+                    # Write-back: warm the missing expected node
+                    self.focus.boost_residual(nid, amount=0.22)
+                    report["boosted"].append(nid)
+            except Exception:
+                pass
+
+        # Sustained miss ratio → mild explore pressure (Active Thread / bias hint)
+        n_miss = len(report["misses"])
+        n_exp = max(1, len(expected_ids) + n_miss)
+        miss_ratio = n_miss / float(max(1, len(expected_ids))) if expected_ids else 0.0
+        if expected_ids and miss_ratio >= 0.5 and n_miss >= 2:
+            report["explore_nudge"] = True
+            # Prefer EXPAND path: boost residual on focus itself slightly
+            try:
+                self.focus.boost_residual(fid, amount=0.12)
+            except Exception:
+                pass
+            # Stash for operators / thread (read next cognition step)
+            self._expectation_explore_nudge = True
+        else:
+            self._expectation_explore_nudge = False
+
+        report["miss_ratio"] = round(miss_ratio, 3)
+        report["misses"] = report["misses"][:12]
+        report["boosted"] = report["boosted"][:12]
+        self._last_expectation_error = report
+        return report
 
     def get_schema_expectations(self, root_id: Optional[str] = None) -> dict:
         """Map-conditioned expectations from schema members + high-conf causes.
@@ -3701,6 +3799,101 @@ class Prometheus:
                 pass
         return {h for h in hubs if h in graph and not is_schema(h)}
 
+    def _hygiene_legacy_causal(self) -> dict:
+        """Decay / drop unscored low-confidence causal edges (legacy Package B noise).
+
+        Keeps scored_improve / evidence_credit edges. Does not touch is-a / composed-of.
+        """
+        g = self.archivist.graph
+        summary = {"decayed": 0, "dropped": 0, "kept_scored": 0, "scanned": 0}
+        causal = frozenset({"causes", "enables", "prevents", "results-in"})
+        # MultiGraph-safe: collect then mutate
+        to_drop = []
+        try:
+            for u, v, k, data in list(g.edges(keys=True, data=True)):
+                if not isinstance(data, dict):
+                    continue
+                rel = data.get("relation_type") or ""
+                if rel not in causal:
+                    continue
+                summary["scanned"] += 1
+                scored = bool(
+                    data.get("scored_improve") or data.get("evidence_credit")
+                )
+                conf = float(data.get("confidence") or 0.3)
+                w = float(data.get("weight") or 0.0)
+                src = str(data.get("source") or "")
+                # Protect scored and strong user-taught edges
+                if scored:
+                    summary["kept_scored"] += 1
+                    continue
+                if src in ("user", "teach", "pedagogical") and conf >= 0.5:
+                    continue
+                # Legacy / weak: decay
+                if conf < 0.45 or (src in ("causal_cooccur", "act_cooccur") and not scored):
+                    new_c = max(0.05, conf * 0.82)
+                    new_w = max(0.0, w * 0.80)
+                    # link_L drift toward 0
+                    try:
+                        ll = float(data.get("link_L") or 0.0)
+                        data["link_L"] = ll * 0.85
+                    except Exception:
+                        pass
+                    data["confidence"] = new_c
+                    data["weight"] = new_w
+                    data["legacy_hygiene"] = True
+                    summary["decayed"] += 1
+                    if new_w < 0.05 and new_c < 0.22:
+                        to_drop.append((u, v, k))
+            for u, v, k in to_drop:
+                try:
+                    g.remove_edge(u, v, k)
+                    summary["dropped"] += 1
+                except Exception:
+                    try:
+                        g.remove_edge(u, v)
+                        summary["dropped"] += 1
+                    except Exception:
+                        pass
+        except TypeError:
+            # Graph without keys
+            try:
+                for u, v, data in list(g.edges(data=True)):
+                    if not isinstance(data, dict):
+                        continue
+                    rel = data.get("relation_type") or ""
+                    if rel not in causal:
+                        continue
+                    summary["scanned"] += 1
+                    scored = bool(
+                        data.get("scored_improve") or data.get("evidence_credit")
+                    )
+                    if scored:
+                        summary["kept_scored"] += 1
+                        continue
+                    conf = float(data.get("confidence") or 0.3)
+                    w = float(data.get("weight") or 0.0)
+                    src = str(data.get("source") or "")
+                    if src in ("user", "teach", "pedagogical") and conf >= 0.5:
+                        continue
+                    if conf < 0.45 or (src in ("causal_cooccur", "act_cooccur") and not scored):
+                        new_c = max(0.05, conf * 0.82)
+                        new_w = max(0.0, w * 0.80)
+                        data["confidence"] = new_c
+                        data["weight"] = new_w
+                        data["legacy_hygiene"] = True
+                        summary["decayed"] += 1
+                        if new_w < 0.05 and new_c < 0.22:
+                            try:
+                                g.remove_edge(u, v)
+                                summary["dropped"] += 1
+                            except Exception:
+                                pass
+            except Exception as e:
+                logger.debug("causal hygiene fallback: %s", e)
+        self._last_causal_hygiene = summary
+        return summary
+
     def _repair_hierarchy_edges(self) -> dict:
         """Generic hierarchy hygiene — no domain word lists.
 
@@ -4362,6 +4555,12 @@ class Prometheus:
                 _plan_op = str(self.planner.suggested_operator() or "")
         except Exception:
             _plan_op = ""
+        # Expectation miss → mild EXPAND bias if no plan suggestion
+        try:
+            if not _plan_op and getattr(self, "_expectation_explore_nudge", False):
+                _plan_op = "EXPAND"
+        except Exception:
+            pass
         dec = self.operators.choose(
             graph=graph,
             focus_id=fid,
@@ -5244,6 +5443,14 @@ class Prometheus:
                 print(f"Consolidation: hierarchy repair {repaired}")
         except Exception as e:
             logger.warning("hierarchy repair failed: %s", e)
+        try:
+            causal_hygiene = self._hygiene_legacy_causal()
+            if causal_hygiene and (
+                causal_hygiene.get("decayed") or causal_hygiene.get("dropped")
+            ):
+                print(f"Consolidation: legacy causal hygiene {causal_hygiene}")
+        except Exception as e:
+            logger.warning("legacy causal hygiene failed: %s", e)
         try:
             grown = self._grow_kind_schema_membership()
             if grown and grown.get("members_linked"):
