@@ -2519,6 +2519,11 @@ class Prometheus:
                 if act >= act_threshold or res >= 0.35:
                     hit_n += 1
                     self._expect_miss_streak[nid] = 0
+                    # Package E: informational credit — reinforce map edge on hit
+                    if self._promote_expectation_edge(
+                        root, nid, is_member=(nid in member_set)
+                    ):
+                        report.setdefault("promoted", []).append(nid)
                 else:
                     miss_n += 1
                     report["misses"].append(nid)
@@ -2537,31 +2542,127 @@ class Prometheus:
         report["hits"] = hit_n
         total = max(1, hit_n + miss_n)
         miss_ratio = miss_n / float(total) if (hit_n + miss_n) else 0.0
+        hit_rate = hit_n / float(total)
 
         # Schema reliability in [0, 1] — slow EMA from hit rate
         prev_r = float(self._schema_reliability.get(root, 0.5))
-        instant = hit_n / float(total)
+        instant = hit_rate
         new_r = 0.92 * prev_r + 0.08 * instant
         self._schema_reliability[root] = max(0.05, min(0.95, new_r))
         report["reliability"] = round(new_r, 3)
 
+        # Package E: informational score in [-1, 1] (hit-rate centered)
+        # Used as non-body teacher for op L and choose soft bias
+        info_score = max(-1.0, min(1.0, (hit_rate - 0.5) * 2.0))
+        report["info_score"] = round(info_score, 3)
+        self._last_info_score = info_score
+        self._last_info_root = root
+
+        # Credit last operator from informational success/failure (milder than body)
+        try:
+            if (hit_n + miss_n) >= 2 and self.operators is not None:
+                op0 = None
+                if getattr(self.operators, "_last_act_op", None):
+                    op0 = self.operators._last_act_op
+                elif getattr(self.operators, "last_decision", None):
+                    op0 = getattr(self.operators.last_decision, "operator", None)
+                if op0:
+                    improved = True if info_score > 0.15 else (
+                        False if info_score < -0.15 else None
+                    )
+                    # EXPAND that reduces misses later gets hits; HOLD under high
+                    # miss is informational failure
+                    self.operators.credit_evidence(
+                        str(op0),
+                        improved,
+                        context=str(root or "")[:64],
+                        magnitude=0.45 * min(1.5, abs(info_score) + 0.35),
+                    )
+                    report["info_credit_op"] = str(op0)
+                    report["info_improved"] = improved
+        except Exception:
+            pass
+
         if expected_ids and miss_ratio >= 0.5 and miss_n >= 2:
             report["explore_nudge"] = True
             try:
-                self.focus.boost_residual(fid, amount=0.12)
+                # Stronger residual when reliability is low (map untrustworthy)
+                amt = 0.12 + 0.12 * (1.0 - new_r)
+                self.focus.boost_residual(fid, amount=amt)
             except Exception:
                 pass
             self._expectation_explore_nudge = True
         else:
             self._expectation_explore_nudge = False
+        # Stabilize nudge when map is reliable and mostly hitting
+        self._expectation_stabilize_nudge = bool(
+            new_r >= 0.62 and miss_ratio < 0.35 and hit_n >= 2
+        )
 
         report["miss_ratio"] = round(miss_ratio, 3)
         report["misses"] = report["misses"][:12]
         report["boosted"] = report["boosted"][:12]
         report["demoted"] = report["demoted"][:8]
+        report["promoted"] = list(report.get("promoted") or [])[:8]
         report["root"] = root
         self._last_expectation_error = report
         return report
+
+    def _iter_edge_attrs(self, u: str, v: str):
+        """Yield edge attribute dicts for u→v (MultiGraph or simple)."""
+        g = self.archivist.graph
+        try:
+            edges = g.get_edge_data(u, v) or {}
+            if not edges:
+                return
+            # networkx MultiGraph: {key: attr}
+            if isinstance(edges, dict):
+                vals = list(edges.values())
+                if vals and all(isinstance(x, dict) for x in vals):
+                    for attr in vals:
+                        yield attr
+                elif isinstance(edges, dict) and (
+                    "relation_type" in edges or "weight" in edges
+                ):
+                    yield edges
+        except Exception:
+            return
+
+    def _promote_expectation_edge(self, root: str, child: str, is_member: bool = True) -> bool:
+        """Package E: reinforce map edge when expectation hits (informational credit)."""
+        g = self.archivist.graph
+        if not root or not child or root not in g or child not in g:
+            return False
+        rels = ("composed-of", "part-of") if is_member else (
+            "causes", "enables", "associated-with", "prevents"
+        )
+        changed = False
+        try:
+            for attr in self._iter_edge_attrs(root, child):
+                rel = attr.get("relation_type") or ""
+                if rel not in rels:
+                    continue
+                w = float(attr.get("weight") or 0.4)
+                c = float(attr.get("confidence") or 0.35)
+                attr["weight"] = min(2.5, w + 0.04)
+                attr["confidence"] = min(0.95, c + 0.03)
+                ll = float(attr.get("link_L") or 0.0)
+                attr["link_L"] = max(-3.0, min(3.0, ll + 0.12))
+                attr["info_credit"] = True
+                changed = True
+            if is_member and not changed:
+                for attr in self._iter_edge_attrs(child, root):
+                    if (attr.get("relation_type") or "") != "part-of":
+                        continue
+                    w = float(attr.get("weight") or 0.4)
+                    c = float(attr.get("confidence") or 0.35)
+                    attr["weight"] = min(2.5, w + 0.04)
+                    attr["confidence"] = min(0.95, c + 0.03)
+                    attr["info_credit"] = True
+                    changed = True
+        except Exception:
+            return False
+        return changed
 
     def _demote_expectation_edge(self, root: str, child: str, is_member: bool = True) -> bool:
         """Soft-down composed-of (or weak causal) when expectation persistently fails."""
@@ -2571,16 +2672,7 @@ class Prometheus:
         rels = ("composed-of", "part-of") if is_member else ("causes", "enables", "associated-with")
         changed = False
         try:
-            edges = g.get_edge_data(root, child) or {}
-            # MultiGraph: edges is dict of key -> attr
-            if edges and not any(isinstance(v, dict) and "relation_type" in v for v in edges.values()):
-                # simple edge dict
-                candidates = [edges] if isinstance(edges, dict) else []
-            else:
-                candidates = list(edges.values()) if isinstance(edges, dict) else []
-            for attr in candidates:
-                if not isinstance(attr, dict):
-                    continue
+            for attr in self._iter_edge_attrs(root, child):
                 rel = attr.get("relation_type") or ""
                 if rel not in rels:
                     continue
@@ -2596,11 +2688,7 @@ class Prometheus:
                 changed = True
             # Also try reverse part-of
             if is_member and not changed:
-                redges = g.get_edge_data(child, root) or {}
-                rvals = list(redges.values()) if isinstance(redges, dict) else []
-                for attr in rvals:
-                    if not isinstance(attr, dict):
-                        continue
+                for attr in self._iter_edge_attrs(child, root):
                     if (attr.get("relation_type") or "") != "part-of":
                         continue
                     w = float(attr.get("weight") or 0.5)
@@ -4634,10 +4722,13 @@ class Prometheus:
                 _plan_op = str(self.planner.suggested_operator() or "")
         except Exception:
             _plan_op = ""
-        # Expectation miss → mild EXPAND bias if no plan suggestion
+        # Package E: map reliability → soft op bias if no plan suggestion
         try:
             if not _plan_op and getattr(self, "_expectation_explore_nudge", False):
                 _plan_op = "EXPAND"
+            elif not _plan_op and getattr(self, "_expectation_stabilize_nudge", False):
+                # Reliable map, mostly hits → prefer HOLD over restless EXPAND
+                _plan_op = "HOLD"
         except Exception:
             pass
         dec = self.operators.choose(
