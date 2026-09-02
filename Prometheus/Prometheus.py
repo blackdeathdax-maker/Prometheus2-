@@ -271,6 +271,16 @@ class Prometheus:
                 self.planner = PlanModule()
             except Exception:
                 self.planner = None
+        # Package F: minimal episodic log + consolidation replay
+        try:
+            from .episodes import EpisodeLog
+            self.episode_log = EpisodeLog()
+        except Exception:
+            try:
+                from episodes import EpisodeLog
+                self.episode_log = EpisodeLog()
+            except Exception:
+                self.episode_log = None
 
         # --- Learning policy (phase / inhibition / valence / lookup budgets) ---
         self.DICT_LOOKUPS_PER_PULSE = 6
@@ -1255,6 +1265,29 @@ class Prometheus:
                         self._pending_causal = None
                     except Exception as e:
                         logger.debug("causal commit: %s", e)
+                    # Package F: record minimal episode (act + scores)
+                    try:
+                        if getattr(self, "episode_log", None) is not None:
+                            info_s = float(getattr(self, "_last_info_score", 0) or 0)
+                            made = int(
+                                (getattr(self, "_last_causal_report", None) or {}).get(
+                                    "made", 0
+                                )
+                                or 0
+                            )
+                            self.episode_log.record(
+                                pulse=int(getattr(self, "pulse_count", 0) or 0),
+                                focus_id=str(
+                                    getattr(self.focus, "focus_id", "") or ""
+                                ),
+                                lemma=str(ctx or ""),
+                                op=str(op0 or ""),
+                                body_improved=improved,
+                                info_score=info_s,
+                                causal_made=made,
+                            )
+                    except Exception as e:
+                        logger.debug("episode record: %s", e)
                 except Exception as e:
                     logger.debug("evidence credit: %s", e)
         except Exception as e:
@@ -5354,12 +5387,19 @@ class Prometheus:
             return self.planner.report()
         return {"active": False}
 
+    def get_episode_report(self) -> dict:
+        """Package F: minimal episodic buffer + last consolidation replay."""
+        if getattr(self, "episode_log", None) is not None:
+            return self.episode_log.report()
+        return {"buffer": 0, "recent": [], "top_patterns": []}
+
     def get_module_health_report(self) -> dict:
         """Which optional modules imported cleanly (Identity & Hygiene)."""
         names = (
             "modulators", "felt_anchors", "schema_felt", "executive",
             "stimulus", "goals", "operators", "active_thread", "self_narrative",
             "somatic_topo", "long_term_interest", "world_stub", "allostasis",
+            "episode_log", "planner",
         )
         out = {}
         for n in names:
@@ -5621,6 +5661,29 @@ class Prometheus:
                 print(f"Consolidation: legacy causal hygiene {causal_hygiene}")
         except Exception as e:
             logger.warning("legacy causal hygiene failed: %s", e)
+        # Package F: replay consistent (lemma, op) successes → mild re-credit
+        try:
+            if getattr(self, "episode_log", None) is not None:
+                def _credit(op, improved, context="", magnitude=1.0):
+                    if self.operators is not None:
+                        self.operators.credit_evidence(
+                            op, improved, context=context, magnitude=magnitude
+                        )
+
+                def _boost(lemma):
+                    if lemma and self.focus is not None:
+                        try:
+                            self.focus.boost_residual(lemma, amount=0.15)
+                        except Exception:
+                            pass
+
+                rep = self.episode_log.replay(
+                    credit_fn=_credit, link_boost_fn=_boost
+                )
+                if rep and rep.get("replayed"):
+                    print(f"Consolidation: episode replay {rep}")
+        except Exception as e:
+            logger.warning("episode replay failed: %s", e)
         try:
             grown = self._grow_kind_schema_membership()
             if grown and grown.get("members_linked"):
