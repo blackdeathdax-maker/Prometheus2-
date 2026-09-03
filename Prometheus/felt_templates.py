@@ -122,35 +122,59 @@ class FeltTemplateStore:
             # "joy is an emotion" alone is not a somatic template
             return None
 
-        # Need at least one channel cue
+        # Split on sentence boundaries so "cold" on warmth doesn't pollute heart rate
+        clauses = re.split(r"[.;:\n]+", t)
+        # Drop the emotion-name-only first clause if present
         channel_dev: Dict[str, float] = {}
         for ch, aliases in CHANNEL_ALIASES.items():
-            if not any(a in t for a in aliases):
+            best_clause = None
+            for clause in clauses:
+                if any(a in clause for a in aliases):
+                    best_clause = clause
+                    break
+            if best_clause is None:
                 continue
-            pos = min((t.find(a) for a in aliases if a in t), default=-1)
-            window = t[max(0, pos - 32): pos + 48] if pos >= 0 else t
-            if any(w in window for w in LOW_WORDS):
+            # Prefer high when both poles appear in the same short clause
+            has_high = any(w in best_clause for w in HIGH_WORDS)
+            has_low = any(w in best_clause for w in LOW_WORDS)
+            if has_high and has_low:
+                # Disambiguate: cold+wet → wet wins high for sweat; cold alone → low
+                if ch == "warmth" and has_low:
+                    channel_dev[ch] = -0.55
+                elif ch == "sweat_skin" and ("wet" in best_clause or "clammy" in best_clause):
+                    channel_dev[ch] = 0.55
+                elif ch == "breath" and "shallow" in best_clause and "rapid" in best_clause:
+                    channel_dev[ch] = 0.45  # activated but shallow
+                else:
+                    # majority: count tokens
+                    channel_dev[ch] = 0.55 if has_high else -0.55
+            elif has_low:
                 channel_dev[ch] = -0.55
-            elif any(w in window for w in HIGH_WORDS):
+            elif has_high:
                 channel_dev[ch] = 0.55
             else:
-                # mentioned without clear pole — mild high as "salient"
                 channel_dev[ch] = 0.25
 
         if not channel_dev:
             return None
 
-        # Optional: refine magnitude from live body vs setpoint at teach time
+        # Do NOT collapse taught poles into near-zero live body (that made anger match everything)
         sp = setpoints or {}
         bd = body or {}
         mags = []
         for ch, dev in list(channel_dev.items()):
             if ch in bd and ch in sp:
                 live_dev = float(bd[ch]) - float(sp[ch])
-                # If live agrees in sign, use magnitude
-                if live_dev * dev > 0:
-                    channel_dev[ch] = max(-0.9, min(0.9, live_dev))
-                    mags.append(abs(live_dev))
+                # Only refine magnitude if live is strongly in the taught direction
+                if live_dev * dev > 0 and abs(live_dev) >= 0.18:
+                    sign = 1.0 if dev > 0 else -1.0
+                    mag = max(0.35, min(0.9, abs(live_dev)))
+                    channel_dev[ch] = sign * mag
+                    mags.append(mag)
+                else:
+                    mags.append(abs(dev))
+            else:
+                mags.append(abs(dev))
         ref_mag = max(0.35, sum(mags) / len(mags)) if mags else 0.55
 
         pad_ref = pad or (0.5, 0.5, 0.5)
@@ -250,32 +274,43 @@ class FeltTemplateStore:
         best_intensity = 0.0
         near = []
         for dist_pad, name, tmpl in shortlist[:8]:
+            # Skip collapsed templates (near-zero face matches every baseline pulse)
+            mean_ref = sum(abs(float(v)) for v in tmpl.channel_dev.values()) / max(
+                1, len(tmpl.channel_dev)
+            )
+            if mean_ref < 0.22:
+                tmpl.log_odds = max(L_MIN, min(L_MAX, tmpl.log_odds - L_MISS))
+                continue
             chan_dist = 0.0
             n = 0
             dir_agree = 0
             live_mag = 0.0
             for ch, ref_dev in tmpl.channel_dev.items():
                 live = float(self._smooth_dev.get(ch, 0.0))
-                chan_dist += abs(live - ref_dev)
+                ref = float(ref_dev)
+                chan_dist += abs(live - ref)
                 n += 1
-                if live * ref_dev > 0 and abs(live) > 0.05:
+                # Require same sign and meaningful live move
+                if live * ref > 0 and abs(live) > 0.08 and abs(ref) > 0.15:
                     dir_agree += 1
                     live_mag += abs(live)
             if n == 0:
                 continue
             chan_dist /= n
-            # Near-match if channel distance small and some direction agreement
-            is_near = chan_dist < (CHANNEL_MATCH_MAX / max(3, n)) and dir_agree >= max(
-                1, n // 2
+            need = max(2, (n + 1) // 2)
+            is_near = (
+                chan_dist < 0.55
+                and dir_agree >= need
+                and mean_ref >= 0.22
             )
             if is_near:
-                tmpl.log_odds = max(
-                    L_MIN, min(L_MAX, tmpl.log_odds + L_HIT)
-                )
+                tmpl.log_odds = max(L_MIN, min(L_MAX, tmpl.log_odds + L_HIT))
                 near.append(name)
                 intensity = 0.0
                 if tmpl.ref_magnitude > 1e-6:
-                    intensity = min(2.0, (live_mag / max(1, dir_agree)) / tmpl.ref_magnitude)
+                    intensity = min(
+                        2.0, (live_mag / max(1, dir_agree)) / tmpl.ref_magnitude
+                    )
                 if chan_dist < best_chan_dist:
                     best_chan_dist = chan_dist
                     best_name = name
