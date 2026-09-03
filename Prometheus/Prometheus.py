@@ -1048,6 +1048,10 @@ class Prometheus:
 
         User may teach 'heart racing', 'sweating', etc. Those reinforce
         anatomy nodes and, if focus/schema is active, part-link into it.
+
+        Also: somatic emotion profiles — e.g. "Sadness: heart rate slowed,
+        energy depleted…" — bind the emotion lemma to channels with direction
+        and to basins whose surface_signature matches (no long dwell required).
         Does not create new channel types.
         """
         if not text:
@@ -1061,19 +1065,56 @@ class Prometheus:
         t = text.lower()
         aliases = {
             "heart_rate": ["heart", "heartbeat", "heart rate", "pulse", "racing heart", "heart racing"],
-            "breath": ["breath", "breathing", "breathe", "respiration", "short of breath"],
-            "muscle_tension": ["tension", "tense", "muscle", "clench", "tight muscles", "tightness"],
-            "sweat_skin": ["sweat", "sweating", "sweaty", "perspir", "clammy"],
-            "gut": ["gut", "stomach", "nausea", "butterflies", "belly"],
-            "energy": ["energy", "energetic", "tired", "fatigue", "exhausted", "wired"],
-            "warmth": ["warm", "warmth", "hot", "cold", "chill", "flush"],
+            "breath": ["breath", "breathing", "breathe", "respiration", "short of breath", "sighing"],
+            "muscle_tension": [
+                "tension", "tense", "muscle", "clench", "tight muscles", "tightness",
+                "limp", "loose", "fluid", "rigid", "bracing", "heavy",
+            ],
+            "sweat_skin": ["sweat", "sweating", "sweaty", "perspir", "clammy", "damp"],
+            "gut": ["gut", "stomach", "nausea", "butterflies", "belly", "hollow", "churning", "sinking"],
+            "energy": [
+                "energy", "energetic", "tired", "fatigue", "exhausted", "wired",
+                "depleted", "expansive", "mobilized", "jittery", "sluggish", "vital",
+            ],
+            "warmth": [
+                "warm", "warmth", "hot", "cold", "chill", "flush", "pleasant",
+                "cooling", "glowing", "localized",
+            ],
+            "pain": ["pain", "hurt", "ache"],
+            "pleasure": ["pleasure", "pleasant"],
         }
+        # Direction cues near channel mentions
+        low_words = (
+            "slow", "slowed", "low", "depleted", "minimal", "absent", "cool", "cold",
+            "limp", "loose", "hollow", "heavy", "restrained", "shallow", "draining",
+            "down", "less", "weak", "calm", "settled", "soft",
+        )
+        high_words = (
+            "high", "elevated", "racing", "pounding", "quick", "sharp", "forceful",
+            "rigid", "clenched", "explosive", "expansive", "widespread", "hot",
+            "strong", "full", "vital", "fluttering", "spiking", "up",
+        )
+
         hit = []
         for ch, words in aliases.items():
             if any(w in t for w in words):
                 hit.append(ch)
         if not hit:
             return []
+
+        # Optional emotion lemma at start: "Sadness: …" or "joy is …"
+        emotion_lemmas = (
+            "joy", "sadness", "anger", "fear", "disgust", "surprise",
+            "guilt", "pride", "jealousy", "compassion", "anxiety",
+            "elation", "shame", "love", "hate", "calm", "grief",
+        )
+        emotion = None
+        head = t.split(":")[0].strip() if ":" in t else t.split()[0] if t.split() else ""
+        head = head.replace(".", " ").strip()
+        for em in emotion_lemmas:
+            if head == em or head.startswith(em + " ") or t.startswith(em + ":") or t.startswith(em + " "):
+                emotion = em
+                break
 
         if hasattr(self.archivist, "_seed_body_channels"):
             self.archivist._seed_body_channels()
@@ -1086,14 +1127,35 @@ class Prometheus:
         except Exception:
             pass
 
+        # Ensure emotion lemma node exists when teaching a profile
+        if emotion:
+            if emotion not in g:
+                try:
+                    g.add_node(
+                        emotion,
+                        name=emotion,
+                        node_type="standard",
+                        source="user",
+                        activation=0.4,
+                    )
+                except Exception:
+                    pass
+            try:
+                self.archivist.bump_activation(emotion)
+                self.focus.boost_residual(emotion)
+            except Exception:
+                pass
+
         # Focus / recent schema as whole for part links
         wholes = []
+        if emotion and emotion in g:
+            wholes.append(emotion)
         try:
             fid = None
-            if hasattr(self, "focus") and hasattr(self.focus, "get_focus"):
+            if hasattr(self, "focus") and hasattr(self.focus, "focus_id"):
+                fid = self.focus.focus_id
+            elif hasattr(self, "focus") and hasattr(self.focus, "get_focus"):
                 fid = self.focus.get_focus()
-            elif hasattr(self, "focus") and hasattr(self.focus, "current"):
-                fid = self.focus.current
             if fid and fid in g and not is_body_channel_node(fid):
                 wholes.append(fid)
         except Exception:
@@ -1103,29 +1165,171 @@ class Prometheus:
                 if d and (d.get("is_schema") or "epistemic" in str(d.get("node_type") or "")):
                     if float(d.get("activation") or 0) >= 0.2 and not is_body_channel_node(n):
                         wholes.append(n)
-            wholes = list(dict.fromkeys(wholes))[:5]
+            wholes = list(dict.fromkeys(wholes))[:6]
         except Exception:
             pass
 
+        profile_dirs = {}  # ch -> "high"|"low"|"mid"
         for ch in hit:
             nid = body_channel_node_id(ch)
             if nid not in g:
                 continue
-            # bump as "noticed"
-            g.nodes[nid]["body_value"] = max(float(g.nodes[nid].get("body_value") or 0.5), 0.72)
+            # Infer direction from nearby wording
+            direction = "mid"
+            # Find a window around the first alias hit
+            pos = min(
+                (t.find(w) for w in aliases.get(ch, []) if w in t),
+                default=-1,
+            )
+            window = t[max(0, pos - 28): pos + 40] if pos >= 0 else t
+            if any(w in window for w in low_words):
+                direction = "low"
+            elif any(w in window for w in high_words):
+                direction = "high"
+            profile_dirs[ch] = direction
+
+            # Nudge live body_value toward taught direction (gentle, not override)
+            cur = float(g.nodes[nid].get("body_value") or 0.5)
+            if direction == "high":
+                g.nodes[nid]["body_value"] = max(cur, 0.68)
+            elif direction == "low":
+                g.nodes[nid]["body_value"] = min(cur, 0.32)
+            else:
+                g.nodes[nid]["body_value"] = max(cur, 0.55)
             g.nodes[nid]["last_reinforced"] = __import__("datetime").datetime.now()
             try:
-                self.archivist.link(SELF_NODE, nid, EDGE_ASSOCIATED_WITH, source="user", placement="self_body_user")
+                self.archivist.link(
+                    SELF_NODE, nid, EDGE_ASSOCIATED_WITH,
+                    source="user", placement="self_body_user",
+                )
                 self.archivist.bump_activation(nid)
             except Exception:
                 pass
             for whole in wholes:
                 try:
-                    self.archivist.link(whole, nid, EDGE_COMPOSED_OF, source="user", placement="body_part_of_schema", felt_state=felt)
-                    self.archivist.link(nid, whole, EDGE_PART_OF, source="user", placement="body_part_of_schema", felt_state=felt)
+                    self.archivist.link(
+                        whole, nid, EDGE_COMPOSED_OF, source="user",
+                        placement="body_part_of_schema", felt_state=felt,
+                    )
+                    self.archivist.link(
+                        nid, whole, EDGE_PART_OF, source="user",
+                        placement="body_part_of_schema", felt_state=felt,
+                    )
+                    # Weighted associated-with with direction for attribution
+                    self.archivist.link(
+                        whole, nid, EDGE_ASSOCIATED_WITH, source="user",
+                        placement="somatic_profile_teach", felt_state=felt,
+                    )
+                    ed = g.get_edge_data(whole, nid) or {}
+                    for _k, attr in (ed.items() if isinstance(ed, dict) else []):
+                        if not isinstance(attr, dict):
+                            continue
+                        if attr.get("relation_type") != EDGE_ASSOCIATED_WITH:
+                            continue
+                        attr["placement"] = "somatic_profile_teach"
+                        attr["direction"] = direction
+                        attr["weight"] = max(float(attr.get("weight") or 0.3), 0.55)
+                        attr["source"] = "user"
+                        break
                 except Exception:
                     pass
+
+        # Attribute taught profile to matching basins (surface_signature similarity)
+        if emotion and profile_dirs and emotion in g:
+            try:
+                self._attribute_emotion_to_basins(emotion, profile_dirs)
+            except Exception as e:
+                logger.debug("emotion→basin attribute: %s", e)
         return hit
+
+    def _attribute_emotion_to_basins(self, emotion: str, profile_dirs: dict) -> dict:
+        """Link emotion lemma to basins whose surface face matches taught directions.
+
+        profile_dirs: channel -> 'high'|'low'|'mid'
+        Match uses basin surface_signature when present; else skip.
+        """
+        from .edge_types import EDGE_ASSOCIATED_WITH
+
+        g = self.archivist.graph
+        report = {"emotion": emotion, "linked": [], "scored": []}
+        if not emotion or emotion not in g or not profile_dirs:
+            return report
+
+        def score_basin(sig: dict) -> float:
+            if not sig:
+                return -1.0
+            s = 0.0
+            n = 0
+            for ch, direction in profile_dirs.items():
+                if ch not in sig:
+                    continue
+                v = float(sig[ch])
+                n += 1
+                if direction == "high" and v >= 0.55:
+                    s += 1.0
+                elif direction == "low" and v <= 0.40:
+                    s += 1.0
+                elif direction == "mid" and 0.35 <= v <= 0.65:
+                    s += 0.5
+                else:
+                    s -= 0.35
+            return s / n if n else -1.0
+
+        candidates = []
+        for n, d in g.nodes(data=True):
+            if not d or not d.get("is_felt_place"):
+                continue
+            sig = d.get("surface_signature") or {}
+            if not sig:
+                continue
+            sc = score_basin(sig)
+            if sc >= 0.35:
+                candidates.append((sc, n, float(d.get("surface_dwell") or 0)))
+        candidates.sort(key=lambda t: (-t[0], -t[2]))
+        for sc, basin_id, _dwell in candidates[:3]:
+            try:
+                self.archivist.link(
+                    emotion, basin_id, EDGE_ASSOCIATED_WITH,
+                    source="user", placement="emotion_basin_attribute",
+                )
+                ed = g.get_edge_data(emotion, basin_id) or {}
+                for _k, attr in (ed.items() if isinstance(ed, dict) else []):
+                    if not isinstance(attr, dict):
+                        continue
+                    if attr.get("relation_type") != EDGE_ASSOCIATED_WITH:
+                        continue
+                    attr["placement"] = "emotion_basin_attribute"
+                    attr["weight"] = max(float(attr.get("weight") or 0.3), 0.4 + 0.4 * sc)
+                    attr["match_score"] = round(sc, 3)
+                    attr["source"] = "user"
+                    break
+                report["linked"].append(basin_id)
+                report["scored"].append({"basin": basin_id, "score": round(sc, 3)})
+            except Exception:
+                pass
+        # Also link current basin if body *right now* matches profile (no prior dwell needed)
+        try:
+            from .edge_types import BODY_CHANNELS, body_channel_node_id
+            instant = {}
+            for ch in BODY_CHANNELS:
+                nid = body_channel_node_id(ch)
+                if nid in g:
+                    instant[ch] = float(g.nodes[nid].get("body_value") or 0.5)
+            sc_now = score_basin(instant)
+            if sc_now >= 0.35:
+                # current basin node id from last signature or sync
+                cur = (getattr(self, "_last_basin_signature", None) or {}).get("basin")
+                if cur and cur in g and cur not in report["linked"]:
+                    self.archivist.link(
+                        emotion, cur, EDGE_ASSOCIATED_WITH,
+                        source="user", placement="emotion_basin_attribute",
+                    )
+                    report["linked"].append(cur)
+                    report["scored"].append({"basin": cur, "score": round(sc_now, 3), "instant": True})
+        except Exception:
+            pass
+        self._last_emotion_attribute = report
+        return report
 
     def pulse(self):
         self.pulse_count += 1
@@ -2821,6 +3025,117 @@ class Prometheus:
     BODY_FELT_SHOW = 0.12       # below this = residual, not peer
     BODY_FELT_DROP = 0.02       # remove edge under this after decay
 
+    def _link_focus_lemma_to_somatic(self, g, basin_id: str = "", stamp=None) -> dict:
+        """Connect focus knowledge (lemma/kind) to current basin + salient body surfaces.
+
+        Does not hardcode emotion profiles. Under dwell, co-occurrence routes:
+          focus_lemma ↔ basin_* (felt place)
+          focus_lemma ↔ body:* when channel is extreme (high or low)
+        Weight + decay-friendly placement so differential soaks can separate joy/fear.
+        """
+        from .edge_types import (
+            EDGE_ASSOCIATED_WITH,
+            BODY_CHANNELS,
+            body_channel_node_id,
+        )
+        report = {"lemma": None, "basin": basin_id, "channels": [], "basin_linked": False}
+        fid = None
+        try:
+            fid = self.focus.focus_id if self.focus else None
+        except Exception:
+            fid = None
+        if not fid or fid not in g:
+            return report
+        # Resolve to lemma (not sentence, not body shell)
+        lemma = fid
+        try:
+            if hasattr(self, "_resolve_causal_anchor"):
+                lemma = self._resolve_causal_anchor(fid) or fid
+        except Exception:
+            lemma = fid
+        if not lemma or lemma not in g:
+            return report
+        if str(lemma).startswith(("body:", "felt:", "basin_", "narr:", "world:")):
+            return report
+        # Skip sentence-like
+        try:
+            nd = g.nodes.get(lemma) or {}
+            name = str(nd.get("name") or lemma)
+            if len(name.split()) >= 6 or len(name) > 48:
+                return report
+        except Exception:
+            pass
+        report["lemma"] = lemma
+
+        # 1) Lemma ↔ current somatic basin
+        if basin_id and basin_id in g:
+            try:
+                for a, b in ((lemma, basin_id), (basin_id, lemma)):
+                    self.archivist.link(
+                        a, b, EDGE_ASSOCIATED_WITH,
+                        source="focus_somatic", placement="lemma_basin_cooccur",
+                        felt_state=stamp,
+                    )
+                    ed = g.get_edge_data(a, b) or {}
+                    for _k, attr in (ed.items() if isinstance(ed, dict) else []):
+                        if not isinstance(attr, dict):
+                            continue
+                        if attr.get("relation_type") != EDGE_ASSOCIATED_WITH:
+                            continue
+                        if attr.get("placement") not in (
+                            None, "", "lemma_basin_cooccur", "focus_somatic"
+                        ):
+                            # don't overwrite body_felt placement
+                            if attr.get("placement") == "body_felt_cooccur":
+                                continue
+                        attr["placement"] = "lemma_basin_cooccur"
+                        prev = float(attr.get("weight") if attr.get("weight") is not None else 0.2)
+                        attr["weight"] = min(1.0, prev + 0.06)
+                        attr["source"] = attr.get("source") or "focus_somatic"
+                        report["basin_linked"] = True
+                        break
+            except Exception:
+                pass
+
+        # 2) Lemma ↔ extreme body channels (surface signature under this focus)
+        LO, HI = 0.32, 0.58
+        for ch in BODY_CHANNELS:
+            nid = body_channel_node_id(ch)
+            if nid not in g:
+                continue
+            try:
+                val = float(g.nodes[nid].get("body_value") or 0.5)
+            except (TypeError, ValueError):
+                continue
+            if LO < val < HI:
+                continue  # mid = not distinctive this pulse
+            try:
+                self.archivist.link(
+                    lemma, nid, EDGE_ASSOCIATED_WITH,
+                    source="focus_somatic", placement="lemma_body_cooccur",
+                    felt_state=stamp,
+                )
+                ed = g.get_edge_data(lemma, nid) or {}
+                for _k, attr in (ed.items() if isinstance(ed, dict) else []):
+                    if not isinstance(attr, dict):
+                        continue
+                    if attr.get("relation_type") != EDGE_ASSOCIATED_WITH:
+                        continue
+                    attr["placement"] = "lemma_body_cooccur"
+                    prev = float(attr.get("weight") if attr.get("weight") is not None else 0.15)
+                    # Stronger bump when farther from mid
+                    bump = 0.05 + 0.08 * min(1.0, abs(val - 0.5) * 2)
+                    attr["weight"] = min(1.0, prev + bump)
+                    attr["last_value"] = val
+                    attr["direction"] = "high" if val >= HI else "low"
+                    attr["source"] = attr.get("source") or "focus_somatic"
+                    report["channels"].append({"ch": ch, "val": round(val, 3), "dir": attr["direction"]})
+                    break
+            except Exception:
+                pass
+        self._last_focus_somatic = report
+        return report
+
     def _update_body_felt_weights(self, g, basin_id: str = "", stamp=None):
         """Decay all body↔felt co-occur weights; reinforce current basin.
 
@@ -2871,18 +3186,60 @@ class Prometheus:
         if not basin_id or basin_id not in g:
             return
 
-        # 2) Increment body channels that are currently elevated toward this basin
+        # 2) Basin surface signature: EMA of all channel values while in this place
+        #    Basins become configurations of surfaces (grounding for later emotion labels)
+        try:
+            nd_b = g.nodes[basin_id]
+            sig = dict(nd_b.get("surface_signature") or {})
+            dwell_sig = float(nd_b.get("surface_dwell") or 0.0) + 1.0
+            alpha = 0.12  # slow blend so stable places keep a face
+            instant = {}
+            for ch in BODY_CHANNELS:
+                nid = body_channel_node_id(ch)
+                if nid not in g:
+                    continue
+                try:
+                    val = float(g.nodes[nid].get("body_value") or 0.5)
+                except (TypeError, ValueError):
+                    val = 0.5
+                instant[ch] = val
+                prev = float(sig.get(ch, val))
+                sig[ch] = (1.0 - alpha) * prev + alpha * val
+            nd_b["surface_signature"] = {k: round(float(v), 4) for k, v in sig.items()}
+            nd_b["surface_dwell"] = dwell_sig
+            # Extreme face: which surfaces define this place (high/low vs mid)
+            high = sorted(
+                ((c, v) for c, v in sig.items() if v >= 0.58),
+                key=lambda t: -t[1],
+            )[:5]
+            low = sorted(
+                ((c, v) for c, v in sig.items() if v <= 0.35),
+                key=lambda t: t[1],
+            )[:5]
+            nd_b["surface_high"] = [c for c, _ in high]
+            nd_b["surface_low"] = [c for c, _ in low]
+            nd_b["is_felt_place"] = True
+            self._last_basin_signature = {
+                "basin": basin_id,
+                "dwell": dwell_sig,
+                "high": nd_b["surface_high"],
+                "low": nd_b["surface_low"],
+                "sig": dict(nd_b["surface_signature"]),
+            }
+        except Exception as e:
+            logger.debug("basin surface signature failed: %s", e)
+
+        # 3) ALL body surfaces ↔ current basin (always connected; weight = how it feels)
         for ch in BODY_CHANNELS:
             nid = body_channel_node_id(ch)
             if nid not in g:
                 continue
             try:
-                val = float(g.nodes[nid].get("body_value") or 0.0)
+                val = float(g.nodes[nid].get("body_value") or 0.5)
             except (TypeError, ValueError):
-                val = 0.0
-            if val < self.BODY_FELT_GATE:
-                continue
-            # Ensure bidirectional edges exist, then bump weight
+                val = 0.5
+            distinct = abs(val - 0.5) * 2.0
+            target_w = max(0.12, min(self.BODY_FELT_CAP, 0.22 + 0.55 * distinct + 0.15 * val))
             for a, b in ((nid, basin_id), (basin_id, nid)):
                 try:
                     self.archivist.link(
@@ -2898,17 +3255,19 @@ class Prometheus:
                         continue
                     if attr.get("relation_type") != EDGE_ASSOCIATED_WITH:
                         continue
-                    # Prefer placement match; fall back to any associated-with
                     if attr.get("placement") and attr.get("placement") != "body_felt_cooccur":
                         continue
                     attr["placement"] = "body_felt_cooccur"
-                    prev = float(attr.get("weight") if attr.get("weight") is not None else 0.0)
-                    attr["weight"] = min(self.BODY_FELT_CAP, prev + self.BODY_FELT_INC)
+                    prev = float(attr.get("weight") if attr.get("weight") is not None else 0.2)
+                    attr["weight"] = min(self.BODY_FELT_CAP, 0.7 * prev + 0.3 * target_w)
                     attr["dwell"] = float(attr.get("dwell") or 0.0) + 1.0
                     attr["last_value"] = val
+                    attr["direction"] = (
+                        "high" if val >= 0.58 else ("low" if val <= 0.35 else "mid")
+                    )
                     attr["source"] = attr.get("source") or "somatic"
                     break
-            if val >= 0.55:
+            if val >= 0.55 or val <= 0.30:
                 try:
                     self.archivist.bump_activation(nid)
                     self.archivist.bump_activation(basin_id)
@@ -3100,6 +3459,12 @@ class Prometheus:
                 self._update_body_felt_weights(g, basin_id=basin_id, stamp=stamp)
             except Exception as e:
                 logger.warning("body↔felt weight update failed: %s", e)
+
+            # Focus lemma ↔ basin + body surfaces (route felt/knowledge to soma)
+            try:
+                self._link_focus_lemma_to_somatic(g, basin_id=basin_id, stamp=stamp)
+            except Exception as e:
+                logger.debug("focus↔somatic link failed: %s", e)
 
             # Link salient channels as PARTS of active epistemic schemas
             # anger --composed-of--> body:heart_rate  (part, not child)
@@ -5107,6 +5472,33 @@ class Prometheus:
     def get_somatic_topo_report(self) -> dict:
         """Basin dwell + transition map (not raw hormone gauges)."""
         return self.somatic_topo.report()
+
+    def get_basin_signature_report(self) -> dict:
+        """Current felt place as configuration of body surfaces (grounding layer)."""
+        out = dict(getattr(self, "_last_basin_signature", None) or {})
+        if not out:
+            # Fallback: read current basin node if present
+            try:
+                key = self.synthesizer.get_current_basin_key()
+                # basin node id format from _sync_self_felt
+                g = self.archivist.graph
+                for n, d in g.nodes(data=True):
+                    if not d or not d.get("is_felt_place"):
+                        continue
+                    if d.get("surface_signature"):
+                        if not out or float(d.get("surface_dwell") or 0) >= float(
+                            out.get("dwell") or 0
+                        ):
+                            out = {
+                                "basin": n,
+                                "dwell": d.get("surface_dwell"),
+                                "high": d.get("surface_high") or [],
+                                "low": d.get("surface_low") or [],
+                                "sig": dict(d.get("surface_signature") or {}),
+                            }
+            except Exception:
+                pass
+        return out
 
     def get_felt_anchor_report(self) -> dict:
         """Linkable felt identities over PAD (coords stay internal)."""
