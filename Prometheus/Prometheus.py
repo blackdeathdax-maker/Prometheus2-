@@ -281,6 +281,16 @@ class Prometheus:
                 self.episode_log = EpisodeLog()
             except Exception:
                 self.episode_log = None
+        # Felt-state templates (FELT_STATE_BINDING_SPEC)
+        try:
+            from .felt_templates import FeltTemplateStore
+            self.felt_templates = FeltTemplateStore()
+        except Exception:
+            try:
+                from felt_templates import FeltTemplateStore
+                self.felt_templates = FeltTemplateStore()
+            except Exception:
+                self.felt_templates = None
 
         # --- Learning policy (phase / inhibition / valence / lookup budgets) ---
         self.DICT_LOOKUPS_PER_PULSE = 6
@@ -565,6 +575,11 @@ class Prometheus:
                 self._note_body_from_text(text)
             except Exception as e:
                 logger.warning("_note_body_from_text: %s", e)
+            # Felt-state template teach (spec): qualitative profile → template
+            try:
+                self._teach_felt_template(text)
+            except Exception as e:
+                logger.debug("teach_felt_template: %s", e)
 
         self.sensory.ingest(text)
         if source == "user" and hasattr(self, "modulators"):
@@ -1331,6 +1346,150 @@ class Prometheus:
         self._last_emotion_attribute = report
         return report
 
+    def _teach_felt_template(self, text: str) -> Optional[dict]:
+        """User somatic profile → FeltTemplate (FELT_STATE_BINDING_SPEC)."""
+        if getattr(self, "felt_templates", None) is None:
+            return None
+        pad = (0.5, 0.5, 0.5)
+        try:
+            key = str(self.synthesizer.get_current_basin_key() or "")
+            # keys often "0.30_0.50_0.70"
+            parts = key.replace("felt:", "").split("_")
+            if len(parts) >= 3:
+                pad = (float(parts[0]), float(parts[1]), float(parts[2]))
+        except Exception:
+            pass
+        body = {}
+        sp = {}
+        try:
+            body = dict(getattr(self, "_last_body_surface", None) or {})
+            if not body and hasattr(self, "bio"):
+                body = dict(self.bio.get_raw_variables() or {})
+        except Exception:
+            body = {}
+        try:
+            if getattr(self, "allostasis", None) is not None:
+                sp = dict(self.allostasis.state.setpoints or {})
+        except Exception:
+            sp = {}
+        tmpl = self.felt_templates.parse_and_teach(
+            text, pad=pad, setpoints=sp, body=body
+        )
+        if tmpl is None:
+            return None
+        # Ensure lemma node exists
+        g = self.archivist.graph
+        name = tmpl.name
+        if name not in g:
+            try:
+                g.add_node(
+                    name, name=name, node_type="standard", source="user", activation=0.5
+                )
+            except Exception:
+                pass
+        try:
+            self.archivist.bump_activation(name)
+            self.focus.boost_residual(name)
+        except Exception:
+            pass
+        self._last_felt_template_teach = {
+            "name": name,
+            "channel_dev": dict(tmpl.channel_dev),
+            "pad": tmpl.pad,
+            "ref_magnitude": tmpl.ref_magnitude,
+        }
+        return self._last_felt_template_teach
+
+    def _run_felt_template_match(self, body: dict) -> None:
+        """Smooth live deviations, update template L, write edges on commit."""
+        if getattr(self, "felt_templates", None) is None:
+            return
+        from .edge_types import EDGE_ASSOCIATED_WITH, body_channel_node_id
+        from .felt_templates import FELT_CHANNELS
+        from .archivist import SELF_NODE
+
+        sp = {}
+        try:
+            if getattr(self, "allostasis", None) is not None:
+                sp = dict(self.allostasis.state.setpoints or {})
+        except Exception:
+            sp = {}
+        pad = (0.5, 0.5, 0.5)
+        try:
+            key = str(self.synthesizer.get_current_basin_key() or "")
+            parts = key.replace("felt:", "").split("_")
+            if len(parts) >= 3:
+                pad = (float(parts[0]), float(parts[1]), float(parts[2]))
+        except Exception:
+            pass
+        body_f = {ch: float(body.get(ch, sp.get(ch, 0.5))) for ch in FELT_CHANNELS}
+        for ch in FELT_CHANNELS:
+            if ch not in sp:
+                sp[ch] = 0.5
+        rep = self.felt_templates.observe(body_f, sp, pad)
+        matched = rep.get("matched")
+        if not matched:
+            return
+        # Spec §2: confirmed match → edges to SELF + all seven body channels
+        g = self.archivist.graph
+        intensity = float(rep.get("intensity") or 0.5)
+        w = max(0.35, min(1.0, 0.4 + 0.35 * intensity))
+        try:
+            if matched not in g:
+                g.add_node(
+                    matched, name=matched, node_type="standard",
+                    source="felt_match", activation=0.45,
+                )
+            self.archivist.link(
+                matched, SELF_NODE, EDGE_ASSOCIATED_WITH,
+                source="felt_match", placement="felt_state_self",
+            )
+            ed = g.get_edge_data(matched, SELF_NODE) or {}
+            for _k, attr in (ed.items() if isinstance(ed, dict) else []):
+                if isinstance(attr, dict) and attr.get("relation_type") == EDGE_ASSOCIATED_WITH:
+                    attr["placement"] = "felt_state_self"
+                    attr["weight"] = max(float(attr.get("weight") or 0), w)
+                    attr["intensity"] = intensity
+                    break
+        except Exception:
+            pass
+        tmpl = self.felt_templates.templates.get(matched)
+        for ch in FELT_CHANNELS:
+            nid = body_channel_node_id(ch)
+            try:
+                if nid not in g:
+                    continue
+                self.archivist.link(
+                    matched, nid, EDGE_ASSOCIATED_WITH,
+                    source="felt_match", placement="felt_state_body",
+                )
+                ed = g.get_edge_data(matched, nid) or {}
+                for _k, attr in (ed.items() if isinstance(ed, dict) else []):
+                    if not isinstance(attr, dict):
+                        continue
+                    if attr.get("relation_type") != EDGE_ASSOCIATED_WITH:
+                        continue
+                    attr["placement"] = "felt_state_body"
+                    ch_w = w
+                    if tmpl and ch in tmpl.channel_dev:
+                        ch_w = min(1.0, w + 0.15 * abs(float(tmpl.channel_dev[ch])))
+                    attr["weight"] = max(float(attr.get("weight") or 0), ch_w)
+                    attr["intensity"] = intensity
+                    attr["ref_dev"] = (
+                        float(tmpl.channel_dev[ch]) if tmpl and ch in tmpl.channel_dev else None
+                    )
+                    break
+            except Exception:
+                pass
+        self._last_felt_match_commit = {
+            "name": matched, "intensity": intensity, "L": rep.get("L"),
+        }
+
+    def get_felt_template_report(self) -> dict:
+        if getattr(self, "felt_templates", None) is None:
+            return {"active": None, "templates": {}}
+        return self.felt_templates.report()
+
     def pulse(self):
         self.pulse_count += 1
         somatic = self.bio.step()
@@ -1572,6 +1731,12 @@ class Prometheus:
                 self._last_body_surface = dict(body)
         except Exception as e:
             logger.debug("allostasis update failed: %s", e)
+
+        # Felt-state template match (spec): always feel; name only if L ≥ θ
+        try:
+            self._run_felt_template_match(body)
+        except Exception as e:
+            logger.debug("felt_template_match: %s", e)
         # Pre-linguistic self-awareness: SELF is always bound to how the
         # body feels right now (infants have this without words).
         try:
