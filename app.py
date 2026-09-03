@@ -1156,6 +1156,62 @@ if st.session_state.prom is not None:
             st.subheader("Somatic topography (basin map)")
             st.caption("Basins and transitions — not raw hormone gauges.")
             st.json(prom.get_somatic_topo_report())
+            st.subheader("Felt-state templates")
+            st.caption(
+                "Taught profiles match via deviation-from-setpoint + L threshold. "
+                "Feeling always present; naming only when match commits."
+            )
+            try:
+                ftr = (
+                    prom.get_felt_template_report()
+                    if hasattr(prom, "get_felt_template_report")
+                    else {}
+                )
+            except Exception as e:
+                ftr = {"error": str(e)}
+            if ftr and not ftr.get("error"):
+                st.caption(
+                    f"active=`{ftr.get('active')}` intensity={ftr.get('intensity')}"
+                )
+                lm = ftr.get("last_match") or {}
+                if lm:
+                    st.caption(
+                        f"candidate={lm.get('candidate')} matched={lm.get('matched')} "
+                        f"L={lm.get('L')}"
+                    )
+                for n, t in list((ftr.get("templates") or {}).items())[:8]:
+                    st.write(
+                        f"· `{n}` L={t.get('L')} dev={t.get('channel_dev')} "
+                        f"matches={t.get('match_count')}"
+                    )
+            else:
+                st.caption("No templates yet — teach e.g. Sadness: heart rate slowed…")
+
+            st.subheader("Basin surface signature")
+            st.caption(
+                "Each felt place stores an EMA of body surfaces (high/low face)."
+            )
+            try:
+                bsig = (
+                    prom.get_basin_signature_report()
+                    if hasattr(prom, "get_basin_signature_report")
+                    else {}
+                )
+            except Exception as e:
+                bsig = {"error": str(e)}
+            if bsig and bsig.get("basin"):
+                st.caption(
+                    f"basin=`{bsig.get('basin')}` dwell={bsig.get('dwell')} "
+                    f"high={bsig.get('high')} low={bsig.get('low')}"
+                )
+                if bsig.get("sig"):
+                    st.write(
+                        " · ".join(
+                            f"{k}={v:.2f}" for k, v in list((bsig.get("sig") or {}).items())[:9]
+                        )
+                    )
+            else:
+                st.caption("No basin signature yet.")
 
             st.subheader("Felt anchors (linkable felt identities)")
             st.caption("Stable ids over PAD; body_mean is heart/breath/tension/sweat/gut/energy/warmth only — never hormones.")
